@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lattice-ds-connector"
+version = "0.1.0"
+description = "Per-MDS placement-assessment connector for pnfs-lattice (xiNAS module + fixture module)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7", "jsonschema>=3.2"]
+
+[project.scripts]
+lattice-ds-connector = "lattice_ds_connector.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lattice_ds_connector*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,212 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:lattice:connector-batch:1",
+  "title": "Lattice local connector batch v1",
+  "type": "object",
+  "properties": {
+    "contract_version": { "const": "1.0" },
+    "runtime_epoch": { "type": "string", "minLength": 1 },
+    "config_digest": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "instances": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "connector_instance_id": { "type": "string", "minLength": 1 },
+          "module_type": { "type": "string", "minLength": 1 },
+          "epoch": { "type": "string", "minLength": 1 },
+          "sequence": { "type": "integer", "minimum": 0 },
+          "snapshot_status": { "type": "string", "enum": ["COMPLETE", "PARTIAL", "FAILED"] },
+          "assessments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ds_id": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+                "binding_generation": { "type": "integer", "minimum": 1 },
+                "endpoint": {
+                  "type": "object",
+                  "properties": {
+                    "server": { "type": "string", "minLength": 1 },
+                    "export_path": { "type": "string", "pattern": "^/" },
+                    "protocol": { "const": "NFS" },
+                    "transport": { "type": "string", "enum": ["TCP", "RDMA"] },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                  },
+                  "required": ["server", "export_path", "protocol", "transport", "port"],
+                  "additionalProperties": true
+                },
+                "scope": { "const": "NEW_ALLOCATION" },
+                "access_scope_id": { "const": "cluster-default" },
+                "quality": { "type": "string", "enum": ["VALID", "UNKNOWN"] },
+                "observed_at": { "type": ["string", "null"], "format": "date-time" },
+                "evidence_age_ms": { "type": ["integer", "null"], "minimum": 0 },
+                "remaining_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 20000 },
+                "profile": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string", "minLength": 1 },
+                    "version": { "type": "string", "minLength": 1 },
+                    "digest": { "type": "string", "minLength": 1 }
+                  },
+                  "required": ["id", "version", "digest"],
+                  "additionalProperties": true
+                },
+                "placement": {
+                  "type": "object",
+                  "properties": {
+                    "allowed": { "type": "boolean" },
+                    "multiplier_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+                    "reason_codes": {
+                      "type": "array",
+                      "items": { "type": "string", "minLength": 1 },
+                      "maxItems": 16
+                    }
+                  },
+                  "required": ["allowed", "multiplier_ppm", "reason_codes"],
+                  "additionalProperties": true,
+                  "allOf": [
+                    {
+                      "if": { "properties": { "allowed": { "const": false } } },
+                      "then": {
+                        "properties": {
+                          "multiplier_ppm": { "const": 0 },
+                          "reason_codes": { "minItems": 1 }
+                        }
+                      }
+                    }
+                  ]
+                },
+                "resources": {
+                  "type": "object",
+                  "properties": {
+                    "capacity_domain_id": { "type": ["string", "null"], "minLength": 1 },
+                    "shared_resource_ids": {
+                      "type": "array",
+                      "items": { "type": "string", "minLength": 1 },
+                      "maxItems": 128
+                    }
+                  },
+                  "required": ["capacity_domain_id", "shared_resource_ids"],
+                  "additionalProperties": true
+                },
+                "coverage": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "check": { "type": "string", "minLength": 1 },
+                      "required": { "type": "boolean" },
+                      "status": {
+                        "type": "string",
+                        "enum": ["EVALUATED", "NOT_IMPLEMENTED", "NOT_APPLICABLE", "ERROR"]
+                      },
+                      "reason": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["check", "required", "status"],
+                    "additionalProperties": true,
+                    "allOf": [
+                      {
+                        "if": {
+                          "properties": {
+                            "status": { "enum": ["NOT_APPLICABLE", "ERROR", "NOT_IMPLEMENTED"] }
+                          }
+                        },
+                        "then": { "required": ["reason"] }
+                      }
+                    ]
+                  },
+                  "maxItems": 64
+                },
+                "diagnostics": { "type": "object" },
+                "datastore_id": { "type": "string", "minLength": 1 },
+                "target_id": { "type": "string", "minLength": 1 },
+                "target_incarnation": { "type": ["string", "null"], "minLength": 1 }
+              },
+              "required": [
+                "ds_id",
+                "binding_generation",
+                "datastore_id",
+                "target_id",
+                "target_incarnation",
+                "endpoint",
+                "scope",
+                "access_scope_id",
+                "quality",
+                "observed_at",
+                "evidence_age_ms",
+                "remaining_ttl_ms",
+                "profile",
+                "placement",
+                "resources",
+                "coverage"
+              ],
+              "additionalProperties": true,
+              "allOf": [
+                {
+                  "if": { "properties": { "quality": { "const": "UNKNOWN" } } },
+                  "then": {
+                    "properties": {
+                      "placement": {
+                        "properties": {
+                          "allowed": { "const": false },
+                          "multiplier_ppm": { "const": 0 }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "if": { "properties": { "remaining_ttl_ms": { "const": 0 } } },
+                  "then": {
+                    "properties": {
+                      "placement": {
+                        "properties": {
+                          "allowed": { "const": false },
+                          "multiplier_ppm": { "const": 0 }
+                        }
+                      },
+                      "quality": { "const": "UNKNOWN" }
+                    }
+                  }
+                },
+                {
+                  "if": {
+                    "properties": {
+                      "quality": { "const": "VALID" },
+                      "placement": { "properties": { "allowed": { "const": true } } }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "target_incarnation": { "type": "string", "minLength": 1 },
+                      "observed_at": { "type": "string", "format": "date-time" },
+                      "evidence_age_ms": { "type": "integer", "minimum": 0 },
+                      "resources": {
+                        "properties": { "capacity_domain_id": { "type": "string", "minLength": 1 } }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "maxItems": 256
+          }
+        },
+        "required": [
+          "connector_instance_id",
+          "module_type",
+          "epoch",
+          "sequence",
+          "snapshot_status",
+          "assessments"
+        ],
+        "additionalProperties": true
+      },
+      "maxItems": 64
+    }
+  },
+  "required": ["contract_version", "runtime_epoch", "config_digest", "generated_at", "instances"],
+  "additionalProperties": true
+}

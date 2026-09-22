@@ -1,0 +1,36 @@
+{
+  "connector": "lattice-ds-connector",
+  "connector_version": "0.1.0",
+  "contract_version": "1.0",
+  "modules": {
+    "xinas": {
+      "version": "1",
+      "source": "xiNAS GET /api/v1/placement/observations",
+      "supported_source_schema_versions": ["1.0"],
+      "source_reference": "xiNAS release/3.15, docs/control-path/s20-placement-observations-spec.md (S20)",
+      "supported_xiraid": [
+        {
+          "edition": "Classic",
+          "versions": ["4.4"],
+          "vocabulary_reference": "https://xinnor.io/docs/xiRAID-4.4.0/E/en/AG/1/showing_raid_state.html",
+          "validated_against": "fixtures/xinas/*.json (illustrative) — hardware validation pending"
+        }
+      ],
+      "unsupported_xiraid": ["4.3", "Opus"],
+      "profiles": [{ "id": "xinas-mvp", "version": "1" }],
+      "known_source_gaps": [
+        "export rules come from /etc/exports (details.source), not the kernel etab; profile export_source_required=etab yields UNKNOWN",
+        "no HTTPS ingress on xiNAS yet; http requires allow_insecure_http"
+      ]
+    },
+    "fixture": {
+      "version": "1",
+      "test_only": true,
+      "profiles": [{ "id": "fixture-zfs-shaped", "version": "1" }]
+    }
+  },
+  "lattice": {
+    "upstream_baseline": "PEAK-AIO/pnfs-lattice main @ 6b4dcde (2026-09-04)",
+    "mds_integration": "not part of this prototype (LAT-* / P3)"
+  }
+}

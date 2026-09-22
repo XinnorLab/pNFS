@@ -1,0 +1,18 @@
+{
+  "profile": { "id": "fixture-zfs-shaped", "version": "1" },
+  "snapshot_status": "COMPLETE",
+  "source_epoch": "fixture-instance-epoch-1",
+  "evidence_age_ms": 0,
+  "targets": {
+    "dataset-a": {
+      "quality": "VALID",
+      "allowed": true,
+      "multiplier_ppm": 1000000,
+      "reason_codes": ["FIXTURE_HEALTHY"],
+      "target_incarnation": "dataset-a-inc-1",
+      "capacity_domain_id": "fixture-zfs-01/pool-01",
+      "shared_resource_ids": ["fixture-zfs-01/pool-01"],
+      "coverage": [{ "check": "fixture.health", "required": true, "status": "EVALUATED" }]
+    }
+  }
+}

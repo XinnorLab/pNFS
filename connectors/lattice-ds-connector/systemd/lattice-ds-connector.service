@@ -1,0 +1,37 @@
+[Unit]
+Description=Lattice DS placement-assessment connector
+Documentation=https://github.com/XinnorLab/pNFS/tree/main/connectors/lattice-ds-connector
+After=network-online.target
+Wants=network-online.target
+# The MDS reads the socket; it must not be a hard dependency in either
+# direction — a connector outage reads as UNKNOWN on the MDS, never as a
+# reason to stop serving existing layouts.
+
+[Service]
+Type=simple
+User=lattice-ds-connector
+Group=pnfs
+RuntimeDirectory=lattice-ds-connector
+RuntimeDirectoryMode=0750
+ExecStart=/usr/bin/python3 -m lattice_ds_connector run --config /etc/lattice-ds-connector/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=8
+WorkingDirectory=/opt/lattice-ds-connector
+Environment=PYTHONPATH=/opt/lattice-ds-connector
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/lattice-ds-connector
+ReadWritePaths=/run/lattice-ds-connector
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

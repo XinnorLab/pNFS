@@ -1,0 +1,375 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:xinas:placement-observations:1",
+  "title": "xiNAS placement observations envelope v1",
+  "type": "object",
+  "properties": {
+    "request_id": { "type": "string", "minLength": 1 },
+    "correlation_id": { "type": "string", "minLength": 1 },
+    "state_revision": { "type": "integer", "minimum": 0 },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "details": { "type": "object" }
+        },
+        "required": ["code", "message"],
+        "additionalProperties": true
+      },
+      "maxItems": 256
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "details": { "type": "object" }
+        },
+        "required": ["code", "message"],
+        "additionalProperties": true
+      },
+      "maxItems": 256
+    },
+    "links": { "type": "object", "additionalProperties": { "type": "string" } },
+    "result": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "schema_version": { "const": "1.0" },
+            "controller_id": { "type": "string", "minLength": 1 },
+            "server_epoch": { "type": "string", "minLength": 1 },
+            "source_generation": { "type": "integer", "minimum": 0 },
+            "snapshot_status": { "type": "string", "enum": ["COMPLETE", "PARTIAL", "FAILED"] },
+            "generated_at": { "type": "string", "format": "date-time" },
+            "collection_period_ms": { "type": "integer", "minimum": 1 },
+            "capabilities": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "maxItems": 64
+            },
+            "coverage": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "check": { "type": "string", "minLength": 1 },
+                  "required": { "type": "boolean" },
+                  "status": {
+                    "type": "string",
+                    "enum": ["EVALUATED", "NOT_IMPLEMENTED", "NOT_APPLICABLE", "ERROR"]
+                  },
+                  "reason": { "type": "string", "minLength": 1 }
+                },
+                "required": ["check", "required", "status"],
+                "additionalProperties": true,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "status": { "enum": ["NOT_APPLICABLE", "ERROR", "NOT_IMPLEMENTED"] }
+                      }
+                    },
+                    "then": { "required": ["reason"] }
+                  }
+                ]
+              },
+              "maxItems": 64
+            },
+            "shares": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "share_id": { "type": "string", "minLength": 1 },
+                  "incarnation": { "type": "string", "minLength": 1 },
+                  "export_path": { "type": "string", "minLength": 1 },
+                  "collection_status": { "type": "string", "enum": ["SUCCESS", "ERROR", "UNKNOWN"] },
+                  "observed_at": { "type": ["string", "null"], "format": "date-time" },
+                  "evidence_age_ms": { "type": ["integer", "null"], "minimum": 0 },
+                  "filesystem_ref": { "type": ["string", "null"] },
+                  "export_ref": { "type": ["string", "null"] },
+                  "service_ref": { "type": ["string", "null"] },
+                  "reason_codes": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "maxItems": 16
+                  }
+                },
+                "required": [
+                  "share_id",
+                  "incarnation",
+                  "export_path",
+                  "collection_status",
+                  "observed_at",
+                  "evidence_age_ms",
+                  "filesystem_ref",
+                  "export_ref",
+                  "service_ref",
+                  "reason_codes"
+                ],
+                "additionalProperties": true,
+                "allOf": [
+                  {
+                    "if": { "properties": { "collection_status": { "const": "SUCCESS" } } },
+                    "then": {
+                      "properties": {
+                        "observed_at": { "type": "string", "format": "date-time" },
+                        "evidence_age_ms": { "type": "integer", "minimum": 0 },
+                        "filesystem_ref": { "type": "string", "minLength": 1 },
+                        "export_ref": { "type": "string", "minLength": 1 },
+                        "service_ref": { "type": "string", "minLength": 1 }
+                      }
+                    },
+                    "else": { "properties": { "reason_codes": { "minItems": 1 } } }
+                  }
+                ]
+              },
+              "maxItems": 256
+            },
+            "resources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string", "minLength": 1 },
+                  "incarnation": { "type": "string", "minLength": 1 },
+                  "collection_status": { "type": "string", "enum": ["SUCCESS", "ERROR", "UNKNOWN"] },
+                  "observed_at": { "type": ["string", "null"], "format": "date-time" },
+                  "evidence_age_ms": { "type": ["integer", "null"], "minimum": 0 },
+                  "reason_codes": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "maxItems": 16
+                  },
+                  "details": {
+                    "type": "object",
+                    "properties": {
+                      "kind": { "enum": ["ARRAY", "FILESYSTEM", "EXPORT", "NFS_SERVICE"] }
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": true
+                  }
+                },
+                "required": [
+                  "id",
+                  "incarnation",
+                  "collection_status",
+                  "observed_at",
+                  "evidence_age_ms",
+                  "reason_codes",
+                  "details"
+                ],
+                "additionalProperties": true,
+                "allOf": [
+                  {
+                    "if": { "properties": { "collection_status": { "const": "SUCCESS" } } },
+                    "then": {
+                      "properties": {
+                        "observed_at": { "type": "string", "format": "date-time" },
+                        "evidence_age_ms": { "type": "integer", "minimum": 0 },
+                        "details": {
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": { "const": "ARRAY" },
+                                "name": { "type": "string", "minLength": 1 },
+                                "volume_path": { "type": "string", "minLength": 1 },
+                                "edition": { "const": "Classic" },
+                                "version": { "type": "string", "minLength": 1 },
+                                "build": { "type": "string", "minLength": 1 },
+                                "raid_level": { "type": "string", "minLength": 1 },
+                                "state_valid": { "type": "boolean" },
+                                "raw_states": {
+                                  "type": "array",
+                                  "items": { "type": "string", "minLength": 1 },
+                                  "maxItems": 32
+                                },
+                                "members": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "id": { "type": "string", "minLength": 1 },
+                                      "index": { "type": "integer", "minimum": 0 },
+                                      "group": { "type": ["integer", "null"], "minimum": 0 },
+                                      "device_path": { "type": "string", "minLength": 1 },
+                                      "state_valid": { "type": "boolean" },
+                                      "raw_states": {
+                                        "type": "array",
+                                        "items": { "type": "string", "minLength": 1 },
+                                        "maxItems": 16
+                                      }
+                                    },
+                                    "required": [
+                                      "id",
+                                      "index",
+                                      "group",
+                                      "device_path",
+                                      "state_valid",
+                                      "raw_states"
+                                    ],
+                                    "additionalProperties": true
+                                  },
+                                  "maxItems": 1024
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "name",
+                                "volume_path",
+                                "edition",
+                                "version",
+                                "build",
+                                "raid_level",
+                                "state_valid",
+                                "raw_states",
+                                "members"
+                              ],
+                              "additionalProperties": true
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": { "const": "FILESYSTEM" },
+                                "uuid": { "type": "string", "minLength": 1 },
+                                "incarnation": { "type": "string", "minLength": 1 },
+                                "mountpoint": { "type": "string", "minLength": 1 },
+                                "source_device": { "type": "string", "minLength": 1 },
+                                "fs_type": { "const": "xfs" },
+                                "mounted": { "type": ["boolean", "null"] },
+                                "writable": { "type": ["boolean", "null"] },
+                                "mount_options": {
+                                  "type": "array",
+                                  "items": { "type": "string", "minLength": 1 },
+                                  "maxItems": 128
+                                },
+                                "super_options": {
+                                  "type": "array",
+                                  "items": { "type": "string", "minLength": 1 },
+                                  "maxItems": 128
+                                },
+                                "external_dependencies_resolved": { "type": "boolean" },
+                                "array_refs": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "role": { "type": "string", "enum": ["DATA", "LOG", "REALTIME"] },
+                                      "resource_id": { "type": "string", "minLength": 1 }
+                                    },
+                                    "required": ["role", "resource_id"],
+                                    "additionalProperties": true
+                                  },
+                                  "maxItems": 8
+                                },
+                                "log_mode": { "type": "string", "enum": ["INTERNAL", "EXTERNAL", "UNKNOWN"] }
+                              },
+                              "required": [
+                                "kind",
+                                "uuid",
+                                "incarnation",
+                                "mountpoint",
+                                "source_device",
+                                "fs_type",
+                                "mounted",
+                                "writable",
+                                "mount_options",
+                                "super_options",
+                                "external_dependencies_resolved",
+                                "array_refs",
+                                "log_mode"
+                              ],
+                              "additionalProperties": true
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": { "const": "EXPORT" },
+                                "export_path": { "type": "string", "minLength": 1 },
+                                "present": { "type": ["boolean", "null"] },
+                                "rules": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "object",
+                                    "properties": {
+                                      "client": { "type": "string", "minLength": 1 },
+                                      "writable": { "type": ["boolean", "null"] },
+                                      "security": {
+                                        "type": "array",
+                                        "items": { "type": "string", "minLength": 1 },
+                                        "maxItems": 8
+                                      },
+                                      "options": {
+                                        "type": "array",
+                                        "items": { "type": "string", "minLength": 1 },
+                                        "maxItems": 64
+                                      }
+                                    },
+                                    "required": ["client", "writable", "security", "options"],
+                                    "additionalProperties": true
+                                  },
+                                  "maxItems": 512
+                                }
+                              },
+                              "required": ["kind", "export_path", "present", "rules"],
+                              "additionalProperties": true
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": { "const": "NFS_SERVICE" },
+                                "running": { "type": ["boolean", "null"] },
+                                "protocols": {
+                                  "type": "array",
+                                  "items": { "type": "string", "minLength": 1 },
+                                  "maxItems": 8
+                                },
+                                "reason_codes": {
+                                  "type": "array",
+                                  "items": { "type": "string", "minLength": 1 },
+                                  "maxItems": 16
+                                }
+                              },
+                              "required": ["kind", "running", "protocols", "reason_codes"],
+                              "additionalProperties": true
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "else": { "properties": { "reason_codes": { "minItems": 1 } } }
+                  }
+                ]
+              },
+              "maxItems": 8192
+            }
+          },
+          "required": [
+            "schema_version",
+            "controller_id",
+            "server_epoch",
+            "source_generation",
+            "snapshot_status",
+            "generated_at",
+            "collection_period_ms",
+            "capabilities",
+            "coverage",
+            "shares",
+            "resources"
+          ],
+          "additionalProperties": true
+        },
+        { "type": "null" }
+      ]
+    }
+  },
+  "required": ["request_id", "correlation_id", "state_revision", "warnings", "errors", "links", "result"],
+  "additionalProperties": true
+}

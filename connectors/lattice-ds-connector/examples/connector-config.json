@@ -1,0 +1,103 @@
+{
+  "example_only": true,
+  "config_version": "1.0",
+  "test_mode": true,
+  "runtime": {
+    "socket_path": "/run/lattice-ds-connector/connector.sock",
+    "socket_group": "pnfs",
+    "collect_interval_ms": 5000,
+    "collect_deadline_ms": 2000,
+    "max_ds": 256,
+    "max_instances": 64,
+    "max_batch_bytes": 4194304
+  },
+  "profiles": [
+    {
+      "id": "xinas-mvp",
+      "version": "1",
+      "source_max_age_ms": 20000,
+      "recovery_hold_down_ms": 10000,
+      "recovery_distinct_cycles": 2,
+      "degraded_multiplier_ppm": 250000,
+      "need_restripe_multiplier_ppm": 250000,
+      "required_checks": [
+        "raid.array_states",
+        "raid.member_states",
+        "topology.data_log_realtime",
+        "identity",
+        "filesystem.mounted_rw",
+        "export.effective_access",
+        "nfs.service",
+        "source.freshness"
+      ],
+      "required_protocols": ["NFSv3"],
+      "export_source_required": "exports"
+    }
+  ],
+  "instances": [
+    {
+      "id": "xi-01",
+      "module": "xinas",
+      "expected_controller_id": "xinas-node-01",
+      "source": {
+        "url": "https://xinas-node-01.example.invalid/api/v1/placement/observations",
+        "tls_ca_file": "/etc/lattice-ds-connector/xinas-ca.pem",
+        "bearer_token_file": "/etc/lattice-ds-connector/secrets/xi-01.token"
+      },
+      "profile": "xinas-mvp",
+      "bindings": [
+        {
+          "ds_id": 0,
+          "binding_generation": 1,
+          "target_id": "training-a",
+          "expected_target_incarnation": "training-a:7",
+          "endpoint": {
+            "server": "10.10.10.21",
+            "export_path": "/mnt/data/training-a",
+            "protocol": "NFS",
+            "transport": "TCP",
+            "port": 2049
+          },
+          "expected_client_networks": ["10.10.10.0/24", "10.10.20.0/24"],
+          "expected_security": ["sys"]
+        },
+        {
+          "ds_id": 1,
+          "binding_generation": 1,
+          "target_id": "training-b",
+          "expected_target_incarnation": "training-b:7",
+          "endpoint": {
+            "server": "10.10.10.21",
+            "export_path": "/mnt/data/training-b",
+            "protocol": "NFS",
+            "transport": "TCP",
+            "port": 2049
+          },
+          "expected_client_networks": ["10.10.10.0/24", "10.10.20.0/24"],
+          "expected_security": ["sys"]
+        }
+      ]
+    },
+    {
+      "id": "fixture-01",
+      "module": "fixture",
+      "fixture_file": "/etc/lattice-ds-connector/fixtures/zfs-shaped-healthy.json",
+      "bindings": [
+        {
+          "ds_id": 2,
+          "binding_generation": 1,
+          "datastore_id": "fixture-zfs-01",
+          "target_id": "dataset-a",
+          "expected_target_incarnation": "dataset-a-inc-1",
+          "endpoint": {
+            "server": "10.10.10.31",
+            "export_path": "/pool/dataset-a",
+            "protocol": "NFS",
+            "transport": "TCP",
+            "port": 2049
+          }
+        }
+      ]
+    }
+  ]
+}
