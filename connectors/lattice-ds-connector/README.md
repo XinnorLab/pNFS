@@ -52,6 +52,7 @@ and 10 s passed; a repeated identical source snapshot is one sample.
 | `lattice_ds_connector/cli.py` | `run`, `validate-config`, `show`, `describe` |
 | `contracts/` | Appendix Г (connector batch) and Д (xiNAS observations) schemas |
 | `examples/connector-config.json` | Appendix А, adapted to the xiNAS prototype's identities |
+| `examples/connector-config.lab-xinas-box.json` | the XinnorLab stand: node225 → xinas-box over the api's `mcp.http` listener (plain http on the management LAN, no secrets) |
 | `fixtures/xinas/` | golden xiNAS source responses (healthy, degraded, log fault, broken shapes, missing dependencies, export access, prerequisites, mount ambiguity) |
 | `fixtures/fixture-module/` | a ZFS-shaped fixture for the generic module |
 | `docs/profile-xinas-mvp.md` | the decision table, reason catalogue, coverage, parameters |
@@ -88,6 +89,22 @@ python3 -m pip install pytest jsonschema     # test dependencies only
 python3 -m pytest tests -q
 python3 scripts/gen_fixtures.py               # regenerate fixtures/xinas/*.json
 ```
+
+## Stand result (2026-09-22)
+
+xiNAS `release/3.15` on xinas-box (api `mcp.http` listener on
+192.168.64.51:8080, a `viewer` token), the connector on node225 as a
+transient unit (`examples/connector-config.lab-xinas-box.json`): the share
+`mnt/data` (XFS on `data` RAID 5 with external log on `log` RAID 10,
+xiRAID 4.4.1, export `*` rw, nfsd v3/4.x) reads `VALID` /
+`RECOVERY_HOLD_DOWN` for the first two cycles and `allowed=yes
+ppm=1000000 NORMAL` after 10 s. Stopping `xinas-agent` on the box: the
+last allow is retained on its own TTL (age 12 s, TTL 8 s at t+8 s), then
+the source answers 503 `SOURCE_STALE` (its `2 × period + 2 s` bound) and
+the connector revokes at once — `UNKNOWN` / `SOURCE_STALE` at t+16 s, one
+rate-limited alert line in the journal. After `systemctl start
+xinas-agent`: `RECOVERY_HOLD_DOWN` at t+8 s, `NORMAL` at t+16 s. The live
+batch from node225 validates against `contracts/connector-batch.schema.json`.
 
 ## Decision summary (xinas-mvp v1)
 

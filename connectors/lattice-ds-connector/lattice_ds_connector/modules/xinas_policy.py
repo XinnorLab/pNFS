@@ -93,6 +93,13 @@ class Verdict:
 # ---------------------------------------------------------------------------
 
 
+def normalize_level(raw: Any) -> str:
+    """xiNAS publishes ``raid5`` / ``raid10`` (its parser's spelling); the
+    package's examples say ``5``. Both mean the same level."""
+    text = str(raw if raw is not None else "").strip().lower()
+    return text[4:] if text.startswith("raid") else text
+
+
 def evaluate_array(details: Dict[str, Any], profile: Profile, v: Verdict) -> None:
     """Apply the decision table to one ARRAY resource's details."""
     words_raw = details.get("raw_states")
@@ -112,7 +119,7 @@ def evaluate_array(details: Dict[str, Any], profile: Profile, v: Verdict) -> Non
             v.add_veto(code)
     if "online" not in word_set:
         v.add_veto("ARRAY_UNAVAILABLE")
-    level = str(details.get("raid_level", ""))
+    level = normalize_level(details.get("raid_level"))
     if "online" in word_set and level not in contract.LEVELS_WITHOUT_INITIALIZATION:
         if "initialized" not in word_set and not ({"initing", "need_init"} & word_set):
             # Online, but no proof of initialization readiness where it

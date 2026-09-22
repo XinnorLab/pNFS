@@ -1,0 +1,35 @@
+{
+  "example_only": true,
+  "config_version": "1.0",
+  "test_mode": false,
+  "runtime": {
+    "socket_path": "/run/lattice-ds-connector/connector.sock",
+    "collect_interval_ms": 5000,
+    "collect_deadline_ms": 2000
+  },
+  "profiles": [{ "id": "xinas-mvp", "version": "1" }],
+  "instances": [
+    {
+      "id": "xinas-box",
+      "module": "xinas",
+      "expected_controller_id": "e4e94f0c-d980-43c3-8cf4-9690bb01791d",
+      "source": {
+        "url": "http://192.168.64.51:8080/api/v1/placement/observations",
+        "allow_insecure_http": true,
+        "bearer_token_file": "/etc/lattice-ds-connector/secrets/xi-01.token"
+      },
+      "profile": "xinas-mvp",
+      "bindings": [
+        {
+          "ds_id": 0,
+          "binding_generation": 1,
+          "target_id": "mnt/data",
+          "expected_target_incarnation": "mnt/data:0",
+          "endpoint": { "server": "192.168.64.51", "export_path": "/mnt/data", "protocol": "NFS", "transport": "TCP", "port": 2049 },
+          "expected_client_networks": ["192.168.64.0/22"],
+          "expected_security": ["sys"]
+        }
+      ]
+    }
+  ]
+}

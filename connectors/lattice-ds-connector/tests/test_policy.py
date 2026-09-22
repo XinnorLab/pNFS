@@ -147,13 +147,25 @@ def test_t06_unknown_shapes_are_unknown_not_dropped(base_result, states, valid):
     assert "SOURCE_UNKNOWN" in a.reason_codes
 
 
-def test_t06_online_without_initialization_proof_is_unknown_except_raid0(base_result):
+@pytest.mark.parametrize("level", ["0", "raid0", "RAID0"])
+def test_t06_online_without_initialization_proof_is_unknown_except_raid0(base_result, level):
     a = one(sb.with_array_states(base_result, "data1", ["online"]))
     assert a.quality == "UNKNOWN" and "SOURCE_UNKNOWN" in a.reason_codes
     r = sb.with_array_states(base_result, "data1", ["online"])
-    sb.find(r, "array:data1")["details"]["raid_level"] = "0"
+    sb.find(r, "array:data1")["details"]["raid_level"] = level
     a0 = one(r)
     assert a0.allowed and a0.reason_codes == ["NORMAL"]
+
+
+def test_level_spelling_of_the_xinas_source_is_accepted(base_result):
+    # xiNAS publishes raid5/raid10 (seen on xinas-box 2026-09-22); the level
+    # must not be mistaken for RAID 0 nor for an unknown level.
+    r = copy.deepcopy(base_result)
+    sb.find(r, "array:data1")["details"]["raid_level"] = "raid5"
+    sb.find(r, "array:log1")["details"]["raid_level"] = "raid10"
+    assert one(r).allowed
+    r2 = sb.with_array_states(r, "data1", ["online"])
+    assert one(r2).quality == "UNKNOWN"
 
 
 def test_t06_unknown_evidence_and_proven_veto_keep_both_reasons(base_result):
