@@ -33,6 +33,13 @@ taken slot for stripe 2, 3, … of the same file. Between files the index is
 always 0, so with the stub every single-stripe file lands on the first online
 data server. Measured on a two-DS stand: 40 of 40 files on DS 0.
 
+> **Canonical copy moved.** Since 2026-09-23 the kernel is vendored in the
+> fork [XinnorLab/pnfs-lattice](https://github.com/XinnorLab/pnfs-lattice)
+> (`src/modules/wrr/wrr.c` on `xinnor/placement-modes`), where it also
+> exports `mds_wrr_kernel_id()`, the refusing `mds_wrr_weighted_pick2()`
+> and a test seed hook used by the placement modes.  This directory keeps
+> the original standalone copy and the stand scripts; edit the fork first.
+
 ## Build
 
 Upstream's module glue already selects `wrr.c` when the CMake gate is on:

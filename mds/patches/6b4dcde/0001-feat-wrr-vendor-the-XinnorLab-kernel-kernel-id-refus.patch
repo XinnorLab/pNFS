@@ -1,0 +1,387 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 21:23:33 +0300
+Subject: [PATCH 1/9] feat(wrr): vendor the XinnorLab kernel; kernel id,
+ refusing pick2 and a test seed hook
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/wrr.h                |  18 ++++
+ src/modules/wrr/wrr.c        | 168 +++++++++++++++++++++++++++++++++++
+ src/modules/wrr/wrr_stub.c   |  18 ++++
+ tests/unit/test_wrr_kernel.c | 138 ++++++++++++++++++++++++++++
+ 4 files changed, 342 insertions(+)
+ create mode 100644 src/modules/wrr/wrr.c
+ create mode 100644 tests/unit/test_wrr_kernel.c
+
+diff --git a/include/wrr.h b/include/wrr.h
+index ccd2123..6824f44 100644
+--- a/include/wrr.h
++++ b/include/wrr.h
+@@ -50,4 +50,22 @@ uint32_t mds_wrr_weighted_pick(const uint64_t *free_bytes, uint32_t n);
+  */
+ uint32_t mds_wrr_capacity_pick(const uint64_t *free_bytes, uint32_t n);
+ 
++/*
++ * Build identity: 0 in the community stub, non-zero in a real kernel.
++ * The MDS refuses the fill/smart placement modes when this is 0.
++ */
++#define MDS_WRR_KERNEL_XINNOR_V1 0x58494e01u
++uint32_t mds_wrr_kernel_id(void);
++
++/*
++ * Weighted pick that refuses instead of returning slot 0:
++ *   0  -> *out is a slot with weight > 0, P(i) = w[i] / sum(w)
++ *  -1  -> n == 0, w == NULL, every weight is zero, or the sum of the
++ *         weights reaches 2^62 (the sampler's range).
++ */
++int mds_wrr_weighted_pick2(const uint64_t *w, uint32_t n, uint32_t *out);
++
++/* Tests only: reseed the calling thread's PRNG for a reproducible draw. */
++void mds_wrr_test_seed(uint32_t seed);
++
+ #endif /* WRR_H */
+diff --git a/src/modules/wrr/wrr.c b/src/modules/wrr/wrr.c
+new file mode 100644
+index 0000000..82e6ee3
+--- /dev/null
++++ b/src/modules/wrr/wrr.c
+@@ -0,0 +1,168 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * wrr.c -- weighted-round-robin and capacity-derived placement kernels.
++ *
++ * Independent implementation of the two selection kernels declared in
++ * include/wrr.h (MIT).  Written from the header contract and the
++ * caller in src/fsal_obj/placement.c only; no enterprise code was
++ * consulted.  Linked into pnfs_fsal_obj when ENABLE_WRR=ON.
++ *
++ * Contract (include/wrr.h):
++ *   - weights[] holds one non-negative weight per ONLINE DS; the
++ *     caller zeroes the weight of every slot already taken by an
++ *     earlier stripe of the same file and expects a zero-weight slot
++ *     never to be picked while a positive one exists.
++ *   - both kernels return an index in [0, n); 0 when n == 0.
++ *   - if every weight is zero the caller walks forward from the
++ *     returned index to the next free slot, so returning 0 is safe.
++ */
++
++#include "wrr.h"
++
++#include <stdint.h>
++#include <stdlib.h>
++#include <time.h>
++
++/*
++ * Per-thread PRNG.  The output is a placement hint, not a security
++ * token, so a plain LCG-seeded rand_r() state is enough; the
++ * thread-local copy avoids sharing state between worker threads
++ * without a lock.  Seeded lazily from time + thread-unique address so
++ * two MDS processes do not replay the same sequence.
++ */
++static __thread unsigned int wrr_seed;
++static __thread int wrr_seeded;
++
++void mds_wrr_test_seed(uint32_t s)
++{
++    wrr_seed = (unsigned int)s;
++    wrr_seeded = 1;
++}
++
++uint32_t mds_wrr_kernel_id(void)
++{
++    return MDS_WRR_KERNEL_XINNOR_V1;
++}
++
++static unsigned int wrr_rand(void)
++{
++    unsigned int *seed = &wrr_seed;
++    int *seeded = &wrr_seeded;
++
++    if (!*seeded) {
++        *seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)seed;
++        *seeded = 1;
++    }
++    return (unsigned int)rand_r(seed);
++}
++
++/* Uniform value in [0, bound) without modulo bias for 64-bit bounds. */
++static uint64_t wrr_rand_below(uint64_t bound)
++{
++    uint64_t r;
++
++    if (bound < 2) {
++        return 0;
++    }
++    /* Two 31-bit draws give 62 bits, enough for any realistic
++     * total-free-bytes sum on a lab or production cluster. */
++    do {
++        r = ((uint64_t)wrr_rand() << 31) | (uint64_t)wrr_rand();
++        r &= (UINT64_C(1) << 62) - 1;
++    } while (r >= ((UINT64_C(1) << 62) / bound) * bound);
++    return r % bound;
++}
++
++uint32_t mds_wrr_weighted_pick(const uint64_t *free_bytes, uint32_t n)
++{
++    uint64_t total = 0;
++    uint64_t r;
++    uint32_t i;
++
++    if (free_bytes == NULL || n == 0) {
++        return 0;
++    }
++
++    /* Saturating sum so a pathological weight cannot wrap. */
++    for (i = 0; i < n; i++) {
++        if (free_bytes[i] > UINT64_MAX - total) {
++            total = UINT64_MAX;
++            break;
++        }
++        total += free_bytes[i];
++    }
++    if (total == 0) {
++        return 0; /* nothing eligible -- caller walks forward */
++    }
++
++    /* Roulette-wheel selection: P(i) = w[i] / sum(w). */
++    r = wrr_rand_below(total);
++    for (i = 0; i < n; i++) {
++        if (r < free_bytes[i]) {
++            return i;
++        }
++        r -= free_bytes[i];
++    }
++    /* Unreachable unless the saturating sum clipped; fall back to the
++     * last positive slot so the pick is still eligible. */
++    for (i = n; i-- > 0;) {
++        if (free_bytes[i] != 0) {
++            return i;
++        }
++    }
++    return 0;
++}
++
++int mds_wrr_weighted_pick2(const uint64_t *w, uint32_t n, uint32_t *out)
++{
++    uint64_t total = 0;
++    uint64_t r;
++    uint32_t i;
++
++    if (w == NULL || n == 0 || out == NULL) {
++        return -1;
++    }
++    /* The sampler draws 62 bits; refuse a sum that reaches 2^62 instead
++     * of clipping it (the caller's weight bound guarantees it never
++     * happens with the shipped configuration ranges). */
++    for (i = 0; i < n; i++) {
++        if (w[i] > ((UINT64_C(1) << 62) - 1) - total) {
++            return -1;
++        }
++        total += w[i];
++    }
++    if (total == 0) {
++        return -1;
++    }
++    r = wrr_rand_below(total);
++    for (i = 0; i < n; i++) {
++        if (r < w[i]) {
++            *out = i;
++            return 0;
++        }
++        r -= w[i];
++    }
++    return -1; /* unreachable: r < total */
++}
++
++uint32_t mds_wrr_capacity_pick(const uint64_t *free_bytes, uint32_t n)
++{
++    uint32_t best = 0;
++    uint64_t best_w = 0;
++    uint32_t i;
++
++    if (free_bytes == NULL || n == 0) {
++        return 0;
++    }
++    /* Strict '>' keeps the lowest index on ties, so a cluster of
++     * equal-capacity DSes still spreads via the caller's taken[]
++     * masking rather than always landing on the last one. */
++    for (i = 0; i < n; i++) {
++        if (free_bytes[i] > best_w) {
++            best_w = free_bytes[i];
++            best = i;
++        }
++    }
++    return best; /* 0 when every weight is zero */
++}
+diff --git a/src/modules/wrr/wrr_stub.c b/src/modules/wrr/wrr_stub.c
+index 15ca38e..f77fe00 100644
+--- a/src/modules/wrr/wrr_stub.c
++++ b/src/modules/wrr/wrr_stub.c
+@@ -30,3 +30,21 @@ uint32_t mds_wrr_capacity_pick(const uint64_t *free_bytes, uint32_t n)
+     (void)n;
+     return 0;
+ }
++
++uint32_t mds_wrr_kernel_id(void)
++{
++    return 0;
++}
++
++int mds_wrr_weighted_pick2(const uint64_t *w, uint32_t n, uint32_t *out)
++{
++    (void)w;
++    (void)n;
++    (void)out;
++    return -1;
++}
++
++void mds_wrr_test_seed(uint32_t seed)
++{
++    (void)seed;
++}
+diff --git a/tests/unit/test_wrr_kernel.c b/tests/unit/test_wrr_kernel.c
+new file mode 100644
+index 0000000..070b25f
+--- /dev/null
++++ b/tests/unit/test_wrr_kernel.c
+@@ -0,0 +1,138 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * test_wrr_kernel.c -- the XinnorLab wrr kernel: identity, the refusing
++ * pick2 entry point, the reproducible test seed and the 62-bit bound.
++ */
++#include <stdio.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "wrr.h"
++
++static int tests_run;
++static int tests_passed;
++static int test_failed;
++
++#define ASSERT_EQ(a, b) do { \
++    if ((long long)(a) != (long long)(b)) { \
++        fprintf(stderr, "  FAIL %s:%d: %s (%lld) != %s (%lld)\n", \
++                __FILE__, __LINE__, #a, (long long)(a), #b, (long long)(b)); \
++        test_failed = 1; \
++        return; \
++    } \
++} while (0)
++
++#define ASSERT_TRUE(cond) do { \
++    if (!(cond)) { \
++        fprintf(stderr, "  FAIL %s:%d: !(%s)\n", __FILE__, __LINE__, #cond); \
++        test_failed = 1; \
++        return; \
++    } \
++} while (0)
++
++#define RUN_TEST(fn) do { \
++    tests_run++; \
++    test_failed = 0; \
++    fprintf(stdout, "  %-50s", #fn); \
++    fflush(stdout); \
++    fn(); \
++    if (test_failed == 0) { tests_passed++; fprintf(stdout, "PASS\n"); } \
++    else { fprintf(stdout, "FAILED\n"); } \
++} while (0)
++
++static void test_kernel_id_is_nonzero(void)
++{
++    ASSERT_EQ(mds_wrr_kernel_id(), 0x58494e01u);
++}
++
++static void test_pick2_refuses_empty_and_all_zero(void)
++{
++    uint64_t z[3] = {0, 0, 0};
++    uint32_t out = 99;
++
++    ASSERT_EQ(mds_wrr_weighted_pick2(NULL, 3, &out), -1);
++    ASSERT_EQ(mds_wrr_weighted_pick2(z, 0, &out), -1);
++    ASSERT_EQ(mds_wrr_weighted_pick2(z, 3, &out), -1);
++    ASSERT_EQ(mds_wrr_weighted_pick2(z, 3, NULL), -1);
++    ASSERT_EQ(out, 99u);
++}
++
++static void test_pick2_never_returns_a_zero_slot(void)
++{
++    uint64_t w[4] = {0, 5, 0, 5};
++    uint32_t out;
++
++    mds_wrr_test_seed(7);
++    for (int i = 0; i < 2000; i++) {
++        ASSERT_EQ(mds_wrr_weighted_pick2(w, 4, &out), 0);
++        ASSERT_TRUE(out == 1 || out == 3);
++    }
++}
++
++static void test_pick2_distribution_4_to_1(void)
++{
++    uint64_t w[2] = {80, 20};
++    uint32_t out;
++    uint32_t hits0 = 0;
++
++    mds_wrr_test_seed(12345);
++    for (int i = 0; i < 100000; i++) {
++        ASSERT_EQ(mds_wrr_weighted_pick2(w, 2, &out), 0);
++        if (out == 0) {
++            hits0++;
++        }
++    }
++    ASSERT_TRUE(hits0 > 78000 && hits0 < 82000); /* 80 % +- 2 % */
++}
++
++static void test_pick2_refuses_sum_at_2_pow_62(void)
++{
++    uint64_t w[2] = {UINT64_C(1) << 61, UINT64_C(1) << 61};
++    uint64_t ok[2] = {(UINT64_C(1) << 61) - 1, UINT64_C(1) << 61};
++    uint32_t out;
++
++    ASSERT_EQ(mds_wrr_weighted_pick2(w, 2, &out), -1);
++    ASSERT_EQ(mds_wrr_weighted_pick2(ok, 2, &out), 0); /* 2^62 - 1 is allowed */
++}
++
++static void test_seed_is_deterministic(void)
++{
++    uint64_t w[3] = {1, 2, 3};
++    uint32_t a[50];
++    uint32_t b[50];
++
++    mds_wrr_test_seed(99);
++    for (int i = 0; i < 50; i++) {
++        (void)mds_wrr_weighted_pick2(w, 3, &a[i]);
++    }
++    mds_wrr_test_seed(99);
++    for (int i = 0; i < 50; i++) {
++        (void)mds_wrr_weighted_pick2(w, 3, &b[i]);
++    }
++    ASSERT_EQ(memcmp(a, b, sizeof(a)), 0);
++}
++
++static void test_legacy_picks_still_work(void)
++{
++    uint64_t w[3] = {0, 0, 9};
++    uint64_t z[2] = {0, 0};
++
++    ASSERT_EQ(mds_wrr_weighted_pick(w, 3), 2u);
++    ASSERT_EQ(mds_wrr_weighted_pick(z, 2), 0u);   /* legacy contract: 0 on all-zero */
++    ASSERT_EQ(mds_wrr_capacity_pick(w, 3), 2u);
++}
++
++int main(void)
++{
++    printf("test_wrr_kernel\n");
++    RUN_TEST(test_kernel_id_is_nonzero);
++    RUN_TEST(test_pick2_refuses_empty_and_all_zero);
++    RUN_TEST(test_pick2_never_returns_a_zero_slot);
++    RUN_TEST(test_pick2_distribution_4_to_1);
++    RUN_TEST(test_pick2_refuses_sum_at_2_pow_62);
++    RUN_TEST(test_seed_is_deterministic);
++    RUN_TEST(test_legacy_picks_still_work);
++    printf("%d/%d passed\n", tests_passed, tests_run);
++    return tests_passed == tests_run ? 0 : 1;
++}

@@ -1,0 +1,786 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 21:23:33 +0300
+Subject: [PATCH 2/9] feat(config): placement_mode rr|fill|smart with conflict
+ rules, thresholds, domain map and config generation
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ docs/config-keys.md                |  18 +++
+ include/placement_modes.h          |  54 +++++++
+ include/pnfs_mds.h                 |  29 ++++
+ src/common/CMakeLists.txt          |   1 +
+ src/common/config.c                | 104 +++++++++++++
+ src/common/placement_config.c      | 188 +++++++++++++++++++++++
+ tests/CMakeLists.txt               |   4 +
+ tests/unit/test_placement_config.c | 238 +++++++++++++++++++++++++++++
+ 8 files changed, 636 insertions(+)
+ create mode 100644 include/placement_modes.h
+ create mode 100644 src/common/placement_config.c
+ create mode 100644 tests/unit/test_placement_config.c
+
+diff --git a/docs/config-keys.md b/docs/config-keys.md
+index 884b749..8dfd4e3 100644
+--- a/docs/config-keys.md
++++ b/docs/config-keys.md
+@@ -74,6 +74,24 @@ Sizing knobs for the in-memory NFSv4.1 state tables (Wave 4).  All default to 0
+ - `placement_policy` — `rr|wrr|weighted_rr|capacity`.  Default: rr.
+ - `placement_policy_enabled` — master switch.  Default: false.
+ - `placement_capacity_weighting` — `off|proportional`.  Default: off.  When `proportional`, the statvfs probe derives `auto_weight = max(1, floor((1 - used/total) * 100))` in [1, 100] and writes it into the DS cache.  Overlay precedence: `ds_weight.<id>` > `auto_weight` > free-bytes > uniform, so an operator override always wins.  Visible as the `AUTO` column in `mds-admin ds capacity show`.
++### Placement modes (XinnorLab)
++One operator-facing key selects how a **new** backing object picks its
++data server; see `docs/placement-modes.md`.  When `placement_mode` is
++present it is authoritative: `placement_policy`,
++`placement_policy_enabled`, `placement_capacity_weighting` and a
++`workload_profile` that sets a placement policy are rejected at startup
++(`PLACEMENT_MODE_CONFLICT`).  Without the key nothing below applies and
++the legacy keys behave exactly as documented above.
++- `placement_mode` — `rr|fill|smart`.  No default (absent = legacy).  `rr` = cyclic order over the online DS, no weights; `fill` = weighted random by free fraction of the capacity domain, with a hard capacity gate; `smart` = `fill` × the connector assessment (needs a build with `ENABLE_DS_CONNECTOR`; refused otherwise with `PLACEMENT_MODE_UNSUPPORTED_BUILD`).
++- `placement_capacity_max_age_ms` — freshness bound of a capacity observation (1..86400000, must exceed `ds_capacity_poll_ms`).  Default: 120000.  fill/smart only.
++- `placement_min_free_bytes` — a domain is a candidate only when its available bytes exceed this.  Default: 0.  fill/smart only.
++- `ds_capacity_domain.<ds_id>` — capacity domain of DS `<ds_id>` (≤ 127 bytes).  Two exports of one filesystem must declare the same domain; the domain's weight is shared 1/N across its DS.  Default: the DS is its own domain.
++- `placement_stripe_shrink` — `allow|strict`: with fewer eligible DS than stripes, place fewer stripes or refuse.  Default: allow.
++- `placement_allow_manual_base_weights` — bool; smart only.  Default: false.
++- `placement_domain_weight.<domain>` — manual base weight of a domain (1..10000); smart only, needs the flag above (`DOMAIN_WEIGHT_FORBIDDEN` otherwise).
++- `ds_weight.<id>` is a conflict in `fill` (`PLACEMENT_MODE_CONFLICT`).
++- `fill`/`smart` require `ds_capacity_poll_ms > 0` (`RANGE`).
++The daemon logs `placement_mode=<mode> generation=<sha256[:12]> …` at startup; `placement_config_generation` (a SHA-256 of the managed keys) is what `lattice-placement mode verify` compares across MDS.
+ ## Authentication
+ - `nfs_auth_mode` — `sys|krb5|krb5i|krb5p`.
+ - `krb5_keytab` / `krb5_principal` — GSS credentials.
+diff --git a/include/placement_modes.h b/include/placement_modes.h
+new file mode 100644
+index 0000000..6cffa1c
+--- /dev/null
++++ b/include/placement_modes.h
+@@ -0,0 +1,54 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * placement_modes.h -- the operator-facing placement modes (rr / fill /
++ * smart): mode enum, INI key names, defaults and ranges.
++ *
++ * The values here mirror docs/placement-modes/contract-manifest.json in
++ * XinnorLab/pNFS; a unit test pins the numbers so the two cannot drift
++ * silently.  Design: docs/superpowers/specs/2026-09-23-placement-modes-
++ * design.md (XinnorLab/pNFS), sections 4 and 5.
++ */
++
++#ifndef PLACEMENT_MODES_H
++#define PLACEMENT_MODES_H
++
++#include <stdint.h>
++
++/*
++ * PM_LEGACY: `placement_mode` absent -- the upstream placement_policy*
++ * keys drive selection exactly as before.  The three explicit modes
++ * take the dispatcher branch and the candidate gate (placement_gate.h).
++ */
++enum placement_mode {
++    PM_LEGACY = 0,
++    PM_RR     = 1,
++    PM_FILL   = 2,
++    PM_SMART  = 3,
++};
++
++enum placement_shrink {
++    PM_SHRINK_ALLOW  = 0,   /* fewer eligible DS than stripes: place fewer stripes */
++    PM_SHRINK_STRICT = 1,   /* ... refuse the layout instead */
++};
++
++#define PM_KEY_MODE                 "placement_mode"
++#define PM_KEY_CAP_MAX_AGE_MS       "placement_capacity_max_age_ms"
++#define PM_KEY_MIN_FREE_BYTES       "placement_min_free_bytes"
++#define PM_KEY_DOMAIN_PREFIX        "ds_capacity_domain."
++#define PM_KEY_DOMAIN_WEIGHT_PREFIX "placement_domain_weight."
++#define PM_KEY_ALLOW_MANUAL         "placement_allow_manual_base_weights"
++#define PM_KEY_SHRINK               "placement_stripe_shrink"
++
++#define PM_DEFAULT_CAP_MAX_AGE_MS   120000u
++#define PM_CAP_MAX_AGE_MS_MAX       86400000u
++#define PM_DOMAIN_ID_MAX            128
++#define PM_DOMAIN_WEIGHT_MIN        1u
++#define PM_DOMAIN_WEIGHT_MAX        10000u
++#define PM_WEIGHT_SCALE             65536u
++#define PM_MAX_DOMAINS              256   /* == MDS_MAX_DS_NODES; asserted in placement_config.c */
++
++const char *placement_mode_name(enum placement_mode m);     /* "legacy"|"rr"|"fill"|"smart" */
++const char *placement_shrink_name(enum placement_shrink s); /* "allow"|"strict" */
++
++#endif /* PLACEMENT_MODES_H */
+diff --git a/include/pnfs_mds.h b/include/pnfs_mds.h
+index 1b56a12..cb6833f 100644
+--- a/include/pnfs_mds.h
++++ b/include/pnfs_mds.h
+@@ -34,6 +34,7 @@ _Static_assert(0, "pnfs-mds requires GCC >= 11.1 -- see docs/architecture.md sec
+ 
+ #include <stdint.h>
+ #include <stdbool.h>
++#include "placement_modes.h"
+ #include <pthread.h>
+ #include <time.h>
+ #include <stdio.h>
+@@ -709,6 +710,28 @@ struct mds_config {
+      */
+     uint32_t            ds_capacity_poll_ms;
+ 
++    /*
++     * Placement modes (XinnorLab, placement_modes.h).  placement_mode_set
++     * is false when the key is absent: everything below is then unused
++     * and the legacy placement_policy* path runs unchanged.  The *_set
++     * flags of the legacy keys exist only for the conflict check.
++     */
++    enum placement_mode   placement_mode;
++    bool                  placement_mode_set;
++    bool                  placement_policy_set;
++    bool                  placement_policy_enabled_set;
++    bool                  placement_capacity_weighting_set;
++    bool                  ds_weight_set;
++    uint32_t              placement_capacity_max_age_ms;
++    uint64_t              placement_min_free_bytes;
++    char                  ds_capacity_domain[MDS_MAX_DS_NODES][PM_DOMAIN_ID_MAX];   /* "" = own domain */
++    char                  placement_domain_weight_id[PM_MAX_DOMAINS][PM_DOMAIN_ID_MAX];
++    uint32_t              placement_domain_weight[PM_MAX_DOMAINS];
++    uint32_t              placement_domain_weight_count;
++    bool                  placement_allow_manual_base_weights;
++    enum placement_shrink placement_stripe_shrink;
++    char                  placement_config_generation[65];   /* hex sha256; "" in legacy */
++
+     /*
+      * Per-DS I/O limit probe interval (milliseconds).  The prober
+      * asks each ONLINE generic DS for its real rtmax/wtmax via NFSv3
+@@ -1223,6 +1246,12 @@ struct mds_config {
+  */
+ enum mds_status mds_config_load(const char *path, struct mds_config *cfg);
+ 
++/* Placement modes (src/common/placement_config.c). */
++enum mds_status placement_config_validate(const struct mds_config *cfg,
++                                          char *err, size_t cap);
++void placement_config_generation(const struct mds_config *cfg, char out[65]);
++enum placement_mode placement_config_effective_mode(const struct mds_config *cfg);
++
+ 
+ /* -----------------------------------------------------------------------
+  * Logging
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index c538ba9..dfebc2c 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_library(pnfs_common STATIC
+     threadpool.c
+     heartbeat.c
+     config.c
++    placement_config.c
+     error.c
+     mds_histogram.c
+     mds_metrics.c
+diff --git a/src/common/config.c b/src/common/config.c
+index 90fe525..400c960 100644
+--- a/src/common/config.c
++++ b/src/common/config.c
+@@ -297,6 +297,10 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+ 
+     /* Live DS capacity probe interval (ms).  60s by default. */
+     cfg->ds_capacity_poll_ms = 60000;
++    /* Placement modes: absent key = legacy behaviour. */
++    cfg->placement_mode = PM_LEGACY;
++    cfg->placement_capacity_max_age_ms = PM_DEFAULT_CAP_MAX_AGE_MS;
++    cfg->placement_stripe_shrink = PM_SHRINK_ALLOW;
+ 
+     /* Per-DS I/O limit (FSINFO) probe interval (ms).  60s by
+      * default; 0 disables and restores the legacy 1 MiB wire
+@@ -835,6 +839,7 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+              */
+             unsigned long id = strtoul(key + 10, NULL, 10);
+             unsigned long w = strtoul(val, NULL, 10);
++            cfg->ds_weight_set = true;
+             if (id < MDS_MAX_DS_NODES && w <= UINT32_MAX) {
+                 cfg->ds_weight_by_id[id] = (uint32_t)w;
+             } else {
+@@ -1266,10 +1271,91 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+                 return MDS_ERR_INVAL;
+             }
+             cfg->tuning_set |= MDS_CFG_SET_PLACEMENT_POLICY;
++            cfg->placement_policy_set = true;
+         } else if (strcmp(key, "placement_policy_enabled") == 0) {
+             cfg->placement_policy_enabled =
+                 (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
++            cfg->placement_policy_enabled_set = true;
++        } else if (strcmp(key, PM_KEY_MODE) == 0) {
++            if (strcmp(val, "rr") == 0) {
++                cfg->placement_mode = PM_RR;
++            } else if (strcmp(val, "fill") == 0) {
++                cfg->placement_mode = PM_FILL;
++            } else if (strcmp(val, "smart") == 0) {
++                cfg->placement_mode = PM_SMART;
++            } else {
++                (void)fprintf(stderr,
++                    "ERROR: invalid placement_mode '%s' "
++                    "(expected rr|fill|smart)\n", val);
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
++            cfg->placement_mode_set = true;
++        } else if (strcmp(key, PM_KEY_CAP_MAX_AGE_MS) == 0) {
++            unsigned long v = strtoul(val, NULL, 10);
++            if (v == 0 || v > PM_CAP_MAX_AGE_MS_MAX) {
++                (void)fprintf(stderr,
++                    "ERROR: %s=%lu out of range (1..%u)\n",
++                    key, v, (unsigned)PM_CAP_MAX_AGE_MS_MAX);
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
++            cfg->placement_capacity_max_age_ms = (uint32_t)v;
++        } else if (strcmp(key, PM_KEY_MIN_FREE_BYTES) == 0) {
++            cfg->placement_min_free_bytes = strtoull(val, NULL, 10);
++        } else if (strncmp(key, PM_KEY_DOMAIN_PREFIX,
++                           strlen(PM_KEY_DOMAIN_PREFIX)) == 0) {
++            const char *idtxt = key + strlen(PM_KEY_DOMAIN_PREFIX);
++            char *endp = NULL;
++            unsigned long id = strtoul(idtxt, &endp, 10);
++            if (idtxt[0] == '\0' || (endp != NULL && *endp != '\0') ||
++                id >= MDS_MAX_DS_NODES || val[0] == '\0' ||
++                strlen(val) >= PM_DOMAIN_ID_MAX) {
++                (void)fprintf(stderr,
++                    "ERROR: %s: bad ds id, or empty/too long domain "
++                    "(max %d bytes)\n", key, PM_DOMAIN_ID_MAX - 1);
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
++            (void)snprintf(cfg->ds_capacity_domain[id], PM_DOMAIN_ID_MAX,
++                           "%s", val);
++        } else if (strncmp(key, PM_KEY_DOMAIN_WEIGHT_PREFIX,
++                           strlen(PM_KEY_DOMAIN_WEIGHT_PREFIX)) == 0) {
++            const char *dom = key + strlen(PM_KEY_DOMAIN_WEIGHT_PREFIX);
++            unsigned long w = strtoul(val, NULL, 10);
++            if (dom[0] == '\0' || strlen(dom) >= PM_DOMAIN_ID_MAX ||
++                w < PM_DOMAIN_WEIGHT_MIN || w > PM_DOMAIN_WEIGHT_MAX ||
++                cfg->placement_domain_weight_count >= PM_MAX_DOMAINS) {
++                (void)fprintf(stderr,
++                    "ERROR: %s=%lu out of range (%u..%u)\n",
++                    key, w, (unsigned)PM_DOMAIN_WEIGHT_MIN,
++                    (unsigned)PM_DOMAIN_WEIGHT_MAX);
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
++            {
++                uint32_t n = cfg->placement_domain_weight_count++;
++                (void)snprintf(cfg->placement_domain_weight_id[n],
++                               PM_DOMAIN_ID_MAX, "%s", dom);
++                cfg->placement_domain_weight[n] = (uint32_t)w;
++            }
++        } else if (strcmp(key, PM_KEY_ALLOW_MANUAL) == 0) {
++            cfg->placement_allow_manual_base_weights =
++                (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
++        } else if (strcmp(key, PM_KEY_SHRINK) == 0) {
++            if (strcmp(val, "allow") == 0) {
++                cfg->placement_stripe_shrink = PM_SHRINK_ALLOW;
++            } else if (strcmp(val, "strict") == 0) {
++                cfg->placement_stripe_shrink = PM_SHRINK_STRICT;
++            } else {
++                (void)fprintf(stderr,
++                    "ERROR: invalid %s '%s' (expected allow|strict)\n",
++                    key, val);
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
+         } else if (strcmp(key, "placement_capacity_weighting") == 0) {
++            cfg->placement_capacity_weighting_set = true;
+             if (strcmp(val, "off") == 0 ||
+                 strcmp(val, "false") == 0 ||
+                 strcmp(val, "0") == 0) {
+@@ -1488,6 +1574,24 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+         cfg->ds_synth_secret_len = (uint32_t)sizeof(cfg->ds_synth_secret);
+     }
+ 
++    /*
++     * Placement modes: validate the combination and derive the legacy
++     * dispatcher fields from the mode.  An explicit mode always takes
++     * the dispatcher branch so the configured stripe/mirror geometry
++     * applies in rr as well (design section 4, MODE-03).
++     */
++    if (cfg->placement_mode_set) {
++        char perr[256];
++        if (placement_config_validate(cfg, perr, sizeof(perr)) != MDS_OK) {
++            (void)fprintf(stderr, "ERROR: %s\n", perr);
++            return MDS_ERR_INVAL;
++        }
++        cfg->placement_policy_enabled = true;
++        cfg->placement_policy = (cfg->placement_mode == PM_RR)
++            ? PLACEMENT_RR : PLACEMENT_WEIGHTED_RR;
++        placement_config_generation(cfg, cfg->placement_config_generation);
++    }
++
+     /* Auto-size prealloc_pool_size based on ds_count, but only if
+      * neither a profile nor an explicit key set it deliberately. */
+     if (!(cfg->tuning_set & MDS_CFG_SET_PREALLOC_POOL_SIZE) &&
+diff --git a/src/common/placement_config.c b/src/common/placement_config.c
+new file mode 100644
+index 0000000..c735967
+--- /dev/null
++++ b/src/common/placement_config.c
+@@ -0,0 +1,188 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * placement_config.c -- validation and the config generation for the
++ * placement modes (placement_modes.h).  Pure functions over struct
++ * mds_config so the rules are unit-tested without the INI parser.
++ *
++ * Rules (design section 4):
++ *   - an explicit placement_mode rejects every legacy placement key and a
++ *     workload_profile that sets a placement policy (PLACEMENT_MODE_CONFLICT);
++ *   - ds_weight.<id> is a conflict in fill; placement_domain_weight.* needs
++ *     smart + placement_allow_manual_base_weights (DOMAIN_WEIGHT_FORBIDDEN);
++ *   - fill/smart need ds_capacity_poll_ms > 0 and a larger max age (RANGE);
++ *   - smart needs default_mirror_count == 1 and a build with
++ *     ENABLE_DS_CONNECTOR (MIRROR_COUNT_UNSUPPORTED / PLACEMENT_MODE_UNSUPPORTED_BUILD).
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <assert.h>
++
++#include <openssl/sha.h>
++
++#include "pnfs_mds.h"
++#include "placement_modes.h"
++
++_Static_assert(PM_MAX_DOMAINS == MDS_MAX_DS_NODES,
++               "PM_MAX_DOMAINS must equal MDS_MAX_DS_NODES");
++
++const char *placement_mode_name(enum placement_mode m)
++{
++    switch (m) {
++    case PM_RR:    return "rr";
++    case PM_FILL:  return "fill";
++    case PM_SMART: return "smart";
++    case PM_LEGACY:
++    default:       return "legacy";
++    }
++}
++
++const char *placement_shrink_name(enum placement_shrink s)
++{
++    return (s == PM_SHRINK_STRICT) ? "strict" : "allow";
++}
++
++enum placement_mode placement_config_effective_mode(const struct mds_config *cfg)
++{
++    if (cfg == NULL || !cfg->placement_mode_set) {
++        return PM_LEGACY;
++    }
++    return cfg->placement_mode;
++}
++
++static enum mds_status fail(char *err, size_t cap, const char *msg)
++{
++    if (err != NULL && cap > 0) {
++        (void)snprintf(err, cap, "%s", msg);
++    }
++    return MDS_ERR_INVAL;
++}
++
++enum mds_status placement_config_validate(const struct mds_config *cfg,
++                                          char *err, size_t cap)
++{
++    if (cfg == NULL) {
++        return fail(err, cap, "RANGE: null config");
++    }
++    if (!cfg->placement_mode_set) {
++        return MDS_OK;
++    }
++    if (cfg->placement_policy_set || cfg->placement_policy_enabled_set ||
++        cfg->placement_capacity_weighting_set) {
++        return fail(err, cap,
++            "PLACEMENT_MODE_CONFLICT: placement_policy, "
++            "placement_policy_enabled and placement_capacity_weighting "
++            "cannot be combined with placement_mode (remove the legacy keys)");
++    }
++    if (cfg->workload_profile != MDS_PROFILE_DEFAULT &&
++        (cfg->tuning_set & MDS_CFG_SET_PLACEMENT_POLICY)) {
++        return fail(err, cap,
++            "PLACEMENT_MODE_CONFLICT: the selected workload_profile sets a "
++            "placement policy; use a profile without one or drop placement_mode");
++    }
++    if (cfg->placement_mode == PM_FILL && cfg->ds_weight_set) {
++        return fail(err, cap,
++            "PLACEMENT_MODE_CONFLICT: ds_weight.<id> is not allowed in fill "
++            "(weights come from the fill level)");
++    }
++    if (cfg->placement_domain_weight_count > 0 &&
++        (cfg->placement_mode != PM_SMART ||
++         !cfg->placement_allow_manual_base_weights)) {
++        return fail(err, cap,
++            "DOMAIN_WEIGHT_FORBIDDEN: placement_domain_weight.* needs "
++            "placement_mode = smart and placement_allow_manual_base_weights = true");
++    }
++    if (cfg->placement_mode == PM_FILL || cfg->placement_mode == PM_SMART) {
++        if (cfg->ds_capacity_poll_ms == 0) {
++            return fail(err, cap,
++                "RANGE: ds_capacity_poll_ms must be > 0 in fill/smart");
++        }
++        if (cfg->placement_capacity_max_age_ms <= cfg->ds_capacity_poll_ms) {
++            return fail(err, cap,
++                "RANGE: placement_capacity_max_age_ms must exceed ds_capacity_poll_ms");
++        }
++    }
++    if (cfg->placement_mode == PM_SMART) {
++        if (cfg->default_mirror_count > 1) {
++            return fail(err, cap,
++                "MIRROR_COUNT_UNSUPPORTED: smart requires default_mirror_count = 1");
++        }
++#ifndef ENABLE_DS_CONNECTOR
++        return fail(err, cap,
++            "PLACEMENT_MODE_UNSUPPORTED_BUILD: smart needs a binary built "
++            "with ENABLE_DS_CONNECTOR=ON (not yet available in this build)");
++#endif
++    }
++    return MDS_OK;
++}
++
++/* Canonical text of the managed keys; order and format are the contract. */
++struct dw_pair {
++    const char *id;
++    uint32_t    w;
++};
++
++static int dw_cmp(const void *a, const void *b)
++{
++    return strcmp(((const struct dw_pair *)a)->id,
++                  ((const struct dw_pair *)b)->id);
++}
++
++void placement_config_generation(const struct mds_config *cfg, char out[65])
++{
++    static const char hex[] = "0123456789abcdef";
++    char *buf;
++    size_t cap = 64 * 1024;
++    size_t off = 0;
++    unsigned char digest[SHA256_DIGEST_LENGTH];
++    struct dw_pair pairs[PM_MAX_DOMAINS];
++    uint32_t i;
++
++    out[0] = '\0';
++    if (cfg == NULL) {
++        return;
++    }
++    buf = malloc(cap);
++    if (buf == NULL) {
++        return;
++    }
++#define APPEND(...) do { \
++        int n_ = snprintf(buf + off, cap - off, __VA_ARGS__); \
++        if (n_ < 0 || (size_t)n_ >= cap - off) { free(buf); return; } \
++        off += (size_t)n_; \
++    } while (0)
++
++    APPEND("mode=%s\n", placement_mode_name(cfg->placement_mode));
++    APPEND("max_age=%u\n", (unsigned)cfg->placement_capacity_max_age_ms);
++    APPEND("min_free=%llu\n", (unsigned long long)cfg->placement_min_free_bytes);
++    APPEND("shrink=%s\n", placement_shrink_name(cfg->placement_stripe_shrink));
++    APPEND("allow_manual=%d\n", cfg->placement_allow_manual_base_weights ? 1 : 0);
++    for (i = 0; i < MDS_MAX_DS_NODES; i++) {
++        if (cfg->ds_capacity_domain[i][0] != '\0') {
++            APPEND("domain.%u=%s\n", (unsigned)i, cfg->ds_capacity_domain[i]);
++        }
++    }
++    for (i = 0; i < cfg->placement_domain_weight_count && i < PM_MAX_DOMAINS; i++) {
++        pairs[i].id = cfg->placement_domain_weight_id[i];
++        pairs[i].w = cfg->placement_domain_weight[i];
++    }
++    if (i > 0) {
++        qsort(pairs, i, sizeof(pairs[0]), dw_cmp);
++    }
++    for (uint32_t j = 0; j < i; j++) {
++        APPEND("domain_weight.%s=%u\n", pairs[j].id, (unsigned)pairs[j].w);
++    }
++    APPEND("stripe=%u\n", (unsigned)cfg->default_stripe_count);
++    APPEND("mirror=%u\n", (unsigned)cfg->default_mirror_count);
++#undef APPEND
++
++    (void)SHA256((const unsigned char *)buf, off, digest);
++    free(buf);
++    for (i = 0; i < SHA256_DIGEST_LENGTH; i++) {
++        out[2 * i] = hex[digest[i] >> 4];
++        out[2 * i + 1] = hex[digest[i] & 0x0f];
++    }
++    out[64] = '\0';
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index c645a56..ba68e23 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -62,9 +62,11 @@ add_executable(test_backup        unit/test_backup.c)
+ add_executable(test_rolling_upgrade unit/test_rolling_upgrade.c)
+ add_executable(test_mds_metrics    unit/test_mds_metrics.c)
+ add_executable(test_placement_policy unit/test_placement_policy.c)
++add_executable(test_wrr_kernel      unit/test_wrr_kernel.c)
+ add_executable(test_mds_tls        unit/test_mds_tls.c)
+ add_executable(test_mds_gss        unit/test_mds_gss.c)
+ add_executable(test_config          unit/test_config.c)
++add_executable(test_placement_config unit/test_placement_config.c)
+ add_executable(test_log             unit/test_log.c)
+ if(ENABLE_DS_PREALLOC)
+     add_executable(test_ds_prealloc       unit/test_ds_prealloc.c)
+@@ -127,6 +129,7 @@ foreach(test_target
+     test_cluster_membership
+     test_drain
+     test_config
++    test_placement_config
+     test_log
+     test_ds_prealloc
+     test_ds_prealloc_batch
+@@ -145,6 +148,7 @@ foreach(test_target
+     test_apid_http
+     test_mds_metrics
+     test_placement_policy
++    test_wrr_kernel
+     test_mds_tls
+     test_mds_gss
+     test_catalogue
+diff --git a/tests/unit/test_placement_config.c b/tests/unit/test_placement_config.c
+new file mode 100644
+index 0000000..2117f58
+--- /dev/null
++++ b/tests/unit/test_placement_config.c
+@@ -0,0 +1,238 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * test_placement_config.c -- placement_mode parsing, conflict rules,
++ * ranges and the config generation (design section 4).
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "pnfs_mds.h"
++#include "placement_modes.h"
++
++static int tests_run;
++static int tests_passed;
++static int test_failed;
++
++#define ASSERT_EQ(a, b) do { \
++    if ((long long)(a) != (long long)(b)) { \
++        fprintf(stderr, "  FAIL %s:%d: %s (%lld) != %s (%lld)\n", \
++                __FILE__, __LINE__, #a, (long long)(a), #b, (long long)(b)); \
++        test_failed = 1; \
++        return; \
++    } \
++} while (0)
++
++#define ASSERT_TRUE(cond) do { \
++    if (!(cond)) { \
++        fprintf(stderr, "  FAIL %s:%d: !(%s)\n", __FILE__, __LINE__, #cond); \
++        test_failed = 1; \
++        return; \
++    } \
++} while (0)
++
++#define RUN_TEST(fn) do { \
++    tests_run++; \
++    test_failed = 0; \
++    fprintf(stdout, "  %-52s", #fn); \
++    fflush(stdout); \
++    fn(); \
++    if (test_failed == 0) { tests_passed++; fprintf(stdout, "PASS\n"); } \
++    else { fprintf(stdout, "FAILED\n"); } \
++} while (0)
++
++static int write_tmp_ini(const char *content, char path_out[128])
++{
++    (void)snprintf(path_out, 128, "/tmp/pnfs-pm-cfg-%d.conf", (int)getpid());
++    FILE *fp = fopen(path_out, "w");
++    if (fp == NULL) {
++        return -1;
++    }
++    (void)fputs(content, fp);
++    (void)fclose(fp);
++    return 0;
++}
++
++static void test_absent_key_is_legacy(void)
++{
++    struct mds_config cfg; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_policy_enabled = true\nplacement_policy = wrr\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++    ASSERT_EQ(cfg.placement_mode, PM_LEGACY);
++    ASSERT_EQ(cfg.placement_mode_set, false);
++    ASSERT_EQ(placement_config_effective_mode(&cfg), PM_LEGACY);
++    ASSERT_EQ(cfg.placement_policy_enabled, true);
++    ASSERT_EQ(cfg.placement_policy, PLACEMENT_WEIGHTED_RR);
++    ASSERT_EQ(cfg.placement_config_generation[0], '\0');
++}
++
++static void test_each_mode_parses_with_defaults(void)
++{
++    const char *modes[] = {"rr", "fill"};
++    for (int i = 0; i < 2; i++) {
++        struct mds_config cfg; char path[128], ini[128];
++        (void)snprintf(ini, sizeof(ini), "placement_mode = %s\n", modes[i]);
++        ASSERT_EQ(write_tmp_ini(ini, path), 0);
++        ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++        ASSERT_EQ(cfg.placement_mode, i == 0 ? PM_RR : PM_FILL);
++        ASSERT_EQ(cfg.placement_mode_set, true);
++        ASSERT_EQ(cfg.placement_capacity_max_age_ms, 120000u);
++        ASSERT_EQ(cfg.placement_min_free_bytes, 0u);
++        ASSERT_EQ(cfg.placement_stripe_shrink, PM_SHRINK_ALLOW);
++        ASSERT_EQ(cfg.placement_allow_manual_base_weights, false);
++        ASSERT_EQ(strlen(cfg.placement_config_generation), 64u);
++        ASSERT_EQ(cfg.placement_policy_enabled, true);
++        ASSERT_EQ(cfg.placement_policy, i == 0 ? PLACEMENT_RR : PLACEMENT_WEIGHTED_RR);
++    }
++}
++
++static void test_smart_is_unsupported_in_this_build(void)
++{
++    struct mds_config cfg; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_mode = smart\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
++}
++
++static void test_legacy_keys_conflict_with_mode(void)
++{
++    const char *bad[] = {
++        "placement_mode = rr\nplacement_policy = rr\n",
++        "placement_mode = rr\nplacement_policy_enabled = true\n",
++        "placement_mode = rr\nplacement_policy_enabled = false\n",
++        "placement_mode = fill\nplacement_capacity_weighting = proportional\n",
++        "placement_mode = fill\nplacement_capacity_weighting = off\n",
++        "placement_mode = fill\nds_weight.0 = 3\n",
++        "placement_mode = fill\nworkload_profile = hpc\n",
++        "placement_mode = rr\nworkload_profile = genomics\n",
++        "placement_mode = fill\nplacement_domain_weight.d1 = 5\n",
++        "placement_mode = rr\nplacement_domain_weight.d1 = 5\nplacement_allow_manual_base_weights = true\n",
++    };
++    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
++        struct mds_config cfg; char path[128];
++        ASSERT_EQ(write_tmp_ini(bad[i], path), 0);
++        ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
++    }
++    /* rr may carry ds_weight (ignored by rr; forbidden only in fill). */
++    struct mds_config cfg; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_mode = rr\nds_weight.0 = 3\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++    /* the default profile sets nothing and is compatible */
++    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nworkload_profile = default\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++}
++
++static void test_ranges(void)
++{
++    const char *bad[] = {
++        "placement_mode = fill\nds_capacity_poll_ms = 0\n",
++        "placement_mode = fill\nds_capacity_poll_ms = 60000\nplacement_capacity_max_age_ms = 60000\n",
++        "placement_mode = fill\nplacement_capacity_max_age_ms = 86400001\n",
++        "placement_mode = fill\nplacement_capacity_max_age_ms = 0\n",
++        "placement_mode = fill\nplacement_stripe_shrink = maybe\n",
++        "placement_mode = fill\nds_capacity_domain.3 = \n",
++        "placement_mode = fill\nds_capacity_domain.999 = d\n",
++        "placement_mode = fill\nds_capacity_domain.x = d\n",
++        "placement_mode = sideways\n",
++    };
++    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
++        struct mds_config cfg; char path[128];
++        ASSERT_EQ(write_tmp_ini(bad[i], path), 0);
++        ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
++    }
++    struct mds_config cfg; char path[128];
++    ASSERT_EQ(write_tmp_ini(
++        "placement_mode = fill\n"
++        "ds_capacity_poll_ms = 30000\n"
++        "placement_capacity_max_age_ms = 90000\n"
++        "placement_min_free_bytes = 1073741824\n"
++        "placement_stripe_shrink = strict\n"
++        "ds_capacity_domain.0 = xi/fs-1\n"
++        "ds_capacity_domain.1 = xi/fs-1\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++    ASSERT_EQ(cfg.placement_capacity_max_age_ms, 90000u);
++    ASSERT_TRUE(cfg.placement_min_free_bytes == 1073741824ull);
++    ASSERT_EQ(cfg.placement_stripe_shrink, PM_SHRINK_STRICT);
++    ASSERT_EQ(strcmp(cfg.ds_capacity_domain[0], "xi/fs-1"), 0);
++    ASSERT_EQ(strcmp(cfg.ds_capacity_domain[1], "xi/fs-1"), 0);
++    ASSERT_EQ(cfg.ds_capacity_domain[2][0], '\0');
++}
++
++static void test_rr_does_not_need_the_probe(void)
++{
++    struct mds_config cfg; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_mode = rr\nds_capacity_poll_ms = 0\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++}
++
++static void test_generation_is_stable_and_sensitive(void)
++{
++    struct mds_config a, b; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_capacity_domain.1 = d\nds_capacity_domain.0 = d\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &a), MDS_OK);
++    ASSERT_EQ(write_tmp_ini("ds_capacity_domain.0 = d\nplacement_mode = fill\nds_capacity_domain.1 = d\n# comment\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
++    ASSERT_EQ(strcmp(a.placement_config_generation, b.placement_config_generation), 0);
++    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_capacity_domain.0 = d\nds_capacity_domain.1 = e\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
++    ASSERT_TRUE(strcmp(a.placement_config_generation, b.placement_config_generation) != 0);
++    ASSERT_EQ(write_tmp_ini("placement_mode = rr\nds_capacity_domain.0 = d\nds_capacity_domain.1 = d\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
++    ASSERT_TRUE(strcmp(a.placement_config_generation, b.placement_config_generation) != 0);
++}
++
++static void test_rr_keeps_geometry(void)
++{
++    struct mds_config cfg; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_mode = rr\ndefault_stripe_count = 4\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++    ASSERT_EQ(cfg.default_stripe_count, 4u);
++    ASSERT_EQ(cfg.placement_policy_enabled, true);
++    ASSERT_EQ(cfg.placement_policy, PLACEMENT_RR);
++}
++
++static void test_validate_is_pure(void)
++{
++    struct mds_config cfg; char err[256];
++    memset(&cfg, 0, sizeof(cfg));
++    ASSERT_EQ(placement_config_validate(&cfg, err, sizeof(err)), MDS_OK);   /* legacy: nothing to check */
++    cfg.placement_mode_set = true; cfg.placement_mode = PM_FILL;
++    cfg.ds_capacity_poll_ms = 1000; cfg.placement_capacity_max_age_ms = 5000;
++    ASSERT_EQ(placement_config_validate(&cfg, err, sizeof(err)), MDS_OK);
++    cfg.placement_capacity_max_age_ms = 1000;
++    ASSERT_EQ(placement_config_validate(&cfg, err, sizeof(err)), MDS_ERR_INVAL);
++    ASSERT_EQ(strncmp(err, "RANGE:", 6), 0);
++    ASSERT_EQ(placement_config_validate(NULL, err, sizeof(err)), MDS_ERR_INVAL);
++}
++
++static void test_manifest_constants(void)
++{
++    /* Pinned to docs/placement-modes/contract-manifest.json in XinnorLab/pNFS. */
++    ASSERT_EQ(PM_WEIGHT_SCALE, 65536u);
++    ASSERT_EQ(PM_DOMAIN_WEIGHT_MIN, 1u);
++    ASSERT_EQ(PM_DOMAIN_WEIGHT_MAX, 10000u);
++    ASSERT_EQ(PM_DEFAULT_CAP_MAX_AGE_MS, 120000u);
++    ASSERT_EQ(PM_CAP_MAX_AGE_MS_MAX, 86400000u);
++    ASSERT_EQ(PM_DOMAIN_ID_MAX, 128);
++    ASSERT_EQ(PM_MAX_DOMAINS, MDS_MAX_DS_NODES);
++    ASSERT_EQ(strcmp(placement_mode_name(PM_FILL), "fill"), 0);
++    ASSERT_EQ(strcmp(placement_mode_name(PM_LEGACY), "legacy"), 0);
++}
++
++int main(void)
++{
++    printf("test_placement_config\n");
++    RUN_TEST(test_absent_key_is_legacy);
++    RUN_TEST(test_each_mode_parses_with_defaults);
++    RUN_TEST(test_smart_is_unsupported_in_this_build);
++    RUN_TEST(test_legacy_keys_conflict_with_mode);
++    RUN_TEST(test_ranges);
++    RUN_TEST(test_rr_does_not_need_the_probe);
++    RUN_TEST(test_generation_is_stable_and_sensitive);
++    RUN_TEST(test_rr_keeps_geometry);
++    RUN_TEST(test_validate_is_pure);
++    RUN_TEST(test_manifest_constants);
++    printf("%d/%d passed\n", tests_passed, tests_run);
++    return tests_passed == tests_run ? 0 : 1;
++}

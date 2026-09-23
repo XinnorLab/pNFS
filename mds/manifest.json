@@ -1,0 +1,54 @@
+{
+  "upstream": "PEAK-AIO/pnfs-lattice",
+  "upstream_sha": "6b4dcde3cd6a8b02e8a012695ff0c29e93a0caf4",
+  "fork": "XinnorLab/pnfs-lattice",
+  "fork_branch": "xinnor/placement-modes",
+  "fork_sha": "efc32657218272e10f09a1e53ba5a6188f37a531",
+  "patches_dir": "patches/6b4dcde",
+  "patches": [
+    {
+      "file": "0001-feat-wrr-vendor-the-XinnorLab-kernel-kernel-id-refus.patch",
+      "sha256": "d60ace47fee43ed0df6a4974240e3221d1a0d30e24db12cb649fa416f6d23fbb"
+    },
+    {
+      "file": "0002-feat-config-placement_mode-rr-fill-smart-with-confli.patch",
+      "sha256": "adeb293b4acb9b555368948fab8d87ec2567957458b175f9d4669865ce7c9443"
+    },
+    {
+      "file": "0003-feat-ds_capacity-per-DS-observation-record-avail-fsi.patch",
+      "sha256": "0cf1135529e9fba934d1bb60ca0545d7b591c2d41d449a45d3df98b477a9e684"
+    },
+    {
+      "file": "0004-feat-placement-candidate-gate-and-admit-for-rr-fill-.patch",
+      "sha256": "5f007468dc7108eac955f74be704258a63170cf083a215dcc871e6ae2744f70e"
+    },
+    {
+      "file": "0005-feat-placement-gate-singleton-with-a-published-capac.patch",
+      "sha256": "c11ec7645fa3e35ddd2b1901df13d9b66a3f2737243892869f66aa8e9038c808"
+    },
+    {
+      "file": "0006-feat-placement-every-selection-site-goes-through-pla.patch",
+      "sha256": "2d4cb4ea259cd01cf30b5015d147a3923e217f1c79aef3128f12330410a786f7"
+    },
+    {
+      "file": "0007-feat-proxy_io-split-lookup-from-create-every-DS-file.patch",
+      "sha256": "994abb519a18b5fffd8909b148dc485a25b2f0279131f71f939c837231743a7d"
+    },
+    {
+      "file": "0008-feat-admin-config-show-reports-placement-mode-genera.patch",
+      "sha256": "a1846c3d4b0a85925c8a98fd0ee1b8566b1e19d56a3943ad48ac440b4cf100e8"
+    },
+    {
+      "file": "0009-docs-placement-operator-guide-rr-fill-examples-and-a.patch",
+      "sha256": "d1fc3588f99298b9e6ae71f48ba397e08f17aff5acfa11e7f453816d3c5966b4"
+    }
+  ],
+  "cmake_flags": [
+    "-DENABLE_WRR=ON",
+    "-DENABLE_DS_PREALLOC=OFF",
+    "-DENABLE_TESTS=ON",
+    "-DENABLE_EBPF=OFF"
+  ],
+  "connector_profile": "xinas-mvp@1",
+  "contract_manifest": "docs/placement-modes/contract-manifest.json"
+}

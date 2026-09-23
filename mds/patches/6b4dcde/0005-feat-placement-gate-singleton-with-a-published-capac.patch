@@ -1,0 +1,795 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 21:44:03 +0300
+Subject: [PATCH 5/9] feat(placement): gate singleton with a published capacity
+ view, startup wiring, site helper, metrics
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/mds_metrics.h            |   1 +
+ include/placement_gate.h         |  23 +--
+ include/placement_modes.h        |  22 +++
+ src/common/mds_metrics.c         |  39 +++++
+ src/common/placement_config.c    |  27 +++
+ src/fsal_obj/placement_gate.c    | 274 +++++++++++++++++++++++++++----
+ src/mds/ds_capacity.c            |   6 +
+ src/mds/main.c                   |  20 +++
+ tests/unit/test_placement_gate.c | 204 +++++++++++++++++++++++
+ 9 files changed, 561 insertions(+), 55 deletions(-)
+
+diff --git a/include/mds_metrics.h b/include/mds_metrics.h
+index 2d03e65..588ad08 100644
+--- a/include/mds_metrics.h
++++ b/include/mds_metrics.h
+@@ -171,6 +171,7 @@ struct mds_branch_metrics {
+     _Atomic uint64_t placement_rejections_total[16]; /**< indexed by enum placement_reason */
+     _Atomic uint64_t placement_eligible_ds;          /**< gauge: candidates at the last admit */
+     _Atomic uint64_t placement_alias_suspected_total;
++    _Atomic uint64_t placement_mode_gauge;           /**< enum placement_mode of the gate (0 = legacy) */
+ 
+     /*
+      * IO_ADVISE accounting (RFC 7862 S15.5).  io_advise_total
+diff --git a/include/placement_gate.h b/include/placement_gate.h
+index 4cc4127..fbfa208 100644
+--- a/include/placement_gate.h
++++ b/include/placement_gate.h
+@@ -29,28 +29,7 @@
+ #include "placement_modes.h"
+ #include "ds_cache.h"
+ 
+-/* Bounded reason vocabulary; names via placement_reason_name(). */
+-enum placement_reason {
+-    PR_NONE = 0,
+-    PR_DS_OFFLINE,
+-    PR_CAPACITY_UNKNOWN,
+-    PR_CAPACITY_STALE,
+-    PR_CAPACITY_FULL,
+-    PR_DOMAIN_MAP_CONTRADICTION,
+-    PR_SHARED_FS_ALIAS_UNMAPPED,
+-    PR_ASSESSMENT_UNKNOWN,
+-    PR_ASSESSMENT_STALE,
+-    PR_CONNECTOR_DENIED,
+-    PR_ZERO_MULTIPLIER,
+-    PR_NO_BINDING,
+-    PR_NO_ELIGIBLE_DS,
+-    PR_INSUFFICIENT_ELIGIBLE_DS,
+-    PR_MODE_NOT_READY,
+-    PR_WEIGHT_OVERFLOW,
+-    PR_COUNT
+-};
+-
+-const char *placement_reason_name(enum placement_reason r);
++/* enum placement_reason and placement_reason_name() live in placement_modes.h. */
+ 
+ /* Immutable capacity input for one decision (built from the DS cache). */
+ struct placement_capacity_view {
+diff --git a/include/placement_modes.h b/include/placement_modes.h
+index 6cffa1c..d581243 100644
+--- a/include/placement_modes.h
++++ b/include/placement_modes.h
+@@ -48,6 +48,28 @@ enum placement_shrink {
+ #define PM_WEIGHT_SCALE             65536u
+ #define PM_MAX_DOMAINS              256   /* == MDS_MAX_DS_NODES; asserted in placement_config.c */
+ 
++/* Bounded reason vocabulary of the gate (metrics labels, logs, config show). */
++enum placement_reason {
++    PR_NONE = 0,
++    PR_DS_OFFLINE,
++    PR_CAPACITY_UNKNOWN,
++    PR_CAPACITY_STALE,
++    PR_CAPACITY_FULL,
++    PR_DOMAIN_MAP_CONTRADICTION,
++    PR_SHARED_FS_ALIAS_UNMAPPED,
++    PR_ASSESSMENT_UNKNOWN,
++    PR_ASSESSMENT_STALE,
++    PR_CONNECTOR_DENIED,
++    PR_ZERO_MULTIPLIER,
++    PR_NO_BINDING,
++    PR_NO_ELIGIBLE_DS,
++    PR_INSUFFICIENT_ELIGIBLE_DS,
++    PR_MODE_NOT_READY,
++    PR_WEIGHT_OVERFLOW,
++    PR_COUNT
++};
++
++const char *placement_reason_name(enum placement_reason r);
+ const char *placement_mode_name(enum placement_mode m);     /* "legacy"|"rr"|"fill"|"smart" */
+ const char *placement_shrink_name(enum placement_shrink s); /* "allow"|"strict" */
+ 
+diff --git a/src/common/mds_metrics.c b/src/common/mds_metrics.c
+index 608a382..754ce27 100644
+--- a/src/common/mds_metrics.c
++++ b/src/common/mds_metrics.c
+@@ -10,6 +10,7 @@
+ #include <string.h>
+ 
+ #include "mds_metrics.h"
++#include "placement_modes.h"
+ #include "mds_histogram.h"
+ #include "mds_op_metrics.h"
+ #include "pnfs_mds.h"
+@@ -581,6 +582,44 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
+      * operators scanning /metrics grep for it to spot unexpected
+      * ds_count > 64 deployments.
+      */
++    /* XinnorLab placement modes: mode gauge, rejection reasons, eligibility. */
++    {
++        enum placement_mode pm = (enum placement_mode)atomic_load(
++            (_Atomic uint64_t *)&branch->placement_mode_gauge);
++        extra = snprintf(buf + base, cap - (size_t)base,
++            "# HELP pnfs_mds_placement_mode Effective placement mode (1 on the active series).\n"
++            "# TYPE pnfs_mds_placement_mode gauge\n"
++            "pnfs_mds_placement_mode{mode=\"%s\"} 1\n"
++            "# HELP pnfs_mds_placement_eligible_ds Candidates at the last placement decision.\n"
++            "# TYPE pnfs_mds_placement_eligible_ds gauge\n"
++            "pnfs_mds_placement_eligible_ds %lu\n"
++            "# HELP pnfs_mds_placement_alias_suspected_total Same filesystem id behind two host names.\n"
++            "# TYPE pnfs_mds_placement_alias_suspected_total counter\n"
++            "pnfs_mds_placement_alias_suspected_total %lu\n"
++            "# HELP pnfs_mds_placement_rejections_total DS rejected by the placement gate, by reason.\n"
++            "# TYPE pnfs_mds_placement_rejections_total counter\n",
++            placement_mode_name(pm),
++            (unsigned long)atomic_load(
++                (_Atomic uint64_t *)&branch->placement_eligible_ds),
++            (unsigned long)atomic_load(
++                (_Atomic uint64_t *)&branch->placement_alias_suspected_total));
++        if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
++            return -1;
++        }
++        base += extra;
++        for (int r = 1; r < PR_COUNT; r++) {
++            extra = snprintf(buf + base, cap - (size_t)base,
++                "pnfs_mds_placement_rejections_total{reason=\"%s\"} %lu\n",
++                placement_reason_name((enum placement_reason)r),
++                (unsigned long)atomic_load(
++                    (_Atomic uint64_t *)&branch->placement_rejections_total[r]));
++            if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
++                return -1;
++            }
++            base += extra;
++        }
++    }
++
+     extra = snprintf(buf + base, cap - (size_t)base,
+         "# HELP pnfs_mds_placement_heap_fallback_total "
+             "Placement dispatcher heap-fallback count "
+diff --git a/src/common/placement_config.c b/src/common/placement_config.c
+index c735967..a1068f1 100644
+--- a/src/common/placement_config.c
++++ b/src/common/placement_config.c
+@@ -39,6 +39,33 @@ const char *placement_mode_name(enum placement_mode m)
+     }
+ }
+ 
++static const char *const reason_names[PR_COUNT] = {
++    [PR_NONE]                     = "NONE",
++    [PR_DS_OFFLINE]               = "DS_OFFLINE",
++    [PR_CAPACITY_UNKNOWN]         = "CAPACITY_UNKNOWN",
++    [PR_CAPACITY_STALE]           = "CAPACITY_STALE",
++    [PR_CAPACITY_FULL]            = "CAPACITY_FULL",
++    [PR_DOMAIN_MAP_CONTRADICTION] = "DOMAIN_MAP_CONTRADICTION",
++    [PR_SHARED_FS_ALIAS_UNMAPPED] = "SHARED_FS_ALIAS_UNMAPPED",
++    [PR_ASSESSMENT_UNKNOWN]       = "ASSESSMENT_UNKNOWN",
++    [PR_ASSESSMENT_STALE]         = "ASSESSMENT_STALE",
++    [PR_CONNECTOR_DENIED]         = "CONNECTOR_DENIED",
++    [PR_ZERO_MULTIPLIER]          = "ZERO_MULTIPLIER",
++    [PR_NO_BINDING]               = "NO_BINDING",
++    [PR_NO_ELIGIBLE_DS]           = "NO_ELIGIBLE_DS",
++    [PR_INSUFFICIENT_ELIGIBLE_DS] = "INSUFFICIENT_ELIGIBLE_DS",
++    [PR_MODE_NOT_READY]           = "MODE_NOT_READY",
++    [PR_WEIGHT_OVERFLOW]          = "WEIGHT_OVERFLOW",
++};
++
++const char *placement_reason_name(enum placement_reason r)
++{
++    if ((unsigned)r >= PR_COUNT || reason_names[r] == NULL) {
++        return "UNKNOWN_REASON";
++    }
++    return reason_names[r];
++}
++
+ const char *placement_shrink_name(enum placement_shrink s)
+ {
+     return (s == PM_SHRINK_STRICT) ? "strict" : "allow";
+diff --git a/src/fsal_obj/placement_gate.c b/src/fsal_obj/placement_gate.c
+index 30345a7..666e3d6 100644
+--- a/src/fsal_obj/placement_gate.c
++++ b/src/fsal_obj/placement_gate.c
+@@ -21,39 +21,8 @@
+ #include "mds_log.h"
+ #include "wrr.h"
+ 
+-/* -----------------------------------------------------------------------
+- * Reasons
+- * ----------------------------------------------------------------------- */
+-
+-static const char *const reason_names[PR_COUNT] = {
+-    [PR_NONE]                     = "NONE",
+-    [PR_DS_OFFLINE]               = "DS_OFFLINE",
+-    [PR_CAPACITY_UNKNOWN]         = "CAPACITY_UNKNOWN",
+-    [PR_CAPACITY_STALE]           = "CAPACITY_STALE",
+-    [PR_CAPACITY_FULL]            = "CAPACITY_FULL",
+-    [PR_DOMAIN_MAP_CONTRADICTION] = "DOMAIN_MAP_CONTRADICTION",
+-    [PR_SHARED_FS_ALIAS_UNMAPPED] = "SHARED_FS_ALIAS_UNMAPPED",
+-    [PR_ASSESSMENT_UNKNOWN]       = "ASSESSMENT_UNKNOWN",
+-    [PR_ASSESSMENT_STALE]         = "ASSESSMENT_STALE",
+-    [PR_CONNECTOR_DENIED]         = "CONNECTOR_DENIED",
+-    [PR_ZERO_MULTIPLIER]          = "ZERO_MULTIPLIER",
+-    [PR_NO_BINDING]               = "NO_BINDING",
+-    [PR_NO_ELIGIBLE_DS]           = "NO_ELIGIBLE_DS",
+-    [PR_INSUFFICIENT_ELIGIBLE_DS] = "INSUFFICIENT_ELIGIBLE_DS",
+-    [PR_MODE_NOT_READY]           = "MODE_NOT_READY",
+-    [PR_WEIGHT_OVERFLOW]          = "WEIGHT_OVERFLOW",
+-};
+-
+ _Static_assert(PR_COUNT <= 16, "placement_rejections_total[16] must hold every reason");
+ 
+-const char *placement_reason_name(enum placement_reason r)
+-{
+-    if ((unsigned)r >= PR_COUNT || reason_names[r] == NULL) {
+-        return "UNKNOWN_REASON";
+-    }
+-    return reason_names[r];
+-}
+-
+ /* -----------------------------------------------------------------------
+  * Weight
+  * ----------------------------------------------------------------------- */
+@@ -417,11 +386,13 @@ enum mds_status placement_admit(const struct placement_ctx *ctx,
+     if (ctx->mode == PM_RR || ctx->mode == PM_LEGACY) {
+         uint32_t start;
+ 
+-        if (ctx->rr_counter != NULL) {
++        if (rr_key != 0) {
++            start = (uint32_t)(rr_key % (uint64_t)n_c);
++        } else if (ctx->rr_counter != NULL) {
+             start = atomic_fetch_add_explicit(ctx->rr_counter, sc * mirror_count,
+                                               memory_order_relaxed);
+         } else {
+-            start = (uint32_t)(rr_key % (uint64_t)n_c);
++            start = 0;
+         }
+         for (s = 0; s < sc; s++) {
+             for (m = 0; m < mirror_count; m++) {
+@@ -580,3 +551,240 @@ void placement_gate_note_alias_suspected(uint32_t a, uint32_t b)
+             (unsigned)a, (unsigned)b);
+     }
+ }
++
++/* =======================================================================
++ * Process singleton: effective mode + published capacity view + tokens
++ * ======================================================================= */
++
++#include <pthread.h>
++#include "ds_cache.h"
++
++struct cap_view_ref {
++    _Atomic uint32_t refs;
++    struct placement_capacity_view view;
++};
++
++static struct {
++    bool                  initialised;
++    enum placement_mode   mode;
++    enum placement_shrink shrink;
++    uint32_t              max_age_ms;
++    uint64_t              min_free;
++    char                  domain_of[MDS_MAX_DS_NODES][PM_DOMAIN_ID_MAX];
++    char                  generation[65];
++    struct ds_cache      *cache;
++    pthread_rwlock_t      lock;     /* guards cur */
++    struct cap_view_ref  *cur;
++    _Atomic uint32_t      rr_counter;
++    _Atomic uint32_t      snapshot_gen;
++} g;
++
++static void view_unref(struct cap_view_ref *ref)
++{
++    if (ref != NULL &&
++        atomic_fetch_sub_explicit(&ref->refs, 1, memory_order_acq_rel) == 1) {
++        free(ref);
++    }
++}
++
++enum placement_mode placement_gate_mode(void)
++{
++    return g.initialised ? g.mode : PM_LEGACY;
++}
++
++const char *placement_gate_generation(void)
++{
++    return g.initialised ? g.generation : "";
++}
++
++void placement_gate_publish_capacity(void)
++{
++    struct cap_view_ref *fresh;
++    struct cap_view_ref *old;
++
++    if (!g.initialised || g.cache == NULL) {
++        return;
++    }
++    fresh = calloc(1, sizeof(*fresh));
++    if (fresh == NULL) {
++        return;
++    }
++    atomic_store_explicit(&fresh->refs, 1, memory_order_relaxed);
++    fresh->view.count = ds_cache_capacity_view(g.cache, fresh->view.rows,
++                                               MDS_MAX_DS_NODES);
++    pthread_rwlock_wrlock(&g.lock);
++    old = g.cur;
++    g.cur = fresh;
++    pthread_rwlock_unlock(&g.lock);
++    atomic_fetch_add_explicit(&g.snapshot_gen, 1, memory_order_release);
++    view_unref(old);
++}
++
++void placement_gate_ctx(struct placement_ctx *out, uint64_t now_mono_ms)
++{
++    struct cap_view_ref *ref = NULL;
++
++    memset(out, 0, sizeof(*out));
++    out->now_mono_ms = now_mono_ms;
++    if (!g.initialised) {
++        out->mode = PM_LEGACY;
++        return;
++    }
++    out->mode = g.mode;
++    out->shrink = g.shrink;
++    out->capacity_max_age_ms = g.max_age_ms;
++    out->min_free_bytes = g.min_free;
++    out->domain_of = (const char (*)[PM_DOMAIN_ID_MAX])g.domain_of;
++    out->rr_counter = &g.rr_counter;
++    if (g.mode == PM_FILL || g.mode == PM_SMART) {
++        pthread_rwlock_rdlock(&g.lock);
++        ref = g.cur;
++        if (ref != NULL) {
++            atomic_fetch_add_explicit(&ref->refs, 1, memory_order_acq_rel);
++        }
++        pthread_rwlock_unlock(&g.lock);
++        out->cap = (ref != NULL) ? &ref->view : NULL;
++        out->view_ref = ref;
++    }
++}
++
++void placement_gate_ctx_release(struct placement_ctx *ctx)
++{
++    if (ctx == NULL || ctx->view_ref == NULL) {
++        return;
++    }
++    view_unref((struct cap_view_ref *)ctx->view_ref);
++    ctx->view_ref = NULL;
++    ctx->cap = NULL;
++}
++
++int placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache)
++{
++    if (cfg == NULL || !cfg->placement_mode_set) {
++        return -1;
++    }
++    if (g.initialised) {
++        placement_gate_destroy();
++    }
++    memset(&g, 0, sizeof(g));
++    g.mode = cfg->placement_mode;
++    g.shrink = cfg->placement_stripe_shrink;
++    g.max_age_ms = cfg->placement_capacity_max_age_ms;
++    g.min_free = cfg->placement_min_free_bytes;
++    memcpy(g.domain_of, cfg->ds_capacity_domain, sizeof(g.domain_of));
++    memcpy(g.generation, cfg->placement_config_generation, sizeof(g.generation));
++    g.generation[64] = '\0';
++    g.cache = cache;
++    if ((g.mode == PM_FILL || g.mode == PM_SMART) && mds_wrr_kernel_id() == 0) {
++        MDS_LOG_ERROR(LOG_COMP_FSAL,
++            "placement: mode %s needs the XinnorLab wrr kernel; this binary "
++            "carries the community stub (kernel id 0)",
++            placement_mode_name(g.mode));
++        return -1;
++    }
++    if ((g.mode == PM_FILL || g.mode == PM_SMART) && cache == NULL) {
++        MDS_LOG_ERROR(LOG_COMP_FSAL,
++            "placement: mode %s needs the DS cache (capacity observations)",
++            placement_mode_name(g.mode));
++        return -1;
++    }
++    if (pthread_rwlock_init(&g.lock, NULL) != 0) {
++        return -1;
++    }
++    g.initialised = true;
++    atomic_store_explicit(&g_branch_metrics.placement_mode_gauge,
++                          (uint64_t)g.mode, memory_order_relaxed);
++    placement_gate_publish_capacity();
++    MDS_LOG_INFO(LOG_COMP_FSAL,
++        "placement_mode=%s generation=%.12s kernel=%08x shrink=%s "
++        "max_age_ms=%u min_free=%llu",
++        placement_mode_name(g.mode), g.generation,
++        (unsigned)mds_wrr_kernel_id(), placement_shrink_name(g.shrink),
++        (unsigned)g.max_age_ms, (unsigned long long)g.min_free);
++    return 0;
++}
++
++void placement_gate_destroy(void)
++{
++    struct cap_view_ref *old;
++
++    if (!g.initialised) {
++        return;
++    }
++    pthread_rwlock_wrlock(&g.lock);
++    old = g.cur;
++    g.cur = NULL;
++    pthread_rwlock_unlock(&g.lock);
++    view_unref(old);
++    pthread_rwlock_destroy(&g.lock);
++    g.initialised = false;
++    g.cache = NULL;
++    atomic_store_explicit(&g_branch_metrics.placement_mode_gauge, 0,
++                          memory_order_relaxed);
++}
++
++/* -----------------------------------------------------------------------
++ * Site helper
++ * ----------------------------------------------------------------------- */
++
++static void note_refusal(enum placement_reason why)
++{
++    static _Atomic uint64_t last_warn_ms[PR_COUNT];
++    uint64_t now;
++    uint64_t last;
++
++    if ((unsigned)why >= PR_COUNT) {
++        return;
++    }
++    atomic_fetch_add_explicit(&g_branch_metrics.placement_rejections_total[why],
++                              1, memory_order_relaxed);
++    now = ds_cache_mono_ms();
++    last = atomic_load_explicit(&last_warn_ms[why], memory_order_relaxed);
++    if (now - last >= 10000ULL &&
++        atomic_compare_exchange_strong(&last_warn_ms[why], &last, now)) {
++        MDS_LOG_WARN(LOG_COMP_FSAL, "placement refused: %s (mode %s)",
++                     placement_reason_name(why),
++                     placement_mode_name(placement_gate_mode()));
++    }
++}
++
++enum mds_status placement_select_gated(bool legacy_policy_enabled,
++                                       enum mds_placement_policy legacy_policy,
++                                       const struct mds_ds_info *ds_list, uint32_t n,
++                                       uint32_t *stripe_count, uint32_t mirror_count,
++                                       uint32_t stripe_unit, uint64_t rr_key,
++                                       struct mds_ds_map_entry *entries,
++                                       enum placement_reason *reason)
++{
++    struct placement_ctx ctx;
++    enum mds_status st;
++    enum placement_reason why = PR_NONE;
++
++    if (reason != NULL) {
++        *reason = PR_NONE;
++    }
++    if (placement_gate_mode() == PM_LEGACY) {
++        if (!legacy_policy_enabled && rr_key != 0) {
++            return placement_select_rr_at2(ds_list, n, stripe_count, mirror_count,
++                                           stripe_unit, rr_key, entries);
++        }
++        if (legacy_policy_enabled) {
++            return placement_select_ex2(legacy_policy, ds_list, n, stripe_count,
++                                        mirror_count, stripe_unit, entries);
++        }
++        return placement_select2(ds_list, n, stripe_count, mirror_count,
++                                 stripe_unit, entries);
++    }
++    (void)stripe_unit;
++    placement_gate_ctx(&ctx, ds_cache_mono_ms());
++    st = placement_admit(&ctx, ds_list, n, stripe_count, mirror_count, rr_key,
++                         entries, &why);
++    placement_gate_ctx_release(&ctx);
++    if (st == MDS_ERR_NOSPC) {
++        note_refusal(why);
++    }
++    if (reason != NULL) {
++        *reason = why;
++    }
++    return st;
++}
+diff --git a/src/mds/ds_capacity.c b/src/mds/ds_capacity.c
+index 178ea92..d54771d 100644
+--- a/src/mds/ds_capacity.c
++++ b/src/mds/ds_capacity.c
+@@ -44,6 +44,7 @@
+ #include "ds_cache.h"
+ #include "ds_capacity.h"
+ #include "mds_catalogue.h"
++#include "placement_gate.h"
+ 
+ /* -----------------------------------------------------------------------
+  * Internal structures
+@@ -302,6 +303,8 @@ int ds_capacity_probe_once(struct ds_cache *cache,
+ 		probed += probe_one(cache, mount_path_fmt, ids[i],
+ 				    mode, NULL);
+ 	}
++	/* Placement modes read an immutable snapshot of the records. */
++	placement_gate_publish_capacity();
+ 	return probed;
+ }
+ 
+@@ -372,6 +375,9 @@ static void *capacity_thread(void *arg)
+ 		 */
+ 		capacity_reload_cluster_view(cap->cache, cap->cat);
+ 
++		/* Publish this sweep's observation records to the gate. */
++		placement_gate_publish_capacity();
++
+ 		if (!sleep_or_stop(cap->stop_pipe[0], cap->poll_ms)) {
+ 			break;
+ 		}
+diff --git a/src/mds/main.c b/src/mds/main.c
+index c87080e..bf21470 100644
+--- a/src/mds/main.c
++++ b/src/mds/main.c
+@@ -47,6 +47,7 @@
+ #include "mds_shard.h"
+ #include "ds_cache.h"
+ #include "ds_capacity.h"
++#include "placement_gate.h"
+ #include "ds_io_limits.h"
+ #include "inode_cache.h"
+ #include "parent_touch.h"
+@@ -1050,6 +1051,24 @@ if (s_pt != NULL) {
+ 		ds_cache_apply_weights(ds_cache, cfg.ds_weight_by_id);
+ 	}
+ 
++	/*
++	 * XinnorLab placement modes: the gate in front of every selector
++	 * and every DS file creation.  Only with an explicit placement_mode;
++	 * a refusal here (stub kernel, no DS cache for fill/smart) is fatal
++	 * because silently running another mode is exactly what the design
++	 * forbids.
++	 */
++	if (cfg.placement_mode_set) {
++		if (placement_gate_init(&cfg, ds_cache) != 0) {
++			MDS_LOG_ERROR(LOG_COMP_MDS,
++				"placement gate init failed (placement_mode=%s); "
++				"refusing to start",
++				placement_mode_name(cfg.placement_mode));
++			exit_code = EXIT_FAILURE;
++			goto cleanup;
++		}
++	}
++
+ 	/*
+ 	 * Plumb the DS cache into the prealloc pool so its pop
+ 	 * snapshot picks up live capacity (statvfs probe) and
+@@ -2210,6 +2229,7 @@ cleanup:
+ 	 * writes into.  ds_capacity_stop joins the worker thread. */
+ 	ds_capacity_stop(ds_cap);
+ 	ds_cap = NULL;
++	placement_gate_destroy();
+ 	session_table_destroy(session_tbl);
+ 	open_state_table_destroy(ot);
+ 	commit_queue_destroy(cq);
+diff --git a/tests/unit/test_placement_gate.c b/tests/unit/test_placement_gate.c
+index a640365..2cf5fb7 100644
+--- a/tests/unit/test_placement_gate.c
++++ b/tests/unit/test_placement_gate.c
+@@ -14,6 +14,7 @@
+ #include "mds_catalogue.h"
+ #include "ds_capacity.h"
+ #include "wrr.h"
++#include "mds_metrics.h"
+ 
+ struct mds_catalogue *catalogue_memdb_open(void);
+ 
+@@ -526,9 +527,212 @@ static void test_admit_argument_checks(void)
+     ASSERT_EQ(placement_admit(&c, ds, 0, &sc, 1, 0, &e, &why), MDS_ERR_INVAL);
+ }
+ 
++/* -----------------------------------------------------------------------
++ * Singleton (Task 5): published capacity view, init rules, site helper
++ * ----------------------------------------------------------------------- */
++
++static struct ds_cache *cache_with_ds(struct mds_catalogue **cat_out, uint32_t ds_id)
++{
++    struct mds_catalogue *cat = catalogue_memdb_open();
++    struct mds_cat_txn *txn = NULL;
++    struct mds_ds_info info;
++    struct ds_cache *c = NULL;
++
++    if (cat == NULL) {
++        return NULL;
++    }
++    memset(&info, 0, sizeof(info));
++    info.ds_id = ds_id;
++    info.state = DS_ONLINE;
++    info.port = 2049;
++    snprintf(info.host, sizeof(info.host), "ds-host");
++    if (mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn) != MDS_OK ||
++        mds_cat_ds_put(cat, txn, &info) != MDS_OK ||
++        mds_cat_txn_commit(txn) != MDS_OK) {
++        return NULL;
++    }
++    if (ds_cache_create(cat, &c) != 0) {
++        return NULL;
++    }
++    *cat_out = cat;
++    return c;
++}
++
++static void add_cache_ds(struct mds_catalogue *cat, struct ds_cache *c, uint32_t ds_id, const char *host)
++{
++    struct mds_cat_txn *txn = NULL;
++    struct mds_ds_info info;
++    memset(&info, 0, sizeof(info));
++    info.ds_id = ds_id;
++    info.state = DS_ONLINE;
++    info.port = 2049;
++    snprintf(info.host, sizeof(info.host), "%s", host);
++    (void)mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn);
++    (void)mds_cat_ds_put(cat, txn, &info);
++    (void)mds_cat_txn_commit(txn);
++    (void)ds_cache_invalidate(c, cat);
++}
++
++static struct mds_config fill_cfg(void)
++{
++    struct mds_config cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.placement_mode = PM_FILL;
++    cfg.placement_mode_set = true;
++    cfg.placement_capacity_max_age_ms = 120000;
++    cfg.placement_stripe_shrink = PM_SHRINK_ALLOW;
++    snprintf(cfg.placement_config_generation, sizeof(cfg.placement_config_generation), "%064x", 1);
++    return cfg;
++}
++
++static void test_singleton_legacy_when_not_initialised(void)
++{
++    struct placement_ctx c;
++    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
++    ASSERT_EQ(strcmp(placement_gate_generation(), ""), 0);
++    placement_gate_ctx(&c, 5);
++    ASSERT_EQ(c.mode, PM_LEGACY);
++    ASSERT_TRUE(c.cap == NULL);
++    placement_gate_ctx_release(&c);
++    placement_gate_publish_capacity();   /* no-op, no crash */
++    placement_gate_destroy();            /* no-op */
++}
++
++static void test_singleton_init_requires_mode_set(void)
++{
++    struct mds_config cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    ASSERT_EQ(placement_gate_init(&cfg, NULL), -1);
++    ASSERT_EQ(placement_gate_init(NULL, NULL), -1);
++    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
++}
++
++static void test_singleton_fill_needs_cache_and_kernel(void)
++{
++    struct mds_config cfg = fill_cfg();
++    ASSERT_EQ(placement_gate_init(&cfg, NULL), -1);   /* fill without a DS cache */
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_with_ds(&cat, 0);
++    ASSERT_TRUE(cache != NULL);
++    int rc = placement_gate_init(&cfg, cache);
++    ASSERT_EQ(rc, mds_wrr_kernel_id() == 0 ? -1 : 0);
++    placement_gate_destroy();
++    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
++static void test_singleton_rr_needs_no_cache(void)
++{
++    struct mds_config cfg = fill_cfg();
++    cfg.placement_mode = PM_RR;
++    ASSERT_EQ(placement_gate_init(&cfg, NULL), 0);
++    ASSERT_EQ(placement_gate_mode(), PM_RR);
++    ASSERT_EQ(strlen(placement_gate_generation()), 64u);
++    struct placement_ctx c;
++    placement_gate_ctx(&c, 1);
++    ASSERT_EQ(c.mode, PM_RR);
++    ASSERT_TRUE(c.cap == NULL);
++    ASSERT_TRUE(c.rr_counter != NULL);
++    placement_gate_ctx_release(&c);
++    placement_gate_destroy();
++}
++
++static void test_singleton_publishes_capacity_from_cache(void)
++{
++    struct mds_config cfg = fill_cfg();
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_with_ds(&cat, 0);
++    ASSERT_TRUE(cache != NULL);
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    ASSERT_EQ(placement_gate_mode(), PM_FILL);
++    struct placement_ctx c;
++    placement_gate_ctx(&c, ds_cache_mono_ms());
++    ASSERT_TRUE(c.cap != NULL);
++    ASSERT_EQ(c.cap->count, 1u);
++    ASSERT_EQ(c.cap->rows[0].obs.observed_mono_ms, 0u);
++    ASSERT_EQ(c.capacity_max_age_ms, 120000u);
++    placement_gate_ctx_release(&c);
++    ASSERT_TRUE(c.cap == NULL);
++    ASSERT_EQ(ds_capacity_probe_once(cache, "/tmp", CAP_WEIGHT_OFF), 1);   /* probe_once publishes */
++    placement_gate_ctx(&c, ds_cache_mono_ms());
++    ASSERT_TRUE(c.cap->rows[0].obs.observed_mono_ms != 0);
++    /* a ctx keeps its snapshot alive across a republish */
++    struct ds_capacity_obs o = { 1000, 10, 1, ds_cache_mono_ms(), 0 };
++    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &o), 0);
++    placement_gate_publish_capacity();
++    ASSERT_TRUE(c.cap->rows[0].obs.total_bytes != 1000);
++    placement_gate_ctx_release(&c);
++    placement_gate_ctx(&c, ds_cache_mono_ms());
++    ASSERT_EQ(c.cap->rows[0].obs.total_bytes, 1000u);
++    placement_gate_ctx_release(&c);
++    placement_gate_destroy();
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
++static void test_select_gated_legacy_path(void)
++{
++    struct mds_ds_info ds[2];
++    mk_ds(&ds[0], 0, DS_ONLINE, "a");
++    mk_ds(&ds[1], 1, DS_OFFLINE, "b");
++    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
++    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why = PR_CAPACITY_FULL;
++    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 2, &sc, 1, 65536, 0, &e, &why), MDS_OK);
++    ASSERT_EQ(e.ds_id, 0u);
++    ASSERT_EQ(why, PR_NONE);
++    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 2, &sc, 1, 65536, 0, &e, &why), MDS_OK);
++    ASSERT_EQ(e.ds_id, 0u);
++    sc = 1;
++    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 2, &sc, 1, 65536, 12345, &e, &why), MDS_OK);
++    ASSERT_EQ(e.ds_id, 0u);
++}
++
++static void test_select_gated_fill_path_uses_the_gate(void)
++{
++    struct mds_config cfg = fill_cfg();
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_with_ds(&cat, 0);
++    ASSERT_TRUE(cache != NULL);
++    add_cache_ds(cat, cache, 1, "other");
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    struct ds_capacity_obs full = { 1000, 0, 1, ds_cache_mono_ms(), 0 };
++    struct ds_capacity_obs half = { 1000, 500, 2, ds_cache_mono_ms(), 0 };
++    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &full), 0);
++    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
++    placement_gate_publish_capacity();
++    struct mds_ds_info ds[2];
++    mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
++    mk_ds(&ds[1], 1, DS_ONLINE, "other");
++    for (int i = 0; i < 50; i++) {
++        struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
++        ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 2, &sc, 1, 65536, 0, &e, &why), MDS_OK);
++        ASSERT_EQ(e.ds_id, 1u);
++    }
++    uint64_t before = atomic_load(&g_branch_metrics.placement_rejections_total[PR_NO_ELIGIBLE_DS]);
++    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &full), 0);
++    placement_gate_publish_capacity();
++    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
++    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 2, &sc, 1, 65536, 0, &e, &why), MDS_ERR_NOSPC);
++    ASSERT_EQ(why, PR_NO_ELIGIBLE_DS);
++    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_rejections_total[PR_NO_ELIGIBLE_DS]), before + 1);
++    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_mode_gauge), (uint64_t)PM_FILL);
++    placement_gate_destroy();
++    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_mode_gauge), 0u);
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
+ int main(void)
+ {
+     printf("test_placement_gate\n");
++    RUN_TEST(test_singleton_legacy_when_not_initialised);
++    RUN_TEST(test_singleton_init_requires_mode_set);
++    RUN_TEST(test_singleton_fill_needs_cache_and_kernel);
++    RUN_TEST(test_singleton_rr_needs_no_cache);
++    RUN_TEST(test_singleton_publishes_capacity_from_cache);
++    RUN_TEST(test_select_gated_legacy_path);
++    RUN_TEST(test_select_gated_fill_path_uses_the_gate);
+     RUN_TEST(test_rr_is_cyclic_over_the_gated_list);
+     RUN_TEST(test_rr_ignores_capacity);
+     RUN_TEST(test_rr_mirrors_are_distinct_and_shrink);

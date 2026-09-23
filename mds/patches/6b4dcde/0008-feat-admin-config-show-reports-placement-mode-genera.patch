@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 21:58:11 +0300
+Subject: [PATCH 8/9] feat(admin): config show reports placement mode,
+ generation, kernel id and per-DS gate verdicts
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/placement_gate.h            | 17 ++++++
+ src/cluster/CMakeLists.txt          |  1 +
+ src/cluster/cluster_transport.c     | 62 ++++++++++++++++++++
+ src/fsal_obj/placement_gate.c       | 85 +++++++++++++++++++++++++++
+ tests/unit/test_cluster_transport.c | 90 +++++++++++++++++++++++++++++
+ 5 files changed, 255 insertions(+)
+
+diff --git a/include/placement_gate.h b/include/placement_gate.h
+index fbfa208..38ced3b 100644
+--- a/include/placement_gate.h
++++ b/include/placement_gate.h
+@@ -133,6 +133,23 @@ enum mds_status placement_select_gated(bool legacy_policy_enabled,
+                                        struct mds_ds_map_entry *entries,
+                                        enum placement_reason *reason);
+ 
++/* Per-DS view for `config show` (design section 9). */
++struct placement_ds_status {
++    bool     registered;
++    uint32_t state;
++    char     domain[PM_DOMAIN_ID_MAX];
++    uint64_t capacity_age_ms;   /* UINT64_MAX when never observed */
++    uint64_t avail_bytes;
++    uint64_t total_bytes;
++    uint64_t weight;            /* 0 when not a candidate */
++    enum placement_reason reason;
++};
++
++/* DS ids in the published view (0 in rr/legacy or before the first publish). */
++uint32_t placement_gate_ds_ids(uint32_t *ids, uint32_t cap);
++/* The gate's current verdict for one DS; false when unknown to the gate. */
++bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out);
++
+ /* -----------------------------------------------------------------------
+  * Create-boundary admission (Task 7).
+  * ----------------------------------------------------------------------- */
+diff --git a/src/cluster/CMakeLists.txt b/src/cluster/CMakeLists.txt
+index 69312f9..310937a 100644
+--- a/src/cluster/CMakeLists.txt
++++ b/src/cluster/CMakeLists.txt
+@@ -23,6 +23,7 @@ target_include_directories(pnfs_cluster PUBLIC
+ target_link_libraries(pnfs_cluster
+     PUBLIC
+         pnfs_common
++        pnfs_fsal_obj
+         
+         pthread
+ )
+diff --git a/src/cluster/cluster_transport.c b/src/cluster/cluster_transport.c
+index 10e2606..bccff99 100644
+--- a/src/cluster/cluster_transport.c
++++ b/src/cluster/cluster_transport.c
+@@ -36,6 +36,8 @@
+ #include "pnfs_mds.h"
+ #include "subtree_map.h"
+ #include "cluster_transport.h"
++#include "placement_gate.h"
++#include "wrr.h"
+ #include "mds_catalogue.h"
+ #include "rename_2pc.h"
+ #include "mds_tls.h"
+@@ -6644,6 +6646,66 @@ static void render_cfg_placement(const struct mds_config *cfg,
+                 ? "proportional" : "off";
+         RENDER_KEY("placement_capacity_weighting", "%s", w);
+     }
++    /* XinnorLab placement modes (design section 9): desired vs
++     * effective mode, the config generation `verify` compares, the
++     * kernel identity, and the live gate verdict per registered DS
++     * (filter with `config show placement_ds.<id>` on big clusters). */
++    RENDER_KEY("placement_mode", "%s",
++               placement_mode_name(cfg->placement_mode_set
++                                   ? cfg->placement_mode : PM_LEGACY));
++    RENDER_KEY("placement_mode_effective", "%s",
++               placement_mode_name(placement_gate_mode()));
++    RENDER_KEY("placement_config_generation", "%s",
++               cfg->placement_config_generation[0] != '\0'
++                   ? cfg->placement_config_generation : "-");
++    RENDER_KEY("placement_kernel_id", "%08x", (unsigned)mds_wrr_kernel_id());
++    if (cfg->placement_mode_set) {
++        RENDER_KEY("placement_capacity_max_age_ms", "%u",
++                   (unsigned)cfg->placement_capacity_max_age_ms);
++        RENDER_KEY("placement_min_free_bytes", "%llu",
++                   (unsigned long long)cfg->placement_min_free_bytes);
++        RENDER_KEY("placement_stripe_shrink", "%s",
++                   placement_shrink_name(cfg->placement_stripe_shrink));
++        for (uint32_t i = 0; i < MDS_MAX_DS_NODES; i++) {
++            if (cfg->ds_capacity_domain[i][0] != '\0') {
++                char keybuf[40];
++                (void)snprintf(keybuf, sizeof(keybuf),
++                               "ds_capacity_domain.%u", (unsigned)i);
++                RENDER_KEY(keybuf, "%s", cfg->ds_capacity_domain[i]);
++            }
++        }
++    }
++    {
++        uint32_t ids[MDS_MAX_DS_NODES];
++        uint32_t n = placement_gate_ds_ids(ids, MDS_MAX_DS_NODES);
++        for (uint32_t i = 0; i < n; i++) {
++            struct placement_ds_status ps;
++            char keybuf[40];
++            char age[24];
++
++            if (!placement_gate_ds_status(ids[i], &ps)) {
++                continue;
++            }
++            if (ps.capacity_age_ms == UINT64_MAX) {
++                (void)snprintf(age, sizeof(age), "unknown");
++            } else {
++                (void)snprintf(age, sizeof(age), "%llu",
++                               (unsigned long long)ps.capacity_age_ms);
++            }
++            (void)snprintf(keybuf, sizeof(keybuf), "placement_ds.%u",
++                           (unsigned)ids[i]);
++            RENDER_KEY(keybuf,
++                       "domain=%s state=%s capacity_age_ms=%s avail=%llu "
++                       "total=%llu weight=%llu reason=%s",
++                       ps.domain,
++                       (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
++                       age,
++                       (unsigned long long)ps.avail_bytes,
++                       (unsigned long long)ps.total_bytes,
++                       (unsigned long long)ps.weight,
++                       placement_reason_name(ps.reason));
++        }
++    }
+     *offp = off;
+ }
+ 
+diff --git a/src/fsal_obj/placement_gate.c b/src/fsal_obj/placement_gate.c
+index c4771d2..514d279 100644
+--- a/src/fsal_obj/placement_gate.c
++++ b/src/fsal_obj/placement_gate.c
+@@ -883,3 +883,88 @@ enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpo
+     mint_token(tok, ds_id, p, now);
+     return MDS_OK;
+ }
++
++/* -----------------------------------------------------------------------
++ * config show support (design section 9)
++ * ----------------------------------------------------------------------- */
++
++uint32_t placement_gate_ds_ids(uint32_t *ids, uint32_t cap)
++{
++    struct placement_ctx ctx;
++    struct cap_view_ref *ref;
++    uint32_t n = 0;
++
++    if (ids == NULL || cap == 0) {
++        return 0;
++    }
++    placement_gate_ctx(&ctx, ds_cache_mono_ms());
++    ref = (struct cap_view_ref *)ctx.view_ref;
++    if (ref != NULL) {
++        for (uint32_t i = 0; i < ref->view.count && n < cap; i++) {
++            ids[n++] = ref->view.rows[i].ds_id;
++        }
++    }
++    placement_gate_ctx_release(&ctx);
++    return n;
++}
++
++bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
++{
++    struct placement_ctx ctx;
++    struct cap_view_ref *ref;
++    struct placement_candidate *cands = NULL;
++    uint32_t n_c = 0;
++    bool found = false;
++
++    if (out == NULL) {
++        return false;
++    }
++    memset(out, 0, sizeof(*out));
++    out->capacity_age_ms = UINT64_MAX;
++    out->reason = PR_DS_OFFLINE;
++    placement_gate_ctx(&ctx, ds_cache_mono_ms());
++    ref = (struct cap_view_ref *)ctx.view_ref;
++    if (ref == NULL || ref->n_infos == 0) {
++        placement_gate_ctx_release(&ctx);
++        return false;
++    }
++    for (uint32_t i = 0; i < ref->view.count; i++) {
++        const struct ds_capacity_view_row *r = &ref->view.rows[i];
++        if (r->ds_id != ds_id) {
++            continue;
++        }
++        found = true;
++        out->registered = true;
++        out->state = r->state;
++        out->avail_bytes = r->obs.avail_bytes;
++        out->total_bytes = r->obs.total_bytes;
++        if (r->obs.observed_mono_ms != 0 &&
++            ctx.now_mono_ms >= r->obs.observed_mono_ms) {
++            out->capacity_age_ms = ctx.now_mono_ms - r->obs.observed_mono_ms;
++        }
++        break;
++    }
++    if (!found) {
++        placement_gate_ctx_release(&ctx);
++        return false;
++    }
++    domain_for(&ctx, ds_id, out->domain);
++    cands = calloc(ref->n_infos, sizeof(*cands));
++    if (cands != NULL) {
++        n_c = placement_candidates(&ctx, ref->infos, ref->n_infos, cands, NULL);
++        for (uint32_t i = 0; i < n_c; i++) {
++            if (cands[i].ds_id == ds_id) {
++                out->weight = cands[i].weight;
++                out->reason = PR_NONE;
++                break;
++            }
++        }
++        if (out->reason != PR_NONE) {
++            (void)placement_ds_admitted(&ctx, ref->infos, ref->n_infos, ds_id,
++                                        &out->reason);
++        }
++        free(cands);
++    }
++    placement_gate_ctx_release(&ctx);
++    return true;
++}
+diff --git a/tests/unit/test_cluster_transport.c b/tests/unit/test_cluster_transport.c
+index 5d9bf68..24ccaf4 100644
+--- a/tests/unit/test_cluster_transport.c
++++ b/tests/unit/test_cluster_transport.c
+@@ -21,6 +21,8 @@
+ #include "test_helpers.h"
+ #include "test_helpers.h"
+ #include "cluster_transport.h"
++#include "placement_gate.h"
++#include "ds_cache.h"
+ #include "mds_catalogue.h"
+ #include "rename_2pc.h"
+ #include "subtree_map.h"
+@@ -1838,6 +1840,93 @@ static void test_admin_allowed_hosts_acl(void)
+     cleanup_db();
+     PASS();
+ }
++/* ------------------------------------------------------------------- */
++/* test_config_show_placement_rows
++ *
++ * XinnorLab placement modes: `config show` reports the desired and the
++ * effective mode, the config generation, the kernel id and one live
++ * gate verdict per registered DS (design section 9).
++ * ------------------------------------------------------------------- */
++
++static void test_config_show_placement_rows(void)
++{
++    fprintf(stdout, "  test_config_show_placement_rows:     ");
++    fflush(stdout);
++
++    struct mds_catalogue *db = open_test_db();
++    ASSERT_TRUE(db != NULL);
++    {
++        struct mds_cat_txn *txn = NULL;
++        struct mds_ds_info info;
++        memset(&info, 0, sizeof(info));
++        info.ds_id = 1;
++        info.state = DS_ONLINE;
++        info.port = 2049;
++        snprintf(info.host, sizeof(info.host), "ds-host");
++        ASSERT_EQ(mds_cat_txn_begin(db, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
++        ASSERT_EQ(mds_cat_ds_put(db, txn, &info), MDS_OK);
++        ASSERT_EQ(mds_cat_txn_commit(txn), MDS_OK);
++    }
++    struct ds_cache *cache = NULL;
++    ASSERT_EQ(ds_cache_create(wrap_db_as_cat(db), &cache), 0);
++
++    struct cluster_server *srv = NULL;
++    enum mds_status st = cluster_transport_server_start(
++        0, "0.0.0.0", NULL, 0, 0,
++        wrap_db_as_cat(db), NULL, NULL, &srv);
++    ASSERT_EQ(st, MDS_OK);
++
++    struct mds_config cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    snprintf(cfg.admin_allowed_hosts[0],
++             sizeof(cfg.admin_allowed_hosts[0]), "127.0.0.1");
++    cfg.admin_allowed_host_count = 1;
++    cfg.placement_mode = PM_FILL;
++    cfg.placement_mode_set = true;
++    cfg.placement_capacity_max_age_ms = 120000;
++    cfg.placement_stripe_shrink = PM_SHRINK_ALLOW;
++    snprintf(cfg.ds_capacity_domain[1], PM_DOMAIN_ID_MAX, "xi/fs-1");
++    snprintf(cfg.placement_config_generation,
++             sizeof(cfg.placement_config_generation), "%064x", 7);
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    {
++        struct ds_capacity_obs half = { 1000, 500, 9, ds_cache_mono_ms(), 0 };
++        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
++    }
++    placement_gate_publish_capacity();
++    cluster_transport_server_set_config(srv, &cfg);
++
++    uint16_t port = cluster_transport_server_port(srv);
++    ASSERT_TRUE(port > 0);
++    char *text = NULL;
++    st = cluster_transport_request_config_show("127.0.0.1", port, NULL, &text);
++    ASSERT_EQ(st, MDS_OK);
++    ASSERT_TRUE(text != NULL);
++    ASSERT_TRUE(strstr(text, "placement_mode = fill\n") != NULL);
++    ASSERT_TRUE(strstr(text, "placement_mode_effective = fill\n") != NULL);
++    ASSERT_TRUE(strstr(text, "placement_config_generation = 0000000000000000000000000000000000000000000000000000000000000007\n") != NULL);
++    ASSERT_TRUE(strstr(text, "placement_kernel_id = 58494e01\n") != NULL);
++    ASSERT_TRUE(strstr(text, "ds_capacity_domain.1 = xi/fs-1\n") != NULL);
++    ASSERT_TRUE(strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE capacity_age_ms=") != NULL);
++    ASSERT_TRUE(strstr(text, "avail=500 total=1000 weight=") != NULL);
++    ASSERT_TRUE(strstr(text, "reason=NONE\n") != NULL);
++    free(text);
++
++    /* the filter selects one per-DS row */
++    text = NULL;
++    st = cluster_transport_request_config_show("127.0.0.1", port, "placement_ds.1", &text);
++    ASSERT_EQ(st, MDS_OK);
++    ASSERT_TRUE(text != NULL && strncmp(text, "placement_ds.1 = ", 17) == 0);
++    free(text);
++
++    cluster_transport_server_stop(srv);
++    placement_gate_destroy();
++    ds_cache_destroy(cache);
++    mds_catalogue_close(db);
++    cleanup_db();
++    PASS();
++}
++
+ /* ------------------------------------------------------------------- */
+ /* test_hpc_mode_admin
+  *
+@@ -1976,6 +2065,7 @@ int main(void)
+     test_ds_admin_invalidates_cache();
+     test_ds_add_v2_mode_transport();
+     test_admin_allowed_hosts_acl();
++    test_config_show_placement_rows();
+     test_hpc_mode_admin();
+ 
+     fprintf(stdout, "\n  %d passed, %d failed\n", passed, failed);
