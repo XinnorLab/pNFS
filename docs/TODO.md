@@ -40,6 +40,11 @@ entry when it lands.
   failed probe for the sweep now, but the legacy `proportional` path
   still records the MDS root filesystem (upstream behaviour). Done =
   benchmark row in the stand report, an upstream issue for (3).
+- **Flaky upstream test in the fork CI.** `bench_mk_rm_scale` (multi-threaded
+  create/remove ladder against the in-memory catalogue, no placement code)
+  failed once on ubuntu-latest and passed on re-run and on node225. Done =
+  either an upstream fix for the memdb race or a retry/exclusion of that
+  integration bench in `placement-modes.yml`; watch the next runs first.
 - **Cross-repo manifest check.** `docs/placement-modes/contract-manifest.json`
   is pinned by a fork unit test (`test_manifest_constants`) by hand; a CI
   job that diffs the two is Stage C.
