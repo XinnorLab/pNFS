@@ -433,7 +433,9 @@ def assess_binding(
         elif present is False:
             v.add_veto("EXPORT_ABSENT")
         else:
-            if profile.export_source_required == "etab" and exd.get("source") != "etab":
+            src = exd.get("source")
+            accepted = ("etab",) if profile.export_source_required == "etab" else ("etab", "/etc/exports")
+            if src not in accepted:
                 v.add_unknown("EXPORT_SOURCE_NOT_EFFECTIVE")
             rules = [r for r in exd.get("rules", []) if isinstance(r, dict)]
             evaluate_export_access(rules, binding, v)

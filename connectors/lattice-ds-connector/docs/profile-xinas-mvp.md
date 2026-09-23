@@ -17,7 +17,7 @@ assessment; both MDS of a cluster must run the same digest (LAT-24).
 | `scan_multiplier_ppm` | 1000000 | 0..1000000 | `sdc_scanning` array word |
 | `required_checks` | the eight below | subset of the eight | a required check the source does not evaluate → `UNKNOWN` / `CAPABILITY_MISSING`; `network.*` / `filesystem.integrity` cannot be required (validate-config refuses, T-30) |
 | `required_protocols` | `["NFSv3"]` | | missing from nfsd → `NFS_PROTOCOL_MISSING` |
-| `export_source_required` | `exports` | `exports` \| `etab` | `etab` demands kernel-effective rules; the xiNAS prototype publishes `/etc/exports` → `UNKNOWN` / `EXPORT_SOURCE_NOT_EFFECTIVE` |
+| `export_source_required` | `etab` | `etab` \| `exports` | `etab` (default) accepts only kernel-effective rules (`details.source: etab`, what xiNAS publishes since 2026-09-23); `exports` also accepts a labelled `/etc/exports` source. Anything else → `UNKNOWN` / `EXPORT_SOURCE_NOT_EFFECTIVE` |
 
 The veto words and the UNKNOWN rules are not configurable.
 

@@ -19,8 +19,11 @@
       "unsupported_xiraid": ["4.3", "Opus"],
       "profiles": [{ "id": "xinas-mvp", "version": "1" }],
       "known_source_gaps": [
-        "export rules come from /etc/exports (details.source), not the kernel etab; profile export_source_required=etab yields UNKNOWN",
-        "no HTTPS ingress on xiNAS yet; http requires allow_insecure_http"
+        "the source's credential is a static viewer token (rotation = api restart); no per-connector allow-list yet"
+      ],
+      "source_requirements": [
+        "details.source must be etab (kernel-effective export table); xiNAS release/3.15 after 2026-09-23",
+        "HTTPS listener (xiNAS mcp.http.tls) or, for isolated labs only, allow_insecure_http on both sides"
       ]
     },
     "fixture": {

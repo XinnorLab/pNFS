@@ -121,7 +121,7 @@ def fetch_observations(
         errors = doc.get("errors") if isinstance(doc, dict) else None
         if isinstance(errors, list) and errors and isinstance(errors[0], dict):
             src_code = errors[0].get("code")
-            if src_code in ("SOURCE_NOT_READY", "SOURCE_STALE", "SNAPSHOT_TOO_LARGE"):
+            if src_code in ("SOURCE_NOT_READY", "SOURCE_STALE", "SOURCE_FAILED", "SNAPSHOT_TOO_LARGE"):
                 code = src_code
         # The source says its own data is not valid: revoke, do not retain.
         raise CollectionError(code, f"HTTP 503 {code}", retryable=False, details={"status": status})

@@ -69,7 +69,7 @@ def test_http_errors_are_typed(server, status, code, retryable):
     assert ei.value.code == code and ei.value.retryable is retryable
 
 
-@pytest.mark.parametrize("source_code", ["SOURCE_NOT_READY", "SOURCE_STALE", "SNAPSHOT_TOO_LARGE"])
+@pytest.mark.parametrize("source_code", ["SOURCE_NOT_READY", "SOURCE_STALE", "SOURCE_FAILED", "SNAPSHOT_TOO_LARGE"])
 def test_503_carries_the_source_verdict_and_revokes(server, source_code):
     srv, url = server
     Scripted.responses.append((503, {"Content-Type": "application/json"}, sb.envelope(None, errors=[{"code": source_code, "message": "m"}])))

@@ -305,10 +305,17 @@ def test_t08_missing_export_is_a_valid_deny(base_result):
     assert a.quality == "VALID" and not a.allowed and "EXPORT_ABSENT" in a.reason_codes
 
 
-def test_export_source_etab_demand_is_unknown_with_exports_file(base_result):
-    a = one(base_result, profile=make_profile(export_source_required="etab"))
+def test_export_source_etab_is_the_default_and_an_exports_file_source_is_unknown(base_result):
+    r = copy.deepcopy(base_result)
+    sb.find(r, "export:mnt-data-training-a")["details"]["source"] = "/etc/exports"
+    a = one(r)
     assert a.quality == "UNKNOWN" and "EXPORT_SOURCE_NOT_EFFECTIVE" in a.reason_codes
     assert a.diagnostics["export_source"] == "/etc/exports"
+    # A profile that accepts the labelled weaker source still allows it.
+    assert one(r, profile=make_profile(export_source_required="exports")).allowed
+    # An unknown label is refused by both.
+    sb.find(r, "export:mnt-data-training-a")["details"]["source"] = "fixture"
+    assert one(r, profile=make_profile(export_source_required="exports")).quality == "UNKNOWN"
 
 
 # ---------------------------------------------------------------------------

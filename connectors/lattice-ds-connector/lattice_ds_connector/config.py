@@ -85,10 +85,11 @@ class Profile:
     required_checks: Tuple[str, ...] = XINAS_SUPPORTED_CHECKS
     #: NFS protocols the share's nfsd must enable (flex-files data servers speak v3).
     required_protocols: Tuple[str, ...] = ("NFSv3",)
-    #: ``exports`` accepts /etc/exports-derived rules (the xiNAS prototype's
-    #: labelled gap); ``etab`` demands kernel-effective rules and yields
-    #: UNKNOWN until the source provides them.
-    export_source_required: str = "exports"
+    #: ``etab`` (default) demands kernel-effective rules — what xiNAS
+    #: publishes since its audit remediation (``details.source: etab``);
+    #: ``exports`` also accepts a labelled ``/etc/exports`` source (older
+    #: sources, lab fixtures).
+    export_source_required: str = "etab"
     digest: str = ""
 
     def placement_fields(self) -> Dict[str, Any]:

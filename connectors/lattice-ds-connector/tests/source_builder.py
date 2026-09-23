@@ -28,7 +28,7 @@ CAPABILITIES = [
 
 def coverage_rows() -> List[Dict[str, Any]]:
     rows = [{"check": c, "required": True, "status": "EVALUATED"} for c in CAPABILITIES]
-    rows[5] = {**rows[5], "details": {"source": "/etc/exports"}}
+    rows[5] = {**rows[5], "details": {"source": "etab"}}
     for check in ("filesystem.integrity", "network.path", "network.performance"):
         rows.append({"check": check, "required": False, "status": "NOT_IMPLEMENTED", "reason": "OUT_OF_MVP"})
     return rows
@@ -63,6 +63,7 @@ def array(name: str, level: str, members: List[Dict[str, Any]], states: Optional
             "raid_level": level,
             "state_valid": valid,
             "raw_states": ["online", "initialized"] if states is None else states,
+            "progress": {"init_pct": 100, "recon_pct": None, "restripe_pct": None, "sdc_pct": None},
             "members": members,
         },
     }
@@ -104,7 +105,7 @@ def filesystem(unit: str, uuid: str, mountpoint: str, data: str, log: Optional[s
     }
 
 
-def export(path: str, rules: Optional[List[Dict[str, Any]]] = None, present: bool = True, age: int = 1000, source: str = "/etc/exports") -> Dict[str, Any]:
+def export(path: str, rules: Optional[List[Dict[str, Any]]] = None, present: bool = True, age: int = 1000, source: str = "etab") -> Dict[str, Any]:
     enc = path.strip("/").replace("/", "-")
     return {
         "id": f"export:{enc}",
@@ -145,6 +146,8 @@ def nfs_service(running: Optional[bool] = True, protocols: Optional[List[str]] =
             "running": running,
             "protocols": ["NFSv3", "NFSv4.1", "NFSv4.2"] if protocols is None else protocols,
             "reason_codes": [],
+            "unit_active_state": "active" if running is not None else None,
+            "threads": 8 if running else (0 if running is False else None),
         },
     }
 

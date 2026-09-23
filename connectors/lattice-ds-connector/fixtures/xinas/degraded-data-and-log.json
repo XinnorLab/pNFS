@@ -56,7 +56,7 @@
         "required": true,
         "status": "EVALUATED",
         "details": {
-          "source": "/etc/exports"
+          "source": "etab"
         }
       },
       {
@@ -148,6 +148,12 @@
             "initialized",
             "degraded"
           ],
+          "progress": {
+            "init_pct": 100,
+            "recon_pct": null,
+            "restripe_pct": null,
+            "sdc_pct": null
+          },
           "members": [
             {
               "id": "disk-nvme0n2",
@@ -203,6 +209,12 @@
             "initialized",
             "degraded"
           ],
+          "progress": {
+            "init_pct": 100,
+            "recon_pct": null,
+            "restripe_pct": null,
+            "sdc_pct": null
+          },
           "members": [
             {
               "id": "disk-nvme0n1",
@@ -247,6 +259,12 @@
             "online",
             "initialized"
           ],
+          "progress": {
+            "init_pct": 100,
+            "recon_pct": null,
+            "restripe_pct": null,
+            "sdc_pct": null
+          },
           "members": [
             {
               "id": "disk-nvme3n2",
@@ -301,6 +319,12 @@
             "online",
             "initialized"
           ],
+          "progress": {
+            "init_pct": 100,
+            "recon_pct": null,
+            "restripe_pct": null,
+            "sdc_pct": null
+          },
           "members": [
             {
               "id": "disk-nvme3n1",
@@ -412,7 +436,7 @@
           "kind": "EXPORT",
           "export_path": "/mnt/data/training-a",
           "present": true,
-          "source": "/etc/exports",
+          "source": "etab",
           "rules": [
             {
               "client": "10.10.0.0/16",
@@ -441,7 +465,7 @@
           "kind": "EXPORT",
           "export_path": "/mnt/data/training-b",
           "present": true,
-          "source": "/etc/exports",
+          "source": "etab",
           "rules": [
             {
               "client": "10.10.0.0/16",
@@ -470,7 +494,7 @@
           "kind": "EXPORT",
           "export_path": "/mnt/data2/training-c",
           "present": true,
-          "source": "/etc/exports",
+          "source": "etab",
           "rules": [
             {
               "client": "10.10.0.0/16",
@@ -503,7 +527,9 @@
             "NFSv4.1",
             "NFSv4.2"
           ],
-          "reason_codes": []
+          "reason_codes": [],
+          "unit_active_state": "active",
+          "threads": 8
         }
       }
     ]
