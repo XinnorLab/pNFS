@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 22:07:06 +0300
+Subject: [PATCH 11/12] fix(placement): a future-dated capacity observation is
+ not fresh (fail closed); stale test independent of runner uptime
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/fsal_obj/placement_gate.c               |  5 ++++-
+ tests/unit/test_placement_create_boundary.c | 10 ++++++++--
+ tests/unit/test_placement_gate.c            |  5 +++++
+ 3 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/fsal_obj/placement_gate.c b/src/fsal_obj/placement_gate.c
+index 514d279..bf16136 100644
+--- a/src/fsal_obj/placement_gate.c
++++ b/src/fsal_obj/placement_gate.c
+@@ -95,7 +95,10 @@ static bool row_fresh(const struct placement_ctx *ctx,
+         return false;
+     }
+     if (ctx->now_mono_ms < r->obs.observed_mono_ms) {
+-        return true; /* clock skew inside one process: treat as fresh */
++        /* A monotonic clock cannot run backwards inside one process;
++         * an observation "from the future" is corrupt data -- fail
++         * closed (not fresh) rather than trust it. */
++        return false;
+     }
+     return (ctx->now_mono_ms - r->obs.observed_mono_ms) <=
+            (uint64_t)ctx->capacity_max_age_ms;
+diff --git a/tests/unit/test_placement_create_boundary.c b/tests/unit/test_placement_create_boundary.c
+index b7649d6..076aafc 100644
+--- a/tests/unit/test_placement_create_boundary.c
++++ b/tests/unit/test_placement_create_boundary.c
+@@ -230,9 +230,15 @@ static void test_ensure_creates_in_rr_and_refuses_full_ds_in_fill(void)
+     placement_gate_publish_capacity();
+     ASSERT_EQ(mds_proxy_ensure_ds_file(proxy, 1, 101, 0, 0), MDS_OK);
+     ASSERT_TRUE(file_exists(dir, 101, 0, 0));
+-    /* stale observation: refused again for a new object, existing one fine */
++    /* stale observation: refused again for a new object, existing one fine.
++     * CLOCK_MONOTONIC may be small on a fresh CI runner, so the staleness
++     * comes from a tiny max age, not from a large subtraction. */
++    placement_gate_destroy();
++    cfg.placement_capacity_max_age_ms = 1;
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
+     {
+-        struct ds_capacity_obs stale = { 1000, 500, 1, ds_cache_mono_ms() - 200000, 0 };
++        uint64_t now = ds_cache_mono_ms();
++        struct ds_capacity_obs stale = { 1000, 500, 1, (now > 50) ? now - 50 : 1, 0 };
+         ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &stale), 0);
+     }
+     placement_gate_publish_capacity();
+diff --git a/tests/unit/test_placement_gate.c b/tests/unit/test_placement_gate.c
+index a936d76..4a6509e 100644
+--- a/tests/unit/test_placement_gate.c
++++ b/tests/unit/test_placement_gate.c
+@@ -217,6 +217,11 @@ static void test_fill_freshness_boundary(void)
+     ASSERT_EQ(placement_candidates(&c, ds, 1, out, NULL), 1u);
+     V.rows[0].obs.observed_mono_ms = 1000000 - 120001;
+     ASSERT_EQ(placement_candidates(&c, ds, 1, out, NULL), 0u);
++    /* an observation from the future is corrupt: not fresh (fail closed) */
++    V.rows[0].obs.observed_mono_ms = 1000000 + 1;
++    struct placement_reject_counts why;
++    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
++    ASSERT_EQ(why.by_reason[PR_CAPACITY_STALE], 1u);
+ }
+ 
+ /* -----------------------------------------------------------------------

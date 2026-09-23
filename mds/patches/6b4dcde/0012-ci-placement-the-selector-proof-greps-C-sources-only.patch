@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 22:10:12 +0300
+Subject: [PATCH 12/12] ci(placement): the selector proof greps C sources only
+ (a CMake comment matched)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .github/workflows/placement-modes.yml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/.github/workflows/placement-modes.yml b/.github/workflows/placement-modes.yml
+index 033de4b..db561e4 100644
+--- a/.github/workflows/placement-modes.yml
++++ b/.github/workflows/placement-modes.yml
+@@ -38,7 +38,7 @@ jobs:
+           ./build/tests/test_wrr_kernel | grep -q 'kernel_id_is_nonzero.*PASS'
+       - name: Proof -- no selector outside the gate
+         run: |
+-          hits=$(grep -rnE '^[^*/]*placement_select(2|_ex2?|_rr_at2)?\(' src/ \
++          hits=$(grep -rnE --include='*.c' '^[^*/]*placement_select(2|_ex2?|_rr_at2)?\(' src/ \
+                  | grep -v 'src/fsal_obj/placement.c\|src/fsal_obj/placement_gate.c' || true)
+           if [ -n "$hits" ]; then echo "$hits"; echo '::error::selector called outside placement_gate'; exit 1; fi
+       - name: Proof -- no O_CREAT outside the token-guarded create helpers
