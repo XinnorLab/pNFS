@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Command line: ``run``, ``validate-config``, ``show``, ``describe``."""
+"""Command line: ``run``, ``validate-config``, ``show``, ``describe``, ``discover``."""
 
 from __future__ import annotations
 
@@ -13,11 +13,12 @@ from typing import List, Optional
 from . import __version__, contract
 from .config import ConfigError, load_config
 from .log import Logger
-from .modules import REGISTRY
+from .modules import REGISTRY, create_module
 from .runtime import Runtime
 from .server import Server, get_json
 
 DEFAULT_CONFIG = "/etc/lattice-ds-connector/config.json"
+_UNPINNED = "<unpinned>"  # placeholder discover uses to load a not-yet-pinned binding
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -62,6 +63,61 @@ def cmd_show(args: argparse.Namespace) -> int:
                 f"age={a['evidence_age_ms']} ttl={a['remaining_ttl_ms']} reasons={','.join(p['reason_codes'])}"
             )
     return 0
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    """Fetch each xinas instance's source once and print what a binding must
+    pin: share ids, their current incarnation, export path and status. The
+    operator copies the incarnation into `expected_target_incarnation`
+    (audit C-05: bindings are pinned, never trusted on first use)."""
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        for issue in exc.issues:
+            if issue.code == "INCARNATION_REQUIRED":
+                continue  # discover exists to fill exactly that field
+            print(f"error   {issue.path}: {issue.code} — {issue.message}")
+        blocking = [i for i in exc.issues if i.code != "INCARNATION_REQUIRED"]
+        if blocking:
+            return 1
+        from .config import validate_config_dict
+        import json as _json
+
+        with open(args.config, "r", encoding="utf-8") as fh:
+            raw = _json.load(fh)
+        for inst in raw.get("instances", []):
+            for b in inst.get("bindings", []):
+                b.setdefault("expected_target_incarnation", _UNPINNED)
+        config, _issues = validate_config_dict(raw)
+        if config is None:
+            return 1
+    rc = 0
+    for inst in config.instances:
+        if inst.module != "xinas" or inst.source is None:
+            continue
+        if args.instance and inst.id != args.instance:
+            continue
+        module = create_module(inst)
+        try:
+            batch = module.collect(config.runtime.collect_deadline_ms / 1000.0)
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            print(f"instance {inst.id}: collect failed: {exc}")
+            rc = 1
+            continue
+        result = batch.payload
+        print(f"instance {inst.id}: controller {result.get('controller_id')} epoch {result.get('server_epoch')} gen {result.get('source_generation')} snapshot {result.get('snapshot_status')}")
+        bound = {b.target_id: b for b in inst.bindings}
+        for share in result.get("shares", []):
+            b = bound.get(share.get("share_id"))
+            pin = ""
+            if b is not None:
+                pinned = b.expected_target_incarnation
+                pin = " (bound ds %d, pinned %s)" % (b.ds_id, "-" if pinned in (None, _UNPINNED) else pinned)
+            print(
+                f"  share {share.get('share_id')!s:<24} incarnation {share.get('incarnation')!s:<40} "
+                f"path {share.get('export_path')} status {share.get('collection_status')} {share.get('reason_codes')}{pin}"
+            )
+    return rc
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -125,6 +181,10 @@ def build_parser() -> argparse.ArgumentParser:
     show.set_defaults(func=cmd_show)
     desc = sub.add_parser("describe", help="list the registered module types")
     desc.set_defaults(func=cmd_describe)
+    disc = sub.add_parser("discover", help="fetch each xinas source once and print the share incarnations to pin")
+    disc.add_argument("--config", default=DEFAULT_CONFIG)
+    disc.add_argument("--instance", default=None)
+    disc.set_defaults(func=cmd_discover)
     return p
 
 

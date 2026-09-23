@@ -8,12 +8,22 @@ hold-down afterwards.
 
 The vocabulary and the decision table come from the requirements package
 (section 5) and xiRAID Classic 4.4's "Showing RAID state" page.
+
+Beyond the table, the policy proves the graph it walks (audit C-01..C-03):
+every reference must be of the right kind and agree with the share (the
+export's path is the share's path, the filesystem contains the path and is
+the most specific managed filesystem that does, the DATA array's volume is
+the filesystem's source device, LOG/REALTIME arrays match the ``logdev=`` /
+``rtdev=`` super options); every mandatory SUCCESS dependency carries its
+evidence time and age; the filesystem has an identity; the source is a
+supported xiRAID edition/version with a supported RAID level. Any
+contradiction is ``UNKNOWN`` for the affected DS only.
 """
 
 from __future__ import annotations
 
 import ipaddress
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import contract
 from ..config import Binding, Profile
@@ -43,6 +53,13 @@ OPTIONAL_NOT_IMPLEMENTED = (
     ("network.performance", "OUT_OF_MVP"),
 )
 
+#: xiRAID Classic levels (``xicli raid create --level``, 4.4 documentation:
+#: https://xinnor.io/docs/xiRAID-4.4.0/E/en/AG/1/creating_raid.html).
+SUPPORTED_RAID_LEVELS = frozenset({"0", "1", "5", "6", "7", "10", "50", "60", "70", "n+m"})
+#: The edition and version family the decision table was written for (XMOD-01).
+SUPPORTED_EDITIONS = frozenset({"Classic"})
+SUPPORTED_VERSION_PREFIXES = ("4.4.",)
+
 
 class Verdict:
     """Accumulates the three reason classes for one binding."""
@@ -69,6 +86,11 @@ class Verdict:
         if code not in self.info:
             self.info.append(code)
 
+    def note_inconsistency(self, what: str) -> None:
+        """Record one graph contradiction (audit C-01); UNKNOWN once."""
+        self.add_unknown("GRAPH_INCONSISTENT")
+        self.diag.setdefault("graph_inconsistent", []).append(what)
+
     @property
     def is_unknown(self) -> bool:
         return bool(self.unknown)
@@ -89,7 +111,7 @@ class Verdict:
 
 
 # ---------------------------------------------------------------------------
-# Arrays and members (XMOD-06..10)
+# Arrays and members (XMOD-01, XMOD-06..10)
 # ---------------------------------------------------------------------------
 
 
@@ -100,8 +122,24 @@ def normalize_level(raw: Any) -> str:
     return text[4:] if text.startswith("raid") else text
 
 
+def version_supported(edition: Any, version: Any) -> bool:
+    """True only for an edition/version the decision table covers (XMOD-01).
+    Opus, 4.3, a future 5.x or an unreported version are not."""
+    if edition not in SUPPORTED_EDITIONS or not isinstance(version, str):
+        return False
+    bare = {p.rstrip(".") for p in SUPPORTED_VERSION_PREFIXES}
+    return version in bare or any(version.startswith(p) for p in SUPPORTED_VERSION_PREFIXES)
+
+
 def evaluate_array(details: Dict[str, Any], profile: Profile, v: Verdict) -> None:
     """Apply the decision table to one ARRAY resource's details."""
+    if not version_supported(details.get("edition"), details.get("version")):
+        v.add_unknown("XIRAID_VERSION_UNSUPPORTED")
+        v.diag.setdefault("unsupported_versions", []).append({"edition": details.get("edition"), "version": details.get("version")})
+    level = normalize_level(details.get("raid_level"))
+    if level not in SUPPORTED_RAID_LEVELS:
+        v.add_unknown("RAID_LEVEL_UNSUPPORTED")
+        v.diag.setdefault("unsupported_levels", []).append(details.get("raid_level"))
     words_raw = details.get("raw_states")
     valid = details.get("state_valid") is True
     words: List[str] = [w for w in words_raw if isinstance(w, str)] if isinstance(words_raw, list) else []
@@ -119,7 +157,6 @@ def evaluate_array(details: Dict[str, Any], profile: Profile, v: Verdict) -> Non
             v.add_veto(code)
     if "online" not in word_set:
         v.add_veto("ARRAY_UNAVAILABLE")
-    level = normalize_level(details.get("raid_level"))
     if "online" in word_set and level not in contract.LEVELS_WITHOUT_INITIALIZATION:
         if "initialized" not in word_set and not ({"initing", "need_init"} & word_set):
             # Online, but no proof of initialization readiness where it
@@ -132,7 +169,9 @@ def evaluate_array(details: Dict[str, Any], profile: Profile, v: Verdict) -> Non
     if "sdc_scanning" in word_set:
         v.add_penalty(profile.scan_multiplier_ppm, "SCAN_ACTIVE")
     members = details.get("members")
-    if not isinstance(members, list):
+    # XMOD-09: member evidence is mandatory — an array without member
+    # records cannot be assessed; an empty list is not "all healthy".
+    if not isinstance(members, list) or not members:
         v.add_unknown("MEMBER_STATE_MISSING")
         return
     for m in members:
@@ -141,6 +180,11 @@ def evaluate_array(details: Dict[str, Any], profile: Profile, v: Verdict) -> Non
 
 def evaluate_member(member: Dict[str, Any], profile: Profile, v: Verdict) -> None:
     raw = member.get("raw_states")
+    ident = member.get("id")
+    path = member.get("device_path")
+    if not (isinstance(ident, str) and ident) or not (isinstance(path, str) and path):
+        v.add_unknown("MEMBER_STATE_INVALID")
+        return
     if member.get("state_valid") is not True:
         v.add_unknown("MEMBER_STATE_INVALID")
         return
@@ -185,6 +229,11 @@ def evaluate_export_access(rules: Sequence[Dict[str, Any]], binding: Binding, v:
             continue
         supported.append((parsed, r))
     v.diag["export_rules_unsupported"] = unsupported
+    # Audit C-06: a hostname / netgroup / wildcard-host rule may apply to any
+    # host of a configured network and may contradict the IP rules; the
+    # module cannot evaluate it, so the export's access stays unproven.
+    if unsupported:
+        v.add_unknown("EXPORT_RULE_UNSUPPORTED")
     for net_text in binding.expected_client_networks:
         try:
             net = ipaddress.ip_network(net_text, strict=False)
@@ -197,9 +246,7 @@ def evaluate_export_access(rules: Sequence[Dict[str, Any]], binding: Binding, v:
             if parsed == "*" or (parsed.version == net.version and net.subnet_of(parsed))
         ]
         if not covering:
-            if unsupported:
-                v.add_unknown("EXPORT_RULE_UNSUPPORTED")
-            else:
+            if not unsupported:
                 v.add_veto("EXPORT_ACCESS_MISSING")
             continue
         writables = {r.get("writable") for r in covering}
@@ -215,7 +262,7 @@ def evaluate_export_access(rules: Sequence[Dict[str, Any]], binding: Binding, v:
 
 
 # ---------------------------------------------------------------------------
-# The per-binding assessment (XMOD-03, 04, 11, 12, 14)
+# Graph helpers
 # ---------------------------------------------------------------------------
 
 
@@ -242,6 +289,43 @@ def _age(rec: Optional[Dict[str, Any]]) -> Optional[int]:
     return a if isinstance(a, int) and not isinstance(a, bool) and a >= 0 else None
 
 
+def _has_evidence(rec: Dict[str, Any]) -> bool:
+    """A SUCCESS record must carry both its time and its age (CON-10, C-02)."""
+    at = rec.get("observed_at")
+    return _age(rec) is not None and isinstance(at, str) and bool(at)
+
+
+def _details(rec: Dict[str, Any]) -> Dict[str, Any]:
+    d = rec.get("details")
+    return d if isinstance(d, dict) else {}
+
+
+def _kind(rec: Dict[str, Any]) -> Optional[str]:
+    k = _details(rec).get("kind")
+    return k if isinstance(k, str) else None
+
+
+def path_contains(parent: str, path: str) -> bool:
+    """True when ``path`` is ``parent`` or lies under it (string paths, no I/O)."""
+    if not parent or not path:
+        return False
+    if path == parent:
+        return True
+    if parent == "/":
+        return path.startswith("/")
+    return path.startswith(parent.rstrip("/") + "/")
+
+
+def _super_option(super_options: Any, key: str) -> Optional[str]:
+    if not isinstance(super_options, list):
+        return None
+    prefix = key + "="
+    for o in super_options:
+        if isinstance(o, str) and o.startswith(prefix):
+            return o[len(prefix):]
+    return None
+
+
 def _coverage(profile: Profile, log_mode: Optional[str], has_rt: bool) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = [
         {"check": c, "required": True, "status": contract.COVERAGE_EVALUATED} for c in profile.required_checks
@@ -259,6 +343,45 @@ def _coverage(profile: Profile, log_mode: Optional[str], has_rt: bool) -> List[D
     for check, reason in OPTIONAL_NOT_IMPLEMENTED:
         rows.append({"check": check, "required": False, "status": contract.COVERAGE_NOT_IMPLEMENTED, "reason": reason})
     return rows[: contract.MAX_COVERAGE_ROWS]
+
+
+def _check_share_graph(
+    share_path: Any,
+    fs: Dict[str, Any],
+    ex: Dict[str, Any],
+    svc: Dict[str, Any],
+    resources: Dict[str, Dict[str, Any]],
+    v: Verdict,
+) -> None:
+    """The three references must be of the right kind and agree with the
+    share (audit C-01): same export path, a filesystem whose mountpoint
+    contains the path and is the most specific managed one that does."""
+    if _kind(fs) != "FILESYSTEM":
+        v.note_inconsistency("filesystem_ref is not a FILESYSTEM")
+    if _kind(ex) != "EXPORT":
+        v.note_inconsistency("export_ref is not an EXPORT")
+    if _kind(svc) != "NFS_SERVICE":
+        v.note_inconsistency("service_ref is not an NFS_SERVICE")
+    if _kind(ex) == "EXPORT" and _details(ex).get("export_path") != share_path:
+        v.note_inconsistency("export path differs from the share path")
+    if _kind(fs) != "FILESYSTEM":
+        return
+    mountpoint = _details(fs).get("mountpoint")
+    if not (isinstance(mountpoint, str) and isinstance(share_path, str) and path_contains(mountpoint, share_path)):
+        v.note_inconsistency("filesystem does not contain the share path")
+        return
+    for other in resources.values():
+        if other is fs or _kind(other) != "FILESYSTEM":
+            continue
+        omp = _details(other).get("mountpoint")
+        if isinstance(omp, str) and path_contains(omp, share_path) and len(omp.rstrip("/")) > len(mountpoint.rstrip("/")):
+            v.note_inconsistency("a more specific filesystem contains the share path")
+            return
+
+
+# ---------------------------------------------------------------------------
+# The per-binding assessment (XMOD-02..04, 11..14; audit C-01..C-03, C-05, C-06)
+# ---------------------------------------------------------------------------
 
 
 def assess_binding(
@@ -347,37 +470,54 @@ def assess_binding(
         return finish(None, None, None, None, [])
     diag["share_reason_codes"] = [r for r in share.get("reason_codes", []) if isinstance(r, str)]
     incarnation = share.get("incarnation") if isinstance(share.get("incarnation"), str) else None
-    if share.get("export_path") != binding.endpoint.export_path:
+    share_path = share.get("export_path")
+    if share_path != binding.endpoint.export_path:
         v.add_veto("EXPORT_PATH_MISMATCH")
-        diag["source_export_path"] = share.get("export_path")
-    if binding.expected_target_incarnation is not None and incarnation != binding.expected_target_incarnation:
+        diag["source_export_path"] = share_path
+    # Audit C-05: a binding that pins nothing proves nothing. The operator
+    # pins the incarnation (`lattice-ds-connector discover`) and rebinds on
+    # change (XMOD-14, CON-18).
+    if binding.expected_target_incarnation is None:
+        v.add_unknown("INCARNATION_UNPINNED")
+    elif incarnation != binding.expected_target_incarnation:
         v.add_veto("INCARNATION_MISMATCH")
         diag["source_incarnation"] = incarnation
     if share.get("collection_status") != "SUCCESS":
         v.add_unknown("SHARE_COLLECTION_ERROR")
         return finish(incarnation, share.get("observed_at"), _age(share), None, [])
+    if not _has_evidence(share):
+        v.add_unknown("EVIDENCE_AGE_MISSING")
 
-    # --- the graph ----------------------------------------------------------
+    # --- the graph: references resolve AND agree (XMOD-03, audit C-01) ------
     fs = resources.get(share.get("filesystem_ref") or "")
     ex = resources.get(share.get("export_ref") or "")
     svc = resources.get(share.get("service_ref") or "")
     if fs is None or ex is None or svc is None:
         v.add_unknown("GRAPH_UNRESOLVED")
         return finish(incarnation, share.get("observed_at"), _age(share), None, [])
+    _check_share_graph(share_path, fs, ex, svc, resources, v)
     ages: List[Optional[int]] = [_age(share), _age(fs), _age(ex), _age(svc)]
     for dep, name in ((fs, "filesystem"), (ex, "export"), (svc, "service")):
         if dep.get("collection_status") != "SUCCESS":
             v.add_unknown("DEPENDENCY_ERROR")
             diag[f"{name}_reason_codes"] = [r for r in dep.get("reason_codes", []) if isinstance(r, str)]
-    fsd = fs.get("details") if isinstance(fs.get("details"), dict) else {}
-    exd = ex.get("details") if isinstance(ex.get("details"), dict) else {}
-    svd = svc.get("details") if isinstance(svc.get("details"), dict) else {}
+        elif not _has_evidence(dep):
+            # Audit C-02: a SUCCESS record without evidence time/age is not
+            # evidence; it cannot silently pass the freshness check.
+            v.add_unknown("EVIDENCE_AGE_MISSING")
+    fsd, exd, svd = _details(fs), _details(ex), _details(svc)
     domain = None
     shared: List[str] = []
     log_mode = None
     has_rt = False
-    if fs.get("collection_status") == "SUCCESS":
-        domain = f"{controller}/{fsd.get('uuid')}/{fsd.get('incarnation')}"
+    if fs.get("collection_status") == "SUCCESS" and _kind(fs) == "FILESYSTEM":
+        # --- filesystem identity (XMOD-14, audit C-03) ---
+        uuid = fsd.get("uuid")
+        fs_inc = fsd.get("incarnation")
+        if isinstance(uuid, str) and uuid and isinstance(fs_inc, str) and fs_inc:
+            domain = f"{controller}/{uuid}/{fs_inc}"
+        else:
+            v.add_unknown("FILESYSTEM_IDENTITY_MISSING")
         # --- filesystem prerequisites (XMOD-11, 12) ---
         if fsd.get("fs_type") != "xfs":
             v.add_unknown("FILESYSTEM_TYPE_UNSUPPORTED")
@@ -400,11 +540,22 @@ def assess_binding(
             v.add_unknown("DATA_ARRAY_UNRESOLVED")
         if fsd.get("external_dependencies_resolved") is False:
             v.add_unknown("EXTERNAL_DEVICE_UNRESOLVED")
+        super_options = fsd.get("super_options")
+        logdev = _super_option(super_options, "logdev")
+        rtdev = _super_option(super_options, "rtdev")
         if log_mode == "EXTERNAL" and "LOG" not in refs:
             v.add_unknown("EXTERNAL_DEVICE_UNRESOLVED")
         elif log_mode not in ("INTERNAL", "EXTERNAL"):
             v.add_unknown("LOG_MODE_UNKNOWN")
+        if log_mode == "INTERNAL" and (logdev is not None or "LOG" in refs):
+            v.note_inconsistency("internal log with a logdev option or a LOG ref")
+        if log_mode == "EXTERNAL" and logdev is None:
+            v.note_inconsistency("external log without a logdev option")
+        if "REALTIME" in refs and rtdev is None:
+            v.note_inconsistency("REALTIME ref without an rtdev option")
         has_rt = "REALTIME" in refs
+        # The device each role must be backed by (audit C-01).
+        expected_volume = {"DATA": fsd.get("source_device"), "LOG": logdev, "REALTIME": rtdev}
         raw_states: Dict[str, Any] = {}
         for role in ("DATA", "LOG", "REALTIME"):
             rid = refs.get(role)
@@ -415,17 +566,25 @@ def assess_binding(
             if arr is None:
                 v.add_unknown("GRAPH_UNRESOLVED")
                 continue
+            if _kind(arr) != "ARRAY":
+                v.note_inconsistency(f"{role} ref is not an ARRAY")
+                continue
             ages.append(_age(arr))
             if arr.get("collection_status") != "SUCCESS":
                 v.add_unknown("DEPENDENCY_ERROR")
                 diag.setdefault("array_reason_codes", {})[rid] = [r for r in arr.get("reason_codes", []) if isinstance(r, str)]
                 continue
-            ad = arr.get("details") if isinstance(arr.get("details"), dict) else {}
+            if not _has_evidence(arr):
+                v.add_unknown("EVIDENCE_AGE_MISSING")
+            ad = _details(arr)
+            want = expected_volume.get(role)
+            if not (isinstance(want, str) and want) or ad.get("volume_path") != want:
+                v.note_inconsistency(f"{role} array volume {ad.get('volume_path')!r} is not the filesystem's {want!r}")
             raw_states[rid] = ad.get("raw_states")
             evaluate_array(ad, profile, v)
         diag["array_raw_states"] = raw_states
     # --- export (XMOD-13) ---
-    if ex.get("collection_status") == "SUCCESS":
+    if ex.get("collection_status") == "SUCCESS" and _kind(ex) == "EXPORT":
         present = exd.get("present")
         diag["export_source"] = exd.get("source")
         if present is None:
@@ -440,7 +599,7 @@ def assess_binding(
             rules = [r for r in exd.get("rules", []) if isinstance(r, dict)]
             evaluate_export_access(rules, binding, v)
     # --- service (XMOD-04) ---
-    if svc.get("collection_status") == "SUCCESS":
+    if svc.get("collection_status") == "SUCCESS" and _kind(svc) == "NFS_SERVICE":
         running = svd.get("running")
         if running is None:
             v.add_unknown("NFS_SERVICE_UNKNOWN")

@@ -372,6 +372,10 @@ def _parse_binding(c: _Collector, raw: Any, path: str, module: str) -> Optional[
     target = _str(c, raw, "target_id", path)
     endpoint = _parse_endpoint(c, raw.get("endpoint"), f"{path}.endpoint")
     incarnation = _str(c, raw, "expected_target_incarnation", path, required=False)
+    if module == "xinas" and incarnation is None:
+        # Audit C-05: an unpinned binding proves nothing; pin it from
+        # `lattice-ds-connector discover` and rebind on change (XMOD-14).
+        c.error("INCARNATION_REQUIRED", f"{path}.expected_target_incarnation", "pin the share incarnation reported by the source (lattice-ds-connector discover)")
     networks = _str_list(c, raw, "expected_client_networks", path, ())
     for i, n in enumerate(networks):
         try:
@@ -418,6 +422,8 @@ def _parse_source(c: _Collector, raw: Any, path: str, test_mode: bool) -> Option
         elif parts.scheme == "http":
             if not allow_http:
                 c.error("INSECURE_HTTP", f"{path}.url", "plain http requires allow_insecure_http: true (CON-20)")
+            elif not test_mode:
+                c.error("INSECURE_HTTP_PRODUCTION", f"{path}.url", "plain http is accepted only with test_mode: true; production sources are https (CON-20)")
             else:
                 c.warn("INSECURE_HTTP", f"{path}.url", "plain http: the bearer token travels unencrypted; lab use only")
         else:

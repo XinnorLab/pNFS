@@ -14,17 +14,17 @@
       "module": "xinas",
       "expected_controller_id": "e4e94f0c-d980-43c3-8cf4-9690bb01791d",
       "source": {
-        "url": "http://192.168.64.51:8080/api/v1/placement/observations",
-        "allow_insecure_http": true,
+        "url": "https://192.168.64.51:8443/api/v1/placement/observations",
+        "tls_ca_file": "/etc/lattice-ds-connector/xinas-box-ca.pem",
         "bearer_token_file": "/etc/lattice-ds-connector/secrets/xi-01.token"
       },
       "profile": "xinas-mvp",
       "bindings": [
         {
           "ds_id": 0,
-          "binding_generation": 1,
+          "binding_generation": 2,
           "target_id": "mnt/data",
-          "expected_target_incarnation": "mnt/data:0",
+          "expected_target_incarnation": "mnt/data:0:<placement incarnation from `lattice-ds-connector discover`>",
           "endpoint": { "server": "192.168.64.51", "export_path": "/mnt/data", "protocol": "NFS", "transport": "TCP", "port": 2049 },
           "expected_client_networks": ["192.168.64.0/22"],
           "expected_security": ["sys"]

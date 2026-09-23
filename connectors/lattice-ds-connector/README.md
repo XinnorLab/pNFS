@@ -65,18 +65,35 @@ and 10 s passed; a repeated identical source snapshot is one sample.
 
 ```bash
 python3 -m lattice_ds_connector validate-config --config /etc/lattice-ds-connector/config.json
+python3 -m lattice_ds_connector discover --config /etc/lattice-ds-connector/config.json   # share ids + incarnations to pin
 python3 -m lattice_ds_connector run --config /etc/lattice-ds-connector/config.json
 python3 -m lattice_ds_connector show          # human view of the batch
 python3 -m lattice_ds_connector show --json   # the raw batch
 ```
 
 Configuration is the JSON of Appendix А (`examples/connector-config.json`).
-For the xiNAS prototype, which has no HTTPS ingress yet, the source URL may
-be `http://…` **only** with `"allow_insecure_http": true` (validate-config
-warns; the viewer token then travels in clear on the management network).
-The bearer token is read from `bearer_token_file` (mode 0600) on every
-collect, so it rotates without a restart. `test_mode: true` is what allows a
-`fixture` instance; production configs must set it to `false`.
+The source URL is `https://…` with `tls_ca_file` pointing at the CA of the
+xiNAS `mcp.http.tls` listener; `http://…` is accepted **only** in a file
+with `test_mode: true` **and** `"allow_insecure_http": true` (validate-config
+warns; the viewer token then travels in clear). Every xinas binding must
+pin `expected_target_incarnation`: `discover` fetches the source once and
+prints each share's current incarnation; a binding is never trusted on
+first use and is rebound (new `binding_generation`) when the incarnation
+changes. The bearer token is read from `bearer_token_file` (mode 0600) on
+every collect, so it rotates without a restart. `test_mode: true` is what
+allows a `fixture` instance; production configs must set it to `false`.
+
+Runtime guards beyond the decision table (audit 2026-09-23): the graph a
+share references must agree with it (export path, filesystem mountpoint,
+array volumes vs `source_device`/`logdev=`/`rtdev=`, record kinds) or the
+DS is `UNKNOWN` / `GRAPH_INCONSISTENT`; every `SUCCESS` record must carry
+its evidence time and age; the filesystem must have an identity; the
+arrays must be xiRAID Classic 4.4.x with a known level; an export with any
+hostname/netgroup rule is unproven; a snapshot whose generation is not
+newer than the last accepted one is ignored; one collect+evaluate helper
+per instance, bounded by `collect_deadline_ms`. When `jsonschema` is
+installed (`python3-jsonschema`), every response is also validated against
+`contracts/xinas-observations.schema.json` at runtime.
 
 Reload: `SIGHUP`; an invalid file is rejected and the active configuration
 stays (the rejection is logged with every issue). Stop: `SIGTERM`, bounded
@@ -110,14 +127,18 @@ batch from node225 validates against `contracts/connector-batch.schema.json`.
 
 Details in `docs/profile-xinas-mvp.md`. A DS is `VALID`/allowed only when,
 in one consistent source snapshot: the controller id matches the binding;
-the bound share is present, `SUCCESS`, at the expected export path and
-incarnation; its filesystem is XFS, mounted on the expected device and
-writable, with the DATA array resolved and any `logdev=`/`rtdev=` resolved to
-arrays; every referenced array has a valid state shape, is `online`, proves
-initialization where the level needs it, and carries no veto word; every
-member state is valid and not reconstructing; the export is present with a
-writable rule covering every configured client network and offering the
-expected security flavors; nfsd is running with NFSv3; and the oldest
+the bound share is present, `SUCCESS`, at the expected export path and the
+pinned incarnation; its export, filesystem and service records are of the
+right kind and agree with it; its filesystem has an identity, is XFS,
+mounted on the expected device and writable, with the DATA array resolved
+to the filesystem's source device and any `logdev=`/`rtdev=` resolved to the
+matching arrays; every referenced array is xiRAID Classic 4.4.x of a known
+level, has a valid state shape, is `online`, proves initialization where
+the level needs it, carries no veto word and has member records; every
+member state is valid and not reconstructing; the export is present, with
+IP/CIDR rules only, a writable rule covering every configured client
+network and offering the expected security flavors; nfsd is running with
+NFSv3; every record carries its evidence time and age; and the oldest
 evidence is younger than 20 s. `degraded`/`need_restripe`/member `offline`
 give the 250000 ppm multiplier (minimum across data/log/rt, never a
 product); `sdc_scanning` is allowed at full weight with `SCAN_ACTIVE`.

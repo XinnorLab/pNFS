@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import ssl
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlsplit
@@ -132,12 +134,68 @@ def fetch_observations(
     return doc
 
 
-def validate_envelope(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Structural checks the policy relies on; returns ``result``.
+_SCHEMA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "contracts", "xinas-observations.schema.json")
+_schema_lock = threading.Lock()
+_schema_validator: Any = None
+_schema_state = "unloaded"  # unloaded | ready | unavailable
 
-    A full JSON-Schema validation (contracts/xinas-observations.schema.json)
-    runs in tests; the runtime checks the fields it dereferences so a shape
-    surprise becomes SOURCE_SCHEMA_INVALID, never a traceback.
+
+def _load_schema_validator() -> Any:
+    """The shipped source schema compiled with ``jsonschema`` when that
+    package is installed (python3-jsonschema on RHEL 9); None otherwise. The
+    structural checks below run regardless (audit C-02)."""
+    global _schema_validator, _schema_state
+    with _schema_lock:
+        if _schema_state != "unloaded":
+            return _schema_validator
+        try:
+            import jsonschema  # type: ignore
+
+            with open(_SCHEMA_PATH, "r", encoding="utf-8") as fh:
+                schema = json.load(fh)
+            _schema_validator = jsonschema.Draft7Validator(schema)
+            _schema_state = "ready"
+        except Exception:  # noqa: BLE001 - optional dependency or file
+            _schema_validator = None
+            _schema_state = "unavailable"
+        return _schema_validator
+
+
+def schema_validation_available() -> bool:
+    return _load_schema_validator() is not None
+
+
+_RECORD_STR = ("observed_at",)
+
+
+def _check_record(rec: Any, what: str, idx: int) -> None:
+    """Type checks for the fields the policy dereferences on any record."""
+    if not isinstance(rec, dict):
+        raise CollectionError("SOURCE_SCHEMA_INVALID", f"{what}[{idx}] is not an object", retryable=False)
+    status = rec.get("collection_status")
+    if status not in ("SUCCESS", "ERROR", "UNKNOWN"):
+        raise CollectionError("SOURCE_SCHEMA_INVALID", f"{what}[{idx}].collection_status invalid", retryable=False)
+    if not isinstance(rec.get("reason_codes"), list):
+        raise CollectionError("SOURCE_SCHEMA_INVALID", f"{what}[{idx}].reason_codes missing", retryable=False)
+    age = rec.get("evidence_age_ms")
+    if age is not None and (isinstance(age, bool) or not isinstance(age, int) or age < 0):
+        raise CollectionError("SOURCE_SCHEMA_INVALID", f"{what}[{idx}].evidence_age_ms invalid", retryable=False)
+    at = rec.get("observed_at")
+    if at is not None and not isinstance(at, str):
+        raise CollectionError("SOURCE_SCHEMA_INVALID", f"{what}[{idx}].observed_at invalid", retryable=False)
+    if status == "SUCCESS" and (age is None or not at):
+        raise CollectionError("SOURCE_SCHEMA_INVALID", f"{what}[{idx}]: SUCCESS without evidence time/age", retryable=False)
+    if status != "SUCCESS" and not rec.get("reason_codes"):
+        raise CollectionError("SOURCE_SCHEMA_INVALID", f"{what}[{idx}]: {status} without a reason", retryable=False)
+
+
+def validate_envelope(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Contract checks the policy relies on; returns ``result``.
+
+    The full JSON Schema (contracts/xinas-observations.schema.json) is
+    applied when ``jsonschema`` is installed; the structural checks below
+    run always, so a shape surprise becomes SOURCE_SCHEMA_INVALID, never a
+    traceback or a lucky allow (audit C-02).
     """
     for key in ("request_id", "state_revision", "errors", "result"):
         if key not in doc:
@@ -172,6 +230,37 @@ def validate_envelope(doc: Dict[str, Any]) -> Dict[str, Any]:
         raise CollectionError("SOURCE_SCHEMA_INVALID", "unknown snapshot_status", retryable=False)
     if len(result["shares"]) > 256:
         raise CollectionError("SNAPSHOT_TOO_LARGE", "more than 256 shares", retryable=False)
+    validator = _load_schema_validator()
+    if validator is not None:
+        errors = sorted(validator.iter_errors(doc), key=lambda e: list(e.path))
+        if errors:
+            first = errors[0]
+            raise CollectionError(
+                "SOURCE_SCHEMA_INVALID",
+                f"schema: {'/'.join(str(p) for p in first.path)}: {first.message[:120]}",
+                retryable=False,
+                details={"errors": len(errors)},
+            )
+    seen_shares: set = set()
+    for i, s in enumerate(result["shares"]):
+        _check_record(s, "shares", i)
+        sid = s.get("share_id")
+        if not isinstance(sid, str) or not sid:
+            raise CollectionError("SOURCE_SCHEMA_INVALID", f"shares[{i}].share_id missing", retryable=False)
+        if sid in seen_shares:
+            raise CollectionError("SOURCE_SCHEMA_INVALID", f"duplicate share_id {sid!r}", retryable=False)
+        seen_shares.add(sid)
+    seen_res: set = set()
+    for i, r in enumerate(result["resources"]):
+        _check_record(r, "resources", i)
+        rid = r.get("id")
+        if not isinstance(rid, str) or not rid:
+            raise CollectionError("SOURCE_SCHEMA_INVALID", f"resources[{i}].id missing", retryable=False)
+        if rid in seen_res:
+            raise CollectionError("SOURCE_SCHEMA_INVALID", f"duplicate resource id {rid!r}", retryable=False)
+        seen_res.add(rid)
+        if not isinstance(r.get("details"), dict) or r["details"].get("kind") not in ("ARRAY", "FILESYSTEM", "EXPORT", "NFS_SERVICE"):
+            raise CollectionError("SOURCE_SCHEMA_INVALID", f"resources[{i}].details.kind invalid", retryable=False)
     return result
 
 

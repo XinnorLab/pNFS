@@ -74,6 +74,10 @@ def test_profile_digest_changes_only_with_placement_fields(token_file, tmp_path)
         (lambda d: d["instances"][0]["source"].__setitem__("url", "https://user:pw@xinas/api"), ("CREDENTIALS_IN_URL", "instances[0].source.url")),
         (lambda d: d["instances"][1]["bindings"][0].pop("datastore_id"), ("MISSING_FIELD", "instances[1].bindings[0].datastore_id")),
         (lambda d: d.__setitem__("config_version", "2.0"), ("UNSUPPORTED_CONFIG_VERSION", "config_version")),
+        # Audit C-05: a xinas binding must pin the share incarnation it trusts.
+        (lambda d: d["instances"][0]["bindings"][0].pop("expected_target_incarnation"), ("INCARNATION_REQUIRED", "instances[0].bindings[0].expected_target_incarnation")),
+        # Audit C-04/C-07 hardening: plain http is a test-mode-only exception.
+        (lambda d: (d.__setitem__("test_mode", False), d["instances"].pop(1), d["instances"][0]["source"].update({"url": "http://xinas/api/v1/placement/observations", "allow_insecure_http": True})), ("INSECURE_HTTP_PRODUCTION", "instances[0].source.url")),
         (lambda d: d["instances"].append({**d["instances"][1], "id": "fixture-01"}), ("DUPLICATE_INSTANCE", "instances[2].id")),
     ],
 )

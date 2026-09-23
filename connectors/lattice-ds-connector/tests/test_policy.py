@@ -79,6 +79,7 @@ def test_realtime_device_is_evaluated(base_result):
     r["resources"].append(sb.array("rt1", "10", [sb.member(0, "/dev/nvme8n1"), sb.member(1, "/dev/nvme9n1")]))
     fs = sb.find(r, "fs:mnt-data.mount")["details"]
     fs["array_refs"].append({"role": "REALTIME", "resource_id": "array:rt1"})
+    fs["super_options"].append("rtdev=/dev/xi_rt1")  # the ref must be backed by the rtdev option (C-01)
     a = one(r)
     assert a.allowed
     assert {c["check"]: c["status"] for c in a.coverage}["topology.realtime"] == "EVALUATED"
@@ -386,9 +387,13 @@ def test_export_path_mismatch_is_a_valid_deny(base_result):
     assert not a.allowed and "EXPORT_PATH_MISMATCH" in a.reason_codes
 
 
-def test_binding_without_expected_incarnation_accepts_any(base_result):
+def test_binding_without_expected_incarnation_is_unknown_not_trusted(base_result):
+    """Audit C-05: an unpinned binding proves nothing; the operator pins the
+    incarnation from `discover` and rebinds on change."""
     a = one(base_result, binding=make_binding(0, "training-a", "/mnt/data/training-a", None))
-    assert a.allowed and a.target_incarnation == "training-a:7"
+    assert a.quality == "UNKNOWN" and not a.allowed
+    assert a.reason_codes == ["INCARNATION_UNPINNED"]
+    assert a.target_incarnation == "training-a:7"
 
 
 def test_xmod14_share_absent_complete_vs_partial(base_result):
@@ -415,6 +420,195 @@ def test_share_collection_error_is_unknown(base_result):
     a = one(r)
     assert a.quality == "UNKNOWN" and "SHARE_COLLECTION_ERROR" in a.reason_codes
     assert a.diagnostics["share_reason_codes"] == ["EXPORT_ABSENT"]
+
+
+# ---------------------------------------------------------------------------
+# Audit C-01: schema-valid but semantically wrong graphs are UNKNOWN
+# ---------------------------------------------------------------------------
+
+
+def _swap_share_ref(r, key, value):
+    r = copy.deepcopy(r)
+    r["shares"][0][key] = value
+    return r
+
+
+@pytest.mark.parametrize(
+    "mutate, what",
+    [
+        # the share points at another share's export (path differs)
+        (lambda r: _swap_share_ref(r, "export_ref", "export:mnt-data-training-b"), "export path"),
+        # the share points at a filesystem that does not contain its path
+        (lambda r: _swap_share_ref(r, "filesystem_ref", "fs:mnt-data2.mount"), "filesystem does not contain"),
+        # the share points at an ARRAY where a FILESYSTEM is expected
+        (lambda r: _swap_share_ref(r, "filesystem_ref", "array:data1"), "not a FILESYSTEM"),
+        # the share points at the export where the service is expected
+        (lambda r: _swap_share_ref(r, "service_ref", "export:mnt-data-training-a"), "not an NFS_SERVICE"),
+        # the share points at the nfs service where the export is expected
+        (lambda r: _swap_share_ref(r, "export_ref", "nfs:nfs-server"), "not an EXPORT"),
+    ],
+)
+def test_c01_reference_substitution_is_unknown(base_result, mutate, what):
+    a = one(mutate(base_result))
+    assert a.quality == "UNKNOWN" and not a.allowed, a.reason_codes
+    assert "GRAPH_INCONSISTENT" in a.reason_codes
+    assert any(what in note for note in a.diagnostics["graph_inconsistent"]), a.diagnostics
+
+
+def test_c01_data_array_must_be_the_filesystem_source_device(base_result):
+    r = copy.deepcopy(base_result)
+    fsd = sb.find(r, "fs:mnt-data.mount")["details"]
+    fsd["array_refs"] = [{"role": "DATA", "resource_id": "array:data2"}, {"role": "LOG", "resource_id": "array:log1"}]
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "GRAPH_INCONSISTENT" in a.reason_codes
+    assert any("DATA array volume" in n for n in a.diagnostics["graph_inconsistent"])
+
+
+def test_c01_log_array_must_match_the_logdev_option(base_result):
+    r = copy.deepcopy(base_result)
+    fsd = sb.find(r, "fs:mnt-data.mount")["details"]
+    fsd["array_refs"] = [{"role": "DATA", "resource_id": "array:data1"}, {"role": "LOG", "resource_id": "array:log2"}]
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "GRAPH_INCONSISTENT" in a.reason_codes
+    assert any("LOG array volume" in n for n in a.diagnostics["graph_inconsistent"])
+
+
+def test_c01_most_specific_filesystem_wins(base_result):
+    """A filesystem mounted deeper under the share path than the referenced
+    one means the share was pinned to a parent (T-05)."""
+    r = copy.deepcopy(base_result)
+    nested = sb.filesystem("mnt-data-training--a.mount", "fs-uuid-03", "/mnt/data/training-a", "data2", "log2")
+    r["resources"].append(nested)
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "GRAPH_INCONSISTENT" in a.reason_codes
+    assert any("more specific" in n for n in a.diagnostics["graph_inconsistent"])
+
+
+def test_c01_internal_log_with_a_logdev_is_inconsistent(base_result):
+    r = copy.deepcopy(base_result)
+    fsd = sb.find(r, "fs:mnt-data.mount")["details"]
+    fsd["log_mode"] = "INTERNAL"
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "GRAPH_INCONSISTENT" in a.reason_codes
+
+
+def test_c01_healthy_graph_has_no_inconsistency_notes(base_result):
+    a = one(base_result)
+    assert a.allowed and "graph_inconsistent" not in a.diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Audit C-02: evidence time and age are mandatory on every SUCCESS record
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("resource_id", ["fs:mnt-data.mount", "export:mnt-data-training-a", "nfs:nfs-server", "array:data1", "array:log1"])
+@pytest.mark.parametrize("field", ["evidence_age_ms", "observed_at"])
+def test_c02_success_without_evidence_is_unknown(base_result, resource_id, field):
+    r = copy.deepcopy(base_result)
+    sb.find(r, resource_id)[field] = None
+    a = one(r)
+    assert a.quality == "UNKNOWN" and not a.allowed
+    assert "EVIDENCE_AGE_MISSING" in a.reason_codes
+
+
+def test_c02_share_without_evidence_is_unknown(base_result):
+    r = copy.deepcopy(base_result)
+    r["shares"][0]["evidence_age_ms"] = None
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "EVIDENCE_AGE_MISSING" in a.reason_codes
+
+
+def test_c02_missing_ages_never_make_the_snapshot_look_fresh(base_result):
+    """Every age dropped: the freshness check has nothing to measure."""
+    r = copy.deepcopy(base_result)
+    for rec in r["resources"] + r["shares"]:
+        rec["evidence_age_ms"] = None
+    a = one(r)
+    assert a.quality == "UNKNOWN" and {"EVIDENCE_AGE_MISSING", "SOURCE_STALE"} <= set(a.reason_codes)
+    assert a.evidence_age_ms is None
+
+
+# ---------------------------------------------------------------------------
+# Audit C-03: identity, edition/version and level are proven, not assumed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["uuid", "incarnation"])
+@pytest.mark.parametrize("value", [None, ""])
+def test_c03_filesystem_identity_is_mandatory(base_result, field, value):
+    r = copy.deepcopy(base_result)
+    sb.find(r, "fs:mnt-data.mount")["details"][field] = value
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "FILESYSTEM_IDENTITY_MISSING" in a.reason_codes
+    assert a.capacity_domain_id is None
+
+
+@pytest.mark.parametrize(
+    "edition, version",
+    [("Opus", "4.4.0"), ("Classic", "9.0.0"), ("Classic", "4.3.2"), ("Classic", "unknown"), ("Classic", None), (None, "4.4.0"), ("Classic", "5.0.0")],
+)
+def test_c03_unsupported_edition_or_version_is_unknown(base_result, edition, version):
+    r = copy.deepcopy(base_result)
+    d = sb.find(r, "array:data1")["details"]
+    d["edition"] = edition
+    d["version"] = version
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "XIRAID_VERSION_UNSUPPORTED" in a.reason_codes
+    assert a.diagnostics["unsupported_versions"] == [{"edition": edition, "version": version}]
+
+
+@pytest.mark.parametrize("version", ["4.4.0", "4.4.1", "4.4", "4.4.0-43861"])
+def test_c03_supported_versions(base_result, version):
+    r = copy.deepcopy(base_result)
+    sb.find(r, "array:data1")["details"]["version"] = version
+    assert one(r).allowed
+
+
+def test_c03_empty_members_is_unknown(base_result):
+    r = copy.deepcopy(base_result)
+    sb.find(r, "array:data1")["details"]["members"] = []
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "MEMBER_STATE_MISSING" in a.reason_codes
+
+
+@pytest.mark.parametrize("level", ["raid8", "", None, "n+m+1", "raid"])
+def test_c03_unknown_raid_level_is_unknown(base_result, level):
+    r = copy.deepcopy(base_result)
+    sb.find(r, "array:data1")["details"]["raid_level"] = level
+    a = one(r)
+    assert a.quality == "UNKNOWN" and "RAID_LEVEL_UNSUPPORTED" in a.reason_codes
+
+
+@pytest.mark.parametrize("level", ["raid0", "raid1", "raid5", "raid6", "raid7", "raid10", "raid50", "raid60", "raid70", "n+m", "5", "RAID5"])
+def test_c03_supported_raid_levels(base_result, level):
+    r = copy.deepcopy(base_result)
+    d = sb.find(r, "array:data1")["details"]
+    d["raid_level"] = level
+    d["raw_states"] = ["online", "initialized"]
+    assert one(r).allowed, level
+
+
+# ---------------------------------------------------------------------------
+# Audit C-06: an unsupported rule present in the export makes access unproven
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        [sb.rule("*"), sb.rule("nas-clients.example.org", writable=False)],
+        [sb.rule("10.10.0.0/16"), sb.rule("@trusted")],
+        [sb.rule("10.10.0.0/16"), sb.rule("*.example.org")],
+    ],
+)
+def test_c06_any_unsupported_rule_is_unknown_even_when_ip_rules_cover(base_result, rules):
+    r = copy.deepcopy(base_result)
+    sb.find(r, "export:mnt-data-training-a")["details"]["rules"] = rules
+    a = one(r)
+    assert a.quality == "UNKNOWN" and not a.allowed
+    assert "EXPORT_RULE_UNSUPPORTED" in a.reason_codes and "EXPORT_ACCESS_MISSING" not in a.reason_codes
+    assert a.diagnostics["export_rules_unsupported"] == 1
 
 
 def test_graph_unresolved(base_result):

@@ -206,9 +206,13 @@ class InstanceRuntime:
         self._thread: Optional[threading.Thread] = None
         self._collect_generation = 0
         self._stuck = False
+        self._helper: Optional[threading.Thread] = None
         self._restart_times: List[float] = []
         self._backoff_s = 0.0
         self._failures = 0
+        # Audit C-05: the last accepted source cycle; a replayed or regressed
+        # generation within the same source epoch is ignored.
+        self._last_source: Optional[Tuple[str, int]] = None
         self.snapshot: InstanceSnapshot = self._unknown_snapshot("NO_ASSESSMENT", contract.SNAPSHOT_FAILED, publish=False)
 
     # --- helpers ------------------------------------------------------------
@@ -268,21 +272,21 @@ class InstanceRuntime:
         deadline_s = self.cfg.collect_deadline_ms / 1000.0
         started = self._clock()
         try:
-            batch = self._collect_bounded(deadline_s)
+            batch, raw = self._collect_bounded(deadline_s)
         except CollectionError as exc:
             self._on_collection_error(exc)
             return
         except Exception as exc:  # a module bug must not kill the runtime (CON-04)
             self._on_collection_error(CollectionError("MODULE_ERROR", f"{exc.__class__.__name__}: {exc}", retryable=False))
             return
-        try:
-            raw = self.module.evaluate(batch, self.profile, self.instance.bindings)
-        except CollectionError as exc:
-            self._on_collection_error(exc)
+        # Audit C-05 / CON-14: within one source epoch the generation must
+        # advance; a late or replayed snapshot is not new evidence and takes
+        # no part in the hold-down. A new source epoch (agent restart) resets.
+        if self._last_source is not None and self._last_source[0] == batch.source_epoch and batch.source_generation <= self._last_source[1]:
+            self.log.counters.inc("connector_source_replay_total", {"instance": self.instance.id})
+            self.log.limited("warn", "source_replay_ignored", f"{self.instance.id}:replay", instance=self.instance.id, source_cycle=batch.cycle_key, last_accepted=f"{self._last_source[0]}:{self._last_source[1]}")
             return
-        except Exception as exc:
-            self._on_collection_error(CollectionError("MODULE_ERROR", f"evaluate: {exc.__class__.__name__}: {exc}", retryable=False))
-            return
+        self._last_source = (batch.source_epoch, batch.source_generation)
         now = self._clock()
         pid, pver, pdig, max_age = self._profile_triplet(batch)
         by_ds = {a.ds_id: a for a in raw}
@@ -330,8 +334,18 @@ class InstanceRuntime:
             bound=len(records),
         )
 
-    def _collect_bounded(self, deadline_s: float) -> SourceBatch:
-        """Run module.collect in a helper thread; give up at the deadline."""
+    def _collect_bounded(self, deadline_s: float) -> Tuple[SourceBatch, List[Assessment]]:
+        """Run module.collect AND module.evaluate in one helper thread bounded
+        by the deadline (audit C-07). At most one helper per instance is ever
+        in flight: while a previous one has not returned, this tick is skipped
+        (COLLECT_IN_FLIGHT) instead of stacking a second collect on the same
+        module; the previous helper's result, when it finally arrives, is
+        discarded (its result dict is private to that call)."""
+        prev = self._helper
+        if prev is not None and prev.is_alive():
+            self._stuck = True
+            self.log.counters.inc("connector_worker_stuck_total", {"instance": self.instance.id})
+            raise CollectionError("COLLECT_IN_FLIGHT", "the previous collect is still running; tick skipped", retryable=True, details={"stuck": True})
         self._collect_generation += 1
         generation = self._collect_generation
         result: Dict[str, Any] = {}
@@ -339,25 +353,29 @@ class InstanceRuntime:
 
         def target() -> None:
             try:
-                result["batch"] = self.module.collect(deadline_s)
+                batch = self.module.collect(deadline_s)
+                result["batch"] = batch
+                result["raw"] = self.module.evaluate(batch, self.profile, self.instance.bindings)
             except BaseException as exc:  # noqa: BLE001 - forwarded as a typed error
                 result["error"] = exc
             finally:
                 done.set()
 
         t = threading.Thread(target=target, name=f"collect-{self.instance.id}-{generation}", daemon=True)
+        self._helper = t
         t.start()
         if not done.wait(deadline_s + 0.5):
             self._stuck = True
             self.log.counters.inc("connector_worker_stuck_total", {"instance": self.instance.id})
-            raise CollectionError("SOURCE_TIMEOUT", "collect did not return by the deadline (worker abandoned)", retryable=True, details={"stuck": True})
+            raise CollectionError("SOURCE_TIMEOUT", "collect did not return by the deadline (helper left to finish alone)", retryable=True, details={"stuck": True})
         self._stuck = False
+        self._helper = None
         if "error" in result:
             err = result["error"]
             if isinstance(err, CollectionError):
                 raise err
             raise CollectionError("MODULE_ERROR", f"{err.__class__.__name__}: {err}", retryable=False)
-        return result["batch"]
+        return result["batch"], list(result["raw"])
 
     def _on_collection_error(self, exc: CollectionError) -> None:
         self._failures += 1

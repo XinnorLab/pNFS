@@ -182,13 +182,18 @@ def test_t18_same_source_snapshot_repeated_is_not_a_new_sample():
     rt = make_runtime(clock, {"xi-01": mod})
     ir = rt.instances["xi-01"]
     ir.run_cycle()
+    first_seq = records(rt)[0]["sequence"]
     for _ in range(4):
         clock.advance(4.0)
         mod.push(sb.base_result(), same_generation=True)
         ir.run_cycle()
-    _, recs = records(rt)
+    inst, recs = records(rt)
     assert recs[0]["placement"]["allowed"] is False
     assert recs[0]["diagnostics"]["hold_down"]["distinct_cycles"] == 1
+    # Audit C-05: a replayed generation is ignored outright — the sequence
+    # does not advance and the counter records it.
+    assert inst["sequence"] == first_seq
+    assert sum(rt.log.counters.snapshot().get("connector_source_replay_total", {}).values()) == 4
     # A frozen source also ages out on its own evidence (the source's age grows).
     frozen = sb.base_result()
     for s in frozen["shares"]:
@@ -371,6 +376,74 @@ def test_reload_removes_and_adds_instances():
 # ---------------------------------------------------------------------------
 
 
+def test_c05_regressed_generation_is_ignored_and_a_new_epoch_resets():
+    clock = FakeClock()
+    mod = ScriptedModule(clock)
+    rt = make_runtime(clock, {"xi-01": mod})
+    ir = rt.instances["xi-01"]
+    ir.run_cycle()  # generation 101
+    ir.run_cycle()  # 102
+    seq = records(rt)[0]["sequence"]
+    mod.generation = 90  # a delayed / replayed older snapshot
+    mod.push(sb.base_result(), same_generation=True)
+    clock.advance(5.0)
+    ir.run_cycle()
+    assert records(rt)[0]["sequence"] == seq
+    assert ir._last_source == ("publisher-epoch-1", 102)
+    # A new source epoch (agent restart) starts a fresh generation line.
+    mod.epoch = "publisher-epoch-2"
+    mod.generation = 5
+    mod.push(sb.base_result(), same_generation=True)
+    clock.advance(5.0)
+    ir.run_cycle()
+    assert records(rt)[0]["sequence"] == seq + 1
+    assert ir._last_source == ("publisher-epoch-2", 5)
+
+
+class SlowEvaluateModule(Module):
+    """collect returns at once; evaluate hangs (audit C-07)."""
+
+    name = "xinas"
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.release = threading.Event()
+        self.evaluate_calls = 0
+
+    def describe(self):
+        return {}
+
+    def validate(self, instance, profile):
+        return []
+
+    def collect(self, deadline_s):
+        r = sb.base_result()
+        return SourceBatch(r, self.clock(), 10, r["server_epoch"], r["source_generation"], r["snapshot_status"])
+
+    def evaluate(self, batch, profile, bindings):
+        self.evaluate_calls += 1
+        self.release.wait(30)
+        return []
+
+
+def test_c07_slow_evaluate_is_bounded_by_the_same_deadline():
+    real_clock = time.monotonic
+    slow = SlowEvaluateModule(real_clock)
+    cfg = make_config([make_instance()], RuntimeConfig(collect_deadline_ms=100, collect_interval_ms=1000, worker_restart_limit=1))
+    rt = Runtime(cfg, Logger(stream=open("/dev/null", "w")), clock=real_clock, module_factory=lambda inst: slow)
+    ir = rt.instances["xi-01"]
+    t0 = real_clock()
+    ir.run_cycle()
+    assert real_clock() - t0 < 2.0
+    assert rt.health()["instances"]["xi-01"]["stuck"] is True
+    assert rt.health()["instances"]["xi-01"]["last_error"] == "SOURCE_TIMEOUT"
+    # While the helper is still inside evaluate, the next tick does not start a second one.
+    ir.run_cycle()
+    assert slow.evaluate_calls == 1
+    assert rt.health()["instances"]["xi-01"]["last_error"] == "COLLECT_IN_FLIGHT"
+    slow.release.set()
+
+
 class HangingModule(Module):
     name = "fixture"
 
@@ -410,10 +483,21 @@ def test_t22_hanging_collect_is_abandoned_at_the_deadline_and_others_proceed():
     assert rt.health()["instances"]["fx"]["last_error"] == "SOURCE_TIMEOUT"
     rt.instances["xi-01"].run_cycle()
     assert records(rt)[0]["sequence"] == 1
-    # At most one collect in flight: a second cycle while the first hangs does not start another.
+    # Audit C-07: at most one collect in flight — a second cycle while the
+    # first hangs does NOT start another helper; it is skipped as COLLECT_IN_FLIGHT.
     rt.instances["fx"].run_cycle()
-    assert hang.calls == 2  # the abandoned helper and one new attempt (each bounded)
+    assert hang.calls == 1
+    assert rt.health()["instances"]["fx"]["last_error"] == "COLLECT_IN_FLIGHT"
+    assert rt.health()["instances"]["fx"]["stuck"] is True
+    # Once the stuck helper returns, the next cycle starts a fresh one.
     hang.release.set()
+    hang.started.clear()
+    for _ in range(50):
+        if not rt.instances["fx"]._helper.is_alive():
+            break
+        time.sleep(0.02)
+    rt.instances["fx"].run_cycle()
+    assert hang.calls == 2
 
 
 def test_worker_restart_budget_publishes_worker_stuck():

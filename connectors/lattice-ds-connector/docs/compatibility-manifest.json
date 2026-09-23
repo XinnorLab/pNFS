@@ -23,8 +23,12 @@
       ],
       "source_requirements": [
         "details.source must be etab (kernel-effective export table); xiNAS release/3.15 after 2026-09-23",
-        "HTTPS listener (xiNAS mcp.http.tls) or, for isolated labs only, allow_insecure_http on both sides"
-      ]
+        "HTTPS listener (xiNAS mcp.http.tls); plain http only in a test_mode configuration",
+        "every SUCCESS record carries observed_at and evidence_age_ms; filesystems carry uuid and incarnation",
+        "ARRAY details.edition Classic and details.version 4.4.x; raid_level 0/1/5/6/7/10/50/60/70/n+m",
+        "share incarnation = <share id>:<fsid>:<placement incarnation> (xiNAS 846a4922 and later); bindings pin it"
+      ],
+      "runtime_schema_validation": "contracts/xinas-observations.schema.json when the jsonschema package is installed; structural checks always"
     },
     "fixture": {
       "version": "1",

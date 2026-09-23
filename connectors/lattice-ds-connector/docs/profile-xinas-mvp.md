@@ -57,7 +57,7 @@ RAID 0 has no initialization phase, so `online` alone is enough for it
 | `offline` | at least the degraded penalty (250000) | `MEMBER_OFFLINE` |
 | `reconstructing` | veto | `MEMBER_RECONSTRUCTION_ACTIVE` |
 | `need_recon` | veto | `MEMBER_RECONSTRUCTION_REQUIRED` |
-| missing / empty | `UNKNOWN` | `MEMBER_STATE_MISSING` |
+| missing / empty (an array without member records is not "all healthy") | `UNKNOWN` | `MEMBER_STATE_MISSING` |
 | invalid shape / unknown word | `UNKNOWN` | `MEMBER_STATE_INVALID` |
 
 Penalties are not summed per member and group failures are not turned into
@@ -88,7 +88,7 @@ differ per share.
 | a configured client network not covered by an IP/CIDR/`*` rule | VALID deny | `EXPORT_ACCESS_MISSING` |
 | covered only by a read-only rule | VALID deny | `EXPORT_READ_ONLY` |
 | covering rule lacks an expected security flavor | VALID deny | `EXPORT_SECURITY_MISMATCH` |
-| coverage would need a netgroup/hostname rule | UNKNOWN | `EXPORT_RULE_UNSUPPORTED` |
+| any netgroup / hostname / wildcard-host rule present in the export, whether or not an IP rule also covers the network (such a rule may apply to any host of the network and contradict the IP rule) | UNKNOWN | `EXPORT_RULE_UNSUPPORTED` |
 | covering rules disagree on rw/ro, or `writable: null` | UNKNOWN | `EXPORT_RULES_CONFLICT` |
 | nfsd `running: false` | VALID deny | `NFS_SERVICE_STOPPED` |
 | nfsd `running: null` | UNKNOWN | `NFS_SERVICE_UNKNOWN` |
@@ -97,6 +97,12 @@ differ per share.
 | share missing from a `PARTIAL` snapshot | UNKNOWN | `SHARE_UNRESOLVED` |
 | share or referenced resource not `SUCCESS` | UNKNOWN | `SHARE_COLLECTION_ERROR` / `DEPENDENCY_ERROR` |
 | reference does not resolve | UNKNOWN | `GRAPH_UNRESOLVED` |
+| reference resolves to a record that contradicts the share: wrong `kind`, export `export_path` ≠ share path, filesystem `mountpoint` not containing the path or not the most specific managed filesystem that does, DATA array `volume_path` ≠ filesystem `source_device`, LOG / REALTIME array ≠ `logdev=` / `rtdev=`, `INTERNAL` log with a `logdev=` or LOG ref | UNKNOWN | `GRAPH_INCONSISTENT` (`diagnostics.graph_inconsistent` lists every contradiction) |
+| a `SUCCESS` share, filesystem, export, service or array without `observed_at` or `evidence_age_ms` | UNKNOWN | `EVIDENCE_AGE_MISSING` |
+| filesystem without `uuid` or `incarnation` | UNKNOWN (no capacity domain) | `FILESYSTEM_IDENTITY_MISSING` |
+| array `edition` ≠ `Classic` or `version` outside `4.4.x` (Opus, 4.3, a future major, `unknown`) | UNKNOWN | `XIRAID_VERSION_UNSUPPORTED` |
+| array `raid_level` not one of 0 / 1 / 5 / 6 / 7 / 10 / 50 / 60 / 70 / n+m (either spelling) | UNKNOWN | `RAID_LEVEL_UNSUPPORTED` |
+| binding without `expected_target_incarnation` (xinas bindings must pin one; `validate-config` rejects the file, the policy guards the runtime path) | UNKNOWN | `INCARNATION_UNPINNED` |
 | `controller_id` ≠ binding | VALID deny | `IDENTITY_MISMATCH` |
 | share `incarnation` ≠ `expected_target_incarnation` | VALID deny (rebind) | `INCARNATION_MISMATCH` |
 | share `export_path` ≠ endpoint | VALID deny | `EXPORT_PATH_MISMATCH` |
@@ -125,8 +131,12 @@ one filesystem share one domain (LAT-10); `shared_resource_ids` =
 
 `RECOVERY_HOLD_DOWN` (VALID deny during the hold-down), `EVIDENCE_EXPIRED`
 (TTL reached 0), `NO_ASSESSMENT` (start-up), `SOURCE_UNAVAILABLE` /
-`SOURCE_TIMEOUT` (transport; the last VALID decisions are retained until
-their own expiry), `SOURCE_AUTH_FAILED` / `SOURCE_TLS_FAILED` /
+`SOURCE_TIMEOUT` / `COLLECT_IN_FLIGHT` (transport, or a helper that is
+still inside the previous collect+evaluate; the last VALID decisions are
+retained until their own expiry), `SOURCE_REPLAY` (a snapshot whose
+`source_generation` is not newer than the last accepted one within the
+same `server_epoch` is ignored: the sequence does not advance and the
+hold-down sees no new cycle), `SOURCE_AUTH_FAILED` / `SOURCE_TLS_FAILED` /
 `SOURCE_SCHEMA_INVALID` / `SOURCE_NOT_READY` / `SOURCE_STALE` /
 `SNAPSHOT_TOO_LARGE` / `MODULE_ERROR` (revoke immediately, alert),
 `WORKER_STUCK` (restart budget exhausted), `INVALID_MULTIPLIER` /
