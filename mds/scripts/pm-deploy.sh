@@ -40,6 +40,6 @@ for h in $M1 $M2; do
     R $h "systemctl start pnfs-mds"
     for k in $(seq 1 24); do n=$(R $h "ss -tln | grep -c ':2049 '"); [ "$n" -ge 1 ] && break; sleep 5; done
     R $h "echo \"[$h] pnfs-mds=\$(systemctl is-active pnfs-mds) 2049=\$(ss -tln | grep -c ':2049 ')\"; journalctl -u pnfs-mds --since '-3 min' --no-pager | grep -oE 'placement_mode=[a-z]+ generation=[0-9a-f]+ kernel=[0-9a-f]+ shrink=[a-z]+ max_age_ms=[0-9]+ min_free=[0-9]+|placement_policy=[a-z]+ \(dispatcher active\)|placement gate init failed.*' | tail -1
-LD_LIBRARY_PATH=/opt/rondb/lib:/opt/rondb/lib/mysql /usr/local/bin/mds-admin --mds-host 127.0.0.1 --mds-port 50051 config show 2>/dev/null | grep -E '^placement_(mode|mode_effective|config_generation|kernel_id|ds\.)' || echo '[$h] config show unavailable'"
+LD_LIBRARY_PATH=/opt/rondb/lib:/opt/rondb/lib/mysql /usr/local/bin/mds-admin config show --mds-host $h --mds-port 50051 2>/dev/null | grep -E '^placement_(mode|mode_effective|config_generation|kernel_id|ds\.)' || echo '[$h] config show unavailable'"
 done
 echo DEPLOY_DONE
