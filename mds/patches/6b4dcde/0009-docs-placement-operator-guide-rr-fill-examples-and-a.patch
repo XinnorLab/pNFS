@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 22:00:02 +0300
-Subject: [PATCH 9/9] docs(placement): operator guide, rr/fill examples and a
+Subject: [PATCH 09/10] docs(placement): operator guide, rr/fill examples and a
  CI workflow that proves the gate invariants
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

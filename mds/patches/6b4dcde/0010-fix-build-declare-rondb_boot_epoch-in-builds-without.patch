@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 22:03:30 +0300
+Subject: [PATCH 10/10] fix(build): declare rondb_boot_epoch in builds without
+ RonDB
+
+remove_manifest_init() reads it unconditionally; only the RonDB heartbeat assigns it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/mds/main.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/mds/main.c b/src/mds/main.c
+index bf21470..8182bee 100644
+--- a/src/mds/main.c
++++ b/src/mds/main.c
+@@ -278,8 +278,10 @@ int main(int argc, char *argv[])
+ 	struct mds_config cfg;
+ 	enum mds_status rc;
+ 	const char *config_path = "/etc/pnfs-mds/mds.conf";
+-#ifdef HAVE_RONDB
++	/* Used by remove_manifest_init() in every build; only the RonDB
++	 * heartbeat below assigns it a non-zero value. */
+ 	uint64_t rondb_boot_epoch = 0;
++#ifdef HAVE_RONDB
+ 	pthread_t rondb_hb_thread;
+ 	bool rondb_hb_running = false;
+ #endif
