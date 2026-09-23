@@ -27,6 +27,19 @@ entry when it lands.
 - **`config show` buffer.** Per-DS rows are appended to the 8 KiB
   response; on large clusters use the `placement_ds.<id>` filter.  Done =
   a paged or larger admin response in upstream.
+- **Adversarial review 2026-09-23, carried over.** (1) LAT-25 performance
+  budget is unmeasured: the create boundary runs the gate per stripe
+  slot; O(rows) per call after wave 1, but no benchmark vs legacy yet
+  (Stage C acceptance row). (2) `config show` prints four placement keys
+  in legacy mode too (additive, needed by `mode show`); the log line is
+  the only legacy-visible text kept identical. (3) Upstream bug found
+  during the work: `promote_inline_to_ds` loops over the *requested*
+  stripe count while `placement_select` may have shrunk it, creating
+  phantom `ds 0` objects — legacy keeps the upstream behaviour on
+  purpose; report upstream. (4) A DS whose NFS back-mount dropped is a
+  failed probe for the sweep now, but the legacy `proportional` path
+  still records the MDS root filesystem (upstream behaviour). Done =
+  benchmark row in the stand report, an upstream issue for (3).
 - **Cross-repo manifest check.** `docs/placement-modes/contract-manifest.json`
   is pinned by a fork unit test (`test_manifest_constants`) by hand; a CI
   job that diffs the two is Stage C.

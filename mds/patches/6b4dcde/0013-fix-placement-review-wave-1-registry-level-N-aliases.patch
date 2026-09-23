@@ -1,0 +1,1217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 22:25:52 +0300
+Subject: [PATCH 13/13] =?UTF-8?q?fix(placement):=20review=20wave=201=20?=
+ =?UTF-8?q?=E2=80=94=20registry-level=20N/aliases=20from=20the=20view,=20l?=
+ =?UTF-8?q?ive=20admin=20state=20at=20the=20create=20boundary,=20per-DS=20?=
+ =?UTF-8?q?reason=20metrics,=20observations=20survive=20registry=20reloads?=
+ =?UTF-8?q?,=20mount-point=20probe,=20strict=20numbers,=20snapshot-bound?=
+ =?UTF-8?q?=20tokens?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- the weighted candidate pass takes N, alias grades and the canonical
+  observation from the published registry view, so a caller's filtered
+  list cannot inflate a domain's share or hide a proven alias; the
+  single-DS verdict is exact and cheap (O(rows))
+- ds_cache_invalidate keeps each DS's capacity record and republishes
+  the view; the create boundary also reads DS admin state live
+- placement_admit feeds per-DS rejection reasons into
+  pnfs_mds_placement_rejections_total; alias grades log an ERROR
+- a mount path that is not a mount point is a failed probe for the
+  background sweep (ds_capacity_probe_once_ex)
+- placement_* numbers are parsed strictly; the generation covers
+  ds_capacity_poll_ms; the last placement_domain_weight.<d> key wins
+- tokens are refused after two publishes; domain_weight has the
+  >184 EiB guard
+- legacy promotion keeps the upstream by-value stripe count; the
+  lookup WARN keeps the upstream prefix
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ docs/placement-modes.md                     |  18 +-
+ include/ds_capacity.h                       |  10 +
+ include/placement_gate.h                    |   2 +
+ src/common/config.c                         |  69 ++++-
+ src/common/placement_config.c               |   1 +
+ src/fsal_obj/placement_gate.c               | 321 +++++++++++---------
+ src/mds/compound_data_io.c                  |  11 +-
+ src/mds/ds_cache.c                          |  12 +
+ src/mds/ds_capacity.c                       |  43 ++-
+ src/mds/proxy_io.c                          |   2 +-
+ tests/unit/test_ds_capacity.c               |  41 +++
+ tests/unit/test_placement_config.c          |  28 ++
+ tests/unit/test_placement_create_boundary.c | 116 +++++++
+ tests/unit/test_placement_gate.c            |  95 ++++++
+ 14 files changed, 607 insertions(+), 162 deletions(-)
+
+diff --git a/docs/placement-modes.md b/docs/placement-modes.md
+index c3b4c0c..d3c3836 100644
+--- a/docs/placement-modes.md
++++ b/docs/placement-modes.md
+@@ -70,6 +70,17 @@ The domain's observation is the fresh one of the lowest DS id; a fresh
+ sibling that disagrees by more than 1 % of `total` pulls `available`
+ down to the smaller value.
+ 
++Every registry-level fact (N, the alias grades, the canonical
++observation) is taken from the published registry view of **all**
++registered DS, not from the subset a caller happened to pass — an
++offline or io-limit-filtered sibling still counts toward N and still
++proves an alias.  The registry view is republished after every capacity
++sweep and after every DS admin change (add/remove/set-state), and the
++create boundary additionally reads the DS admin state live.  A capacity
++probe of a mount path that is not a mount point (the empty directory an
++unmounted DS leaves behind) counts as a failed probe, never as an
++observation of the DS.
++
+ ## Reasons
+ 
+ A DS that is not a candidate carries one reason; the first failing check
+@@ -111,7 +122,12 @@ and a proxy write on it fails instead of creating elsewhere.
+   `pnfs_mds_placement_rejections_total{reason}`,
+   `pnfs_mds_placement_alias_suspected_total`, plus the upstream
+   `pnfs_mds_placement_degraded_total` when a layout shrank.
+-- Refusals are logged once per reason per 10 s.
++- `pnfs_mds_placement_rejections_total{reason}` counts every DS the gate
++  rejected at every placement decision (a DS that stays full for an hour
++  keeps counting), `pnfs_mds_placement_alias_suspected_total` counts
++  warned episodes (one per 60 s).  Refusals are logged once per reason
++  per 10 s; the two alias grades that need an operator get an ERROR line
++  once per 60 s.
+ 
+ ## Changing the mode
+ 
+diff --git a/include/ds_capacity.h b/include/ds_capacity.h
+index 88bdd97..62edc04 100644
+--- a/include/ds_capacity.h
++++ b/include/ds_capacity.h
+@@ -109,4 +109,14 @@ int ds_capacity_probe_once(struct ds_cache *cache,
+ 			   const char *mount_path_fmt,
+ 			   enum mds_placement_capacity_weighting mode);
+ 
++/**
++ * @brief Like ds_capacity_probe_once, with the background thread's
++ * mount-point requirement: a path on the same device as its parent (an
++ * unmounted DS directory) counts as a failed probe.
++ */
++int ds_capacity_probe_once_ex(struct ds_cache *cache,
++			      const char *mount_path_fmt,
++			      enum mds_placement_capacity_weighting mode,
++			      bool require_mountpoint);
++
+ #endif /* DS_CAPACITY_H */
+diff --git a/include/placement_gate.h b/include/placement_gate.h
+index 38ced3b..50a68c9 100644
+--- a/include/placement_gate.h
++++ b/include/placement_gate.h
+@@ -107,6 +107,8 @@ bool placement_ds_admitted(const struct placement_ctx *ctx,
+ 
+ /* Diagnostics hook for a suspected (unprovable) alias: counter + WARN. */
+ void placement_gate_note_alias_suspected(uint32_t a, uint32_t b);
++/* Per-DS rejection counts into the metrics (+ ERROR for the alias grades). */
++void placement_gate_note_rejections(const struct placement_reject_counts *why);
+ 
+ /* -----------------------------------------------------------------------
+  * Process singleton (Task 5) -- declared here, implemented alongside.
+diff --git a/src/common/config.c b/src/common/config.c
+index 400c960..0685db5 100644
+--- a/src/common/config.c
++++ b/src/common/config.c
+@@ -181,6 +181,25 @@ static char *strip_whitespace(char *s)
+     return s;
+ }
+ 
++/* Digits only, no sign, no suffix, no overflow: the placement keys refuse
++ * "-1", "1G" and "12abc" instead of silently taking a wrong value. */
++static bool parse_u64_strict(const char *val, uint64_t *out)
++{
++    char *end = NULL;
++    unsigned long long v;
++
++    if (val == NULL || val[0] < '0' || val[0] > '9') {
++        return false;
++    }
++    errno = 0;
++    v = strtoull(val, &end, 10);
++    if (errno != 0 || end == NULL || *end != '\0') {
++        return false;
++    }
++    *out = (uint64_t)v;
++    return true;
++}
++
+ /* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
+ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+ {
+@@ -1292,17 +1311,25 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+             }
+             cfg->placement_mode_set = true;
+         } else if (strcmp(key, PM_KEY_CAP_MAX_AGE_MS) == 0) {
+-            unsigned long v = strtoul(val, NULL, 10);
+-            if (v == 0 || v > PM_CAP_MAX_AGE_MS_MAX) {
++            uint64_t v = 0;
++            if (!parse_u64_strict(val, &v) || v == 0 || v > PM_CAP_MAX_AGE_MS_MAX) {
+                 (void)fprintf(stderr,
+-                    "ERROR: %s=%lu out of range (1..%u)\n",
+-                    key, v, (unsigned)PM_CAP_MAX_AGE_MS_MAX);
++                    "ERROR: %s='%s' out of range (1..%u)\n",
++                    key, val, (unsigned)PM_CAP_MAX_AGE_MS_MAX);
+                 (void)fclose(fp);
+                 return MDS_ERR_INVAL;
+             }
+             cfg->placement_capacity_max_age_ms = (uint32_t)v;
+         } else if (strcmp(key, PM_KEY_MIN_FREE_BYTES) == 0) {
+-            cfg->placement_min_free_bytes = strtoull(val, NULL, 10);
++            uint64_t v = 0;
++            if (!parse_u64_strict(val, &v)) {
++                (void)fprintf(stderr,
++                    "ERROR: %s='%s' is not a non-negative integer (bytes)\n",
++                    key, val);
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
++            cfg->placement_min_free_bytes = v;
+         } else if (strncmp(key, PM_KEY_DOMAIN_PREFIX,
+                            strlen(PM_KEY_DOMAIN_PREFIX)) == 0) {
+             const char *idtxt = key + strlen(PM_KEY_DOMAIN_PREFIX);
+@@ -1322,23 +1349,37 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+         } else if (strncmp(key, PM_KEY_DOMAIN_WEIGHT_PREFIX,
+                            strlen(PM_KEY_DOMAIN_WEIGHT_PREFIX)) == 0) {
+             const char *dom = key + strlen(PM_KEY_DOMAIN_WEIGHT_PREFIX);
+-            unsigned long w = strtoul(val, NULL, 10);
++            uint64_t w = 0;
++            uint32_t slot;
+             if (dom[0] == '\0' || strlen(dom) >= PM_DOMAIN_ID_MAX ||
+-                w < PM_DOMAIN_WEIGHT_MIN || w > PM_DOMAIN_WEIGHT_MAX ||
+-                cfg->placement_domain_weight_count >= PM_MAX_DOMAINS) {
++                !parse_u64_strict(val, &w) ||
++                w < PM_DOMAIN_WEIGHT_MIN || w > PM_DOMAIN_WEIGHT_MAX) {
+                 (void)fprintf(stderr,
+-                    "ERROR: %s=%lu out of range (%u..%u)\n",
+-                    key, w, (unsigned)PM_DOMAIN_WEIGHT_MIN,
++                    "ERROR: %s='%s' out of range (%u..%u)\n",
++                    key, val, (unsigned)PM_DOMAIN_WEIGHT_MIN,
+                     (unsigned)PM_DOMAIN_WEIGHT_MAX);
+                 (void)fclose(fp);
+                 return MDS_ERR_INVAL;
+             }
+-            {
+-                uint32_t n = cfg->placement_domain_weight_count++;
+-                (void)snprintf(cfg->placement_domain_weight_id[n],
++            /* Last key wins, as for every other INI key. */
++            for (slot = 0; slot < cfg->placement_domain_weight_count; slot++) {
++                if (strcmp(cfg->placement_domain_weight_id[slot], dom) == 0) {
++                    break;
++                }
++            }
++            if (slot == cfg->placement_domain_weight_count) {
++                if (slot >= PM_MAX_DOMAINS) {
++                    (void)fprintf(stderr,
++                        "ERROR: %s: more than %u domain weights\n",
++                        key, (unsigned)PM_MAX_DOMAINS);
++                    (void)fclose(fp);
++                    return MDS_ERR_INVAL;
++                }
++                cfg->placement_domain_weight_count++;
++                (void)snprintf(cfg->placement_domain_weight_id[slot],
+                                PM_DOMAIN_ID_MAX, "%s", dom);
+-                cfg->placement_domain_weight[n] = (uint32_t)w;
+             }
++            cfg->placement_domain_weight[slot] = (uint32_t)w;
+         } else if (strcmp(key, PM_KEY_ALLOW_MANUAL) == 0) {
+             cfg->placement_allow_manual_base_weights =
+                 (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+diff --git a/src/common/placement_config.c b/src/common/placement_config.c
+index a1068f1..5767b3d 100644
+--- a/src/common/placement_config.c
++++ b/src/common/placement_config.c
+@@ -182,6 +182,7 @@ void placement_config_generation(const struct mds_config *cfg, char out[65])
+     } while (0)
+ 
+     APPEND("mode=%s\n", placement_mode_name(cfg->placement_mode));
++    APPEND("poll=%u\n", (unsigned)cfg->ds_capacity_poll_ms);
+     APPEND("max_age=%u\n", (unsigned)cfg->placement_capacity_max_age_ms);
+     APPEND("min_free=%llu\n", (unsigned long long)cfg->placement_min_free_bytes);
+     APPEND("shrink=%s\n", placement_shrink_name(cfg->placement_stripe_shrink));
+diff --git a/src/fsal_obj/placement_gate.c b/src/fsal_obj/placement_gate.c
+index bf16136..91c0f69 100644
+--- a/src/fsal_obj/placement_gate.c
++++ b/src/fsal_obj/placement_gate.c
+@@ -104,22 +104,54 @@ static bool row_fresh(const struct placement_ctx *ctx,
+            (uint64_t)ctx->capacity_max_age_ms;
+ }
+ 
+-/* Per-DS scratch for one candidates() call. */
+-struct pc_scratch {
+-    const struct ds_capacity_view_row *row;   /* NULL when absent from the view */
+-    char     domain[PM_DOMAIN_ID_MAX];
+-    uint32_t n_aliases;
+-    bool     alias_contradiction;
+-    bool     alias_unmapped;
++/*
++ * Weighted-mode candidate list (fill and, with an assessment view, smart).
++ *
++ * The caller's ds_list is only the NATIVE-eligible subset (ONLINE, profile,
++ * io-limit).  Every registry-level fact -- a domain's alias count N, the
++ * alias grades, the canonical observation -- comes from the published
++ * view, which holds every registered DS whatever the caller filtered, so
++ * a filtered list can neither inflate a domain's share nor hide an alias
++ * (MODE-07, review finding 1).
++ */
++struct row_scratch {
++    char domain[PM_DOMAIN_ID_MAX];
++    bool declared;
++    bool observed;   /* has an fsid and a total: usable for alias checks */
+ };
+ 
+-/* Weighted-mode candidate list (fill and, with an assessment view, smart). */
++static uint32_t domain_weight_of(uint64_t avail, uint64_t total)
++{
++    uint64_t w;
++
++    if (total == 0) {
++        return 0;
++    }
++    if (avail > total) {
++        avail = total;
++    }
++    /* Same guard as ds_capacity_derive_auto_weight: > 184 EiB totals. */
++    if (total > UINT64_MAX / 100ULL) {
++        w = avail / (total / 100ULL);
++    } else {
++        w = (avail * 100ULL) / total;
++    }
++    if (w == 0) {
++        w = 1;
++    }
++    if (w > 100) {
++        w = 100;
++    }
++    return (uint32_t)w;
++}
++
+ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+                                     const struct mds_ds_info *ds_list, uint32_t n,
+                                     struct placement_candidate *out,
+                                     struct placement_reject_counts *why)
+ {
+-    struct pc_scratch *sc;
++    const struct placement_capacity_view *cap = ctx->cap;
++    struct row_scratch *rs;
+     uint32_t i, j;
+     uint32_t n_out = 0;
+ 
+@@ -130,82 +162,33 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+         }
+         return 0;
+     }
+-    if (ctx->cap == NULL) {
++    if (cap == NULL || cap->count == 0) {
+         for (i = 0; i < n; i++) {
+             count_reason(why, PR_CAPACITY_UNKNOWN);
+         }
+         return 0;
+     }
+ 
+-    sc = calloc(n, sizeof(*sc));
+-    if (sc == NULL) {
++    rs = calloc(cap->count, sizeof(*rs));
++    if (rs == NULL) {
+         return 0;
+     }
+-
+-    /* 1. Domain + row per registered DS (any state; N counts all). */
+-    for (i = 0; i < n; i++) {
+-        domain_for(ctx, ds_list[i].ds_id, sc[i].domain);
+-        sc[i].row = NULL;
+-        for (j = 0; j < ctx->cap->count; j++) {
+-            if (ctx->cap->rows[j].ds_id == ds_list[i].ds_id) {
+-                sc[i].row = &ctx->cap->rows[j];
+-                break;
+-            }
+-        }
+-    }
+-    for (i = 0; i < n; i++) {
+-        uint32_t cnt = 0;
+-        for (j = 0; j < n; j++) {
+-            if (strcmp(sc[i].domain, sc[j].domain) == 0) {
+-                cnt++;
+-            }
+-        }
+-        sc[i].n_aliases = cnt;
++    for (j = 0; j < cap->count; j++) {
++        domain_for(ctx, cap->rows[j].ds_id, rs[j].domain);
++        rs[j].declared = declared_domain(ctx, cap->rows[j].ds_id);
++        rs[j].observed = (cap->rows[j].obs.observed_mono_ms != 0 &&
++                          cap->rows[j].obs.total_bytes != 0);
+     }
+ 
+-    /* 2. Alias grades over every pair with an observed fsid. */
+-    for (i = 0; i < n; i++) {
+-        const struct ds_capacity_view_row *ri = sc[i].row;
+-        if (ri == NULL || ri->obs.observed_mono_ms == 0) {
+-            continue;
+-        }
+-        for (j = i + 1; j < n; j++) {
+-            const struct ds_capacity_view_row *rj = sc[j].row;
+-            bool same_host;
+-            bool same_domain;
+-
+-            if (rj == NULL || rj->obs.observed_mono_ms == 0) {
+-                continue;
+-            }
+-            same_host = (strncmp(ri->host, rj->host, MDS_DS_HOST_MAX) == 0);
+-            same_domain = declared_domain(ctx, ds_list[i].ds_id) &&
+-                          declared_domain(ctx, ds_list[j].ds_id) &&
+-                          strcmp(sc[i].domain, sc[j].domain) == 0;
+-            if (same_domain) {
+-                /* (a) one declared domain, one host, two filesystems */
+-                if (same_host && ri->obs.fsid != rj->obs.fsid) {
+-                    sc[i].alias_contradiction = true;
+-                    sc[j].alias_contradiction = true;
+-                }
+-            } else if (ri->obs.fsid == rj->obs.fsid) {
+-                if (same_host) {
+-                    /* (b) proven alias without a shared declaration */
+-                    sc[i].alias_unmapped = true;
+-                    sc[j].alias_unmapped = true;
+-                } else {
+-                    /* (c) cannot be proven from NFS: diagnostics only */
+-                    placement_gate_note_alias_suspected(ds_list[i].ds_id,
+-                                                        ds_list[j].ds_id);
+-                }
+-            }
+-        }
+-    }
+-
+-    /* 3. Per DS: online -> alias marks -> domain observation -> gate. */
+     for (i = 0; i < n; i++) {
++        const struct ds_capacity_view_row *ri = NULL;
++        uint32_t r_i = 0;
++        bool contradiction = false;
++        bool unmapped = false;
+         const struct ds_capacity_view_row *canon = NULL;
+         uint64_t min_avail = UINT64_MAX;
+         bool any_observed = false;
++        uint32_t n_aliases = 0;
+         uint64_t avail;
+         uint64_t total;
+         uint32_t domain_weight;
+@@ -216,23 +199,65 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+             count_reason(why, PR_DS_OFFLINE);
+             continue;
+         }
+-        if (sc[i].alias_contradiction) {
++        for (j = 0; j < cap->count; j++) {
++            if (cap->rows[j].ds_id == ds_list[i].ds_id) {
++                ri = &cap->rows[j];
++                r_i = j;
++                break;
++            }
++        }
++        if (ri == NULL) {
++            count_reason(why, PR_CAPACITY_UNKNOWN);   /* not in the registry view */
++            continue;
++        }
++
++        /* Alias grades: this DS against every other registered DS. */
++        if (rs[r_i].observed) {
++            for (j = 0; j < cap->count; j++) {
++                const struct ds_capacity_view_row *rj = &cap->rows[j];
++                bool same_host;
++                bool same_domain;
++
++                if (j == r_i || !rs[j].observed) {
++                    continue;
++                }
++                same_host = (strncmp(ri->host, rj->host, MDS_DS_HOST_MAX) == 0);
++                same_domain = rs[r_i].declared && rs[j].declared &&
++                              strcmp(rs[r_i].domain, rs[j].domain) == 0;
++                if (same_domain) {
++                    /* (a) one declared domain, one host, two filesystems */
++                    if (same_host && ri->obs.fsid != rj->obs.fsid) {
++                        contradiction = true;
++                    }
++                } else if (ri->obs.fsid == rj->obs.fsid) {
++                    if (same_host) {
++                        unmapped = true;          /* (b) proven, undeclared */
++                    } else if (ri->ds_id < rj->ds_id) {
++                        placement_gate_note_alias_suspected(ri->ds_id, rj->ds_id);   /* (c) */
++                    }
++                }
++            }
++        }
++        if (contradiction) {
+             count_reason(why, PR_DOMAIN_MAP_CONTRADICTION);
+             continue;
+         }
+-        if (sc[i].alias_unmapped) {
++        if (unmapped) {
+             count_reason(why, PR_SHARED_FS_ALIAS_UNMAPPED);
+             continue;
+         }
+-        /* Canonical observation of the domain: the fresh row of the
+-         * lowest ds_id; a fresh sibling that disagrees by more than 1 %
+-         * of total pulls avail down to the smaller value. */
+-        for (j = 0; j < n; j++) {
+-            const struct ds_capacity_view_row *rj = sc[j].row;
+-            if (strcmp(sc[i].domain, sc[j].domain) != 0) {
++
++        /* Domain aggregation over ALL registered members (any state): N,
++         * the canonical (lowest id, fresh) observation, the conservative
++         * minimum when fresh siblings disagree by more than 1 %. */
++        for (j = 0; j < cap->count; j++) {
++            const struct ds_capacity_view_row *rj = &cap->rows[j];
++
++            if (strcmp(rs[r_i].domain, rs[j].domain) != 0) {
+                 continue;
+             }
+-            if (rj != NULL && rj->obs.observed_mono_ms != 0) {
++            n_aliases++;
++            if (rs[j].observed) {
+                 any_observed = true;
+             }
+             if (!row_fresh(ctx, rj)) {
+@@ -258,19 +283,12 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+         if (avail > total) {
+             avail = total;
+         }
+-        if (total == 0) {
+-            count_reason(why, PR_CAPACITY_UNKNOWN);
+-            continue;
+-        }
+         if (avail <= ctx->min_free_bytes) {
+             count_reason(why, PR_CAPACITY_FULL);
+             continue;
+         }
+-        domain_weight = (uint32_t)((avail * 100ULL) / total);
+-        if (domain_weight == 0) {
+-            domain_weight = 1;
+-        }
+-        weight = placement_weight(domain_weight, 1000000u, sc[i].n_aliases, &ovf);
++        domain_weight = domain_weight_of(avail, total);
++        weight = placement_weight(domain_weight, 1000000u, n_aliases, &ovf);
+         if (weight == 0 || ovf) {
+             count_reason(why, PR_WEIGHT_OVERFLOW);
+             continue;
+@@ -278,11 +296,11 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+         out[n_out].idx = i;
+         out[n_out].ds_id = ds_list[i].ds_id;
+         out[n_out].weight = weight;
+-        memcpy(out[n_out].domain, sc[i].domain, PM_DOMAIN_ID_MAX);
++        memcpy(out[n_out].domain, rs[r_i].domain, PM_DOMAIN_ID_MAX);
+         n_out++;
+     }
+ 
+-    free(sc);
++    free(rs);
+     return n_out;
+ }
+ 
+@@ -357,7 +375,12 @@ enum mds_status placement_admit(const struct placement_ctx *ctx,
+     if (cands == NULL) {
+         return MDS_ERR_NOMEM;
+     }
+-    n_c = placement_candidates(ctx, ds_list, n, cands, NULL);
++    {
++        struct placement_reject_counts why;
++
++        n_c = placement_candidates(ctx, ds_list, n, cands, &why);
++        placement_gate_note_rejections(&why);
++    }
+     atomic_store_explicit(&g_branch_metrics.placement_eligible_ds, n_c,
+                           memory_order_relaxed);
+     if (n_c == 0) {
+@@ -464,76 +487,78 @@ bool placement_ds_admitted(const struct placement_ctx *ctx,
+                            const struct mds_ds_info *ds_list, uint32_t n,
+                            uint32_t ds_id, enum placement_reason *reason)
+ {
+-    struct placement_candidate *cands;
++    struct placement_candidate one;
+     struct placement_reject_counts why;
+-    uint32_t n_c;
+-    uint32_t i;
+-    bool found = false;
++    uint32_t k;
+ 
+     set_reason(reason, PR_DS_OFFLINE);
+     if (ctx == NULL || ds_list == NULL || n == 0) {
+         return false;
+     }
+-    for (i = 0; i < n; i++) {
+-        if (ds_list[i].ds_id == ds_id) {
+-            found = true;
++    for (k = 0; k < n; k++) {
++        if (ds_list[k].ds_id == ds_id) {
+             break;
+         }
+     }
+-    if (!found) {
++    if (k == n) {
+         return false;
+     }
+     if (ctx->mode == PM_RR || ctx->mode == PM_LEGACY) {
+-        if (ds_list[i].state == DS_ONLINE) {
++        if (ds_list[k].state == DS_ONLINE) {
+             set_reason(reason, PR_NONE);
+             return true;
+         }
+         return false;
+     }
+-    cands = calloc(n, sizeof(*cands));
+-    if (cands == NULL) {
+-        return false;
++    /* The registry-level facts come from the view, so a one-element list
++     * yields exactly the verdict the DS would get inside the full list. */
++    if (placement_candidates(ctx, &ds_list[k], 1, &one, &why) == 1) {
++        set_reason(reason, PR_NONE);
++        return true;
+     }
+-    n_c = placement_candidates(ctx, ds_list, n, cands, &why);
+-    for (i = 0; i < n_c; i++) {
+-        if (cands[i].ds_id == ds_id) {
+-            free(cands);
+-            set_reason(reason, PR_NONE);
+-            return true;
++    for (k = 1; k < PR_COUNT; k++) {
++        if (why.by_reason[k] != 0) {
++            set_reason(reason, (enum placement_reason)k);
++            return false;
+         }
+     }
+-    free(cands);
+-    /* Not a candidate: report the DS's own verdict by re-running the
+-     * gate on a one-element list (cheap, and exact for the reason). */
+-    {
+-        struct placement_candidate one;
+-        struct placement_reject_counts w1;
+-        uint32_t k;
++    set_reason(reason, PR_CAPACITY_UNKNOWN);
++    return false;
++}
+ 
+-        for (k = 0; k < n; k++) {
+-            if (ds_list[k].ds_id == ds_id) {
+-                break;
+-            }
+-        }
+-        (void)placement_candidates(ctx, &ds_list[k], 1, &one, &w1);
+-        for (k = 1; k < PR_COUNT; k++) {
+-            if (w1.by_reason[k] != 0) {
+-                set_reason(reason, (enum placement_reason)k);
+-                return false;
+-            }
++/*
++ * Per-DS rejection counts into the metrics, plus a rate-limited ERROR for
++ * the two alias grades that need an operator (review finding 3).
++ */
++void placement_gate_note_rejections(const struct placement_reject_counts *why)
++{
++    static _Atomic uint64_t last_alias_err_ms;
++    uint32_t r;
++
++    if (why == NULL) {
++        return;
++    }
++    for (r = 1; r < PR_COUNT; r++) {
++        if (why->by_reason[r] != 0) {
++            atomic_fetch_add_explicit(&g_branch_metrics.placement_rejections_total[r],
++                                      why->by_reason[r], memory_order_relaxed);
+         }
+-        /* Excluded only in the context of the full list (an alias
+-         * grade): report the list-level reason. */
+-        for (k = 1; k < PR_COUNT; k++) {
+-            if (why.by_reason[k] != 0 &&
+-                (k == PR_DOMAIN_MAP_CONTRADICTION ||
+-                 k == PR_SHARED_FS_ALIAS_UNMAPPED)) {
+-                set_reason(reason, (enum placement_reason)k);
+-                return false;
+-            }
++    }
++    if (why->by_reason[PR_DOMAIN_MAP_CONTRADICTION] != 0 ||
++        why->by_reason[PR_SHARED_FS_ALIAS_UNMAPPED] != 0) {
++        uint64_t now = ds_cache_mono_ms();
++        uint64_t last = atomic_load_explicit(&last_alias_err_ms, memory_order_relaxed);
++
++        if (now - last >= 60000ULL &&
++            atomic_compare_exchange_strong(&last_alias_err_ms, &last, now)) {
++            MDS_LOG_ERROR(LOG_COMP_FSAL,
++                "placement: %u DS excluded as DOMAIN_MAP_CONTRADICTION and %u as "
++                "SHARED_FS_ALIAS_UNMAPPED -- declare ds_capacity_domain.<id> for "
++                "every export of a shared filesystem (config show placement_ds.<id>)",
++                (unsigned)why->by_reason[PR_DOMAIN_MAP_CONTRADICTION],
++                (unsigned)why->by_reason[PR_SHARED_FS_ALIAS_UNMAPPED]);
+         }
+     }
+-    return false;
+ }
+ 
+ /* Alias diagnostics: a counter plus a rate-limited WARN (one per pair per 60 s). */
+@@ -543,10 +568,10 @@ void placement_gate_note_alias_suspected(uint32_t a, uint32_t b)
+     uint64_t now = ds_cache_mono_ms();
+     uint64_t last = atomic_load_explicit(&last_warn_ms, memory_order_relaxed);
+ 
+-    atomic_fetch_add_explicit(&g_branch_metrics.placement_alias_suspected_total,
+-                              1, memory_order_relaxed);
+     if (now - last >= 60000ULL &&
+         atomic_compare_exchange_strong(&last_warn_ms, &last, now)) {
++        atomic_fetch_add_explicit(&g_branch_metrics.placement_alias_suspected_total,
++                                  1, memory_order_relaxed);
+         MDS_LOG_WARN(LOG_COMP_FSAL,
+             "placement: ds %u and ds %u report the same filesystem id "
+             "behind different host names; declare ds_capacity_domain for "
+@@ -827,6 +852,15 @@ bool placement_token_valid(const struct placement_token *tok, uint32_t ds_id,
+     if (now_mono_ms < tok->minted_mono_ms) {
+         return false;
+     }
++    if (g.initialised) {
++        uint32_t cur = atomic_load_explicit(&g.snapshot_gen, memory_order_acquire);
++
++        /* One publish may race the create; two mean the token predates the
++         * previous snapshot -- the caller re-admits. */
++        if (cur - tok->snapshot_gen > 1) {
++            return false;
++        }
++    }
+     return (now_mono_ms - tok->minted_mono_ms) <= PLACEMENT_TOKEN_MAX_AGE_MS;
+ }
+ 
+@@ -868,6 +902,13 @@ enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpo
+         mint_token(tok, ds_id, p, now);
+         return MDS_OK;
+     }
++    if (g.cache != NULL && !ds_cache_is_online(g.cache, ds_id)) {
++        /* Admin state is read live: a DS set OFFLINE between two
++         * publishes must not receive a new object (review finding 2). */
++        note_refusal(PR_DS_OFFLINE);
++        set_reason(reason, PR_DS_OFFLINE);
++        return MDS_ERR_NOSPC;
++    }
+     placement_gate_ctx(&ctx, now);
+     ref = (struct cap_view_ref *)ctx.view_ref;
+     if (ref == NULL || ref->n_infos == 0) {
+diff --git a/src/mds/compound_data_io.c b/src/mds/compound_data_io.c
+index 452bdfc..516d1a5 100644
+--- a/src/mds/compound_data_io.c
++++ b/src/mds/compound_data_io.c
+@@ -1866,14 +1866,19 @@ promote_inline_to_ds(struct compound_data *cd, struct mds_inode *inode)
+ 		goto out_clear;
+ 	}
+ 
+-	/* Gated selection (legacy: plain RR as before).  stripe_count is
+-	 * in/out so a shrunk layout is what the loop below creates. */
++	/* Gated selection (legacy: plain RR as before, with the upstream
++	 * by-value stripe count).  Under an explicit placement mode the
++	 * effective (possibly shrunk) count is what the loop below creates. */
+ 	{
+ 		enum placement_reason why = PR_NONE;
++		uint32_t sc_eff = stripe_count;
+ 
+ 		st = placement_select_gated(false, PLACEMENT_RR,
+-			ds_list, ds_count, &stripe_count, mirror_count,
++			ds_list, ds_count, &sc_eff, mirror_count,
+ 			stripe_unit, 0, entries, &why);
++		if (st == MDS_OK && placement_gate_mode() != PM_LEGACY) {
++			stripe_count = sc_eff;
++		}
+ 		if (st != MDS_OK && why != PR_NONE) {
+ 			MDS_LOG_WARN(LOG_COMP_MDS,
+ 				"promotion fileid=%llu: no placement (%s)",
+diff --git a/src/mds/ds_cache.c b/src/mds/ds_cache.c
+index b3377bc..9ba9a2e 100644
+--- a/src/mds/ds_cache.c
++++ b/src/mds/ds_cache.c
+@@ -17,6 +17,7 @@
+ #include "ds_cache.h"
+ #include "pnfs_mds.h"
+ #include "mds_catalogue.h"
++#include "placement_gate.h"
+ 
+ struct ds_cache_entry {
+ 	struct mds_ds_info info;
+@@ -106,6 +107,12 @@ static int cache_reload_locked(struct ds_cache *cache,
+ 		}
+ 		entries[id].info = list[i];
+ 		entries[id].present = true;
++		/* A registry reload must not discard the capacity record of a
++		 * DS that stays registered: the placement gate would see it
++		 * as never observed for a whole poll interval. */
++		if (cache->entries[id].present) {
++			entries[id].cap_obs = cache->entries[id].cap_obs;
++		}
+ 
+ 		/* Try to load provisioning data. */
+ 		st = mds_cat_ds_provision_get(
+@@ -249,6 +256,11 @@ int ds_cache_invalidate(struct ds_cache *cache, struct mds_catalogue *cat)
+ 	pthread_rwlock_wrlock(&cache->lock);
+ 	rc = cache_reload_locked(cache, cat);
+ 	pthread_rwlock_unlock(&cache->lock);
++	/* Registry changes (add/remove/set-state) reach the placement gate at
++	 * once, not at the next capacity sweep.  No-op without a gate. */
++	if (rc == 0) {
++		placement_gate_publish_capacity();
++	}
+ 	return rc;
+ }
+ 
+diff --git a/src/mds/ds_capacity.c b/src/mds/ds_capacity.c
+index d54771d..64be329 100644
+--- a/src/mds/ds_capacity.c
++++ b/src/mds/ds_capacity.c
+@@ -35,6 +35,7 @@
+ #include <stdatomic.h>
+ #include <pthread.h>
+ #include <sys/statvfs.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ #include <time.h>
+ #include <errno.h>
+@@ -190,10 +191,34 @@ uint32_t ds_capacity_derive_auto_weight(uint64_t total_bytes,
+  * MDSes (including pure-metadata MDSes that don't proxy-mount the DS)
+  * can pick up the observation through the periodic cluster reload.
+  */
++/*
++ * A DS whose NFS mount dropped leaves an empty directory behind: statvfs()
++ * then reports the MDS root filesystem as the DS's capacity.  When
++ * @p require_mountpoint is set, the path must sit on a different device
++ * than its parent, else the probe counts as failed (placement modes rely
++ * on this; the legacy weighting path keeps its old behaviour).
++ */
++static bool path_is_mountpoint(const char *path)
++{
++	struct stat st_path;
++	struct stat st_parent;
++	char parent[256 + 4];
++
++	if (stat(path, &st_path) != 0) {
++		return false;
++	}
++	(void)snprintf(parent, sizeof(parent), "%s/..", path);
++	if (stat(parent, &st_parent) != 0) {
++		return false;
++	}
++	return st_path.st_dev != st_parent.st_dev;
++}
++
+ static int probe_one(struct ds_cache *cache,
+ 		     const char *fmt, uint32_t ds_id,
+ 		     enum mds_placement_capacity_weighting mode,
+-		     struct mds_catalogue *cat)
++		     struct mds_catalogue *cat,
++		     bool require_mountpoint)
+ {
+ 	char path[256];
+ 	struct statvfs sv;
+@@ -215,6 +240,10 @@ static int probe_one(struct ds_cache *cache,
+ 		(void)ds_cache_note_capacity_failure(cache, ds_id);
+ 		return 0;
+ 	}
++	if (require_mountpoint && !path_is_mountpoint(path)) {
++		(void)ds_cache_note_capacity_failure(cache, ds_id);
++		return 0;
++	}
+ 
+ 	/*
+ 	 * f_frsize is the fundamental block size (bytes); f_blocks the
+@@ -288,6 +317,14 @@ static int probe_one(struct ds_cache *cache,
+ int ds_capacity_probe_once(struct ds_cache *cache,
+ 			   const char *mount_path_fmt,
+ 			   enum mds_placement_capacity_weighting mode)
++{
++	return ds_capacity_probe_once_ex(cache, mount_path_fmt, mode, false);
++}
++
++int ds_capacity_probe_once_ex(struct ds_cache *cache,
++			      const char *mount_path_fmt,
++			      enum mds_placement_capacity_weighting mode,
++			      bool require_mountpoint)
+ {
+ 	uint32_t ids[MDS_MAX_DS_NODES];
+ 	uint32_t n;
+@@ -301,7 +338,7 @@ int ds_capacity_probe_once(struct ds_cache *cache,
+ 	for (i = 0; i < n; i++) {
+ 		/* Test entry point: no catalogue persistence. */
+ 		probed += probe_one(cache, mount_path_fmt, ids[i],
+-				    mode, NULL);
++				    mode, NULL, require_mountpoint);
+ 	}
+ 	/* Placement modes read an immutable snapshot of the records. */
+ 	placement_gate_publish_capacity();
+@@ -360,7 +397,7 @@ static void *capacity_thread(void *arg)
+ 				(void)probe_one(cap->cache,
+ 						cap->mount_path_fmt,
+ 						ids[i], cap->mode,
+-						cap->cat);
++						cap->cat, true);
+ 			}
+ 		}
+ 
+diff --git a/src/mds/proxy_io.c b/src/mds/proxy_io.c
+index c9381e7..0960416 100644
+--- a/src/mds/proxy_io.c
++++ b/src/mds/proxy_io.c
+@@ -1252,7 +1252,7 @@ enum mds_status mds_proxy_lookup_ds_file_fh(
+                 return MDS_OK;
+             }
+             MDS_LOG_WARN(LOG_COMP_MDS,
+-                "lookup_ds_file_fh: name_to_handle_at path failed "
++                "ensure_ds_file_fh: name_to_handle_at path failed "
+                 "(path=%s errno=%d) -- falling back to NFS3 RPC",
+                 file_path, errno);
+         }
+diff --git a/tests/unit/test_ds_capacity.c b/tests/unit/test_ds_capacity.c
+index 7810a8c..63fe6f6 100644
+--- a/tests/unit/test_ds_capacity.c
++++ b/tests/unit/test_ds_capacity.c
+@@ -342,9 +342,50 @@ static void test_capacity_view_lists_present_ds(void)
+     mds_catalogue_close(cat);
+ }
+ 
++static void test_invalidate_preserves_observation(void)
++{
++    struct mds_catalogue *cat = NULL;
++    struct ds_capacity_obs o;
++    struct ds_cache *c = cache_with_ds(&cat, 0);
++    ASSERT_TRUE(c != NULL);
++    ASSERT_EQ(ds_capacity_probe_once(c, "/tmp", CAP_WEIGHT_OFF), 1);
++    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
++    uint64_t t = o.observed_mono_ms;
++    ASSERT_TRUE(t != 0);
++    ASSERT_EQ(ds_cache_invalidate(c, cat), 0);      /* admin RPCs reload the registry */
++    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
++    ASSERT_EQ(o.observed_mono_ms, t);
++    ds_cache_destroy(c);
++    mds_catalogue_close(cat);
++}
++
++static void test_probe_ex_requires_a_mount_point(void)
++{
++    /* a plain directory (the shape an unmounted DS leaves behind) is not
++     * an observation of that DS */
++    char tpl[] = "/tmp/pnfs-ds-dir-XXXXXX";
++    char fmt[64];
++    struct mds_catalogue *cat = NULL;
++    struct ds_capacity_obs o;
++    struct ds_cache *c = cache_with_ds(&cat, 0);
++    ASSERT_TRUE(c != NULL);
++    ASSERT_TRUE(mkdtemp(tpl) != NULL);
++    snprintf(fmt, sizeof(fmt), "%s", tpl);
++    ASSERT_EQ(ds_capacity_probe_once_ex(c, fmt, CAP_WEIGHT_OFF, true), 0);
++    ASSERT_EQ(ds_cache_get_capacity_obs(c, 0, &o), MDS_OK);
++    ASSERT_EQ(o.observed_mono_ms, 0u);
++    ASSERT_EQ(o.consecutive_failures, 1u);
++    ASSERT_EQ(ds_capacity_probe_once_ex(c, fmt, CAP_WEIGHT_OFF, false), 1);
++    (void)rmdir(tpl);
++    ds_cache_destroy(c);
++    mds_catalogue_close(cat);
++}
++
+ int main(void)
+ {
+     fprintf(stdout, "test_ds_capacity:\n");
++    RUN_TEST(test_invalidate_preserves_observation);
++    RUN_TEST(test_probe_ex_requires_a_mount_point);
+     RUN_TEST(test_obs_absent_until_probed);
+     RUN_TEST(test_probe_records_avail_fsid_and_time);
+     RUN_TEST(test_failed_probe_keeps_values_and_counts);
+diff --git a/tests/unit/test_placement_config.c b/tests/unit/test_placement_config.c
+index 2117f58..a33e9cc 100644
+--- a/tests/unit/test_placement_config.c
++++ b/tests/unit/test_placement_config.c
+@@ -159,6 +159,32 @@ static void test_ranges(void)
+     ASSERT_EQ(cfg.ds_capacity_domain[2][0], '\0');
+ }
+ 
++static void test_numbers_are_parsed_strictly(void)
++{
++    const char *bad[] = {
++        "placement_mode = fill\nplacement_min_free_bytes = -1\n",
++        "placement_mode = fill\nplacement_min_free_bytes = 1G\n",
++        "placement_mode = fill\nplacement_capacity_max_age_ms = 12abc\n",
++        "placement_mode = fill\nplacement_capacity_max_age_ms = +5\n",
++        "placement_mode = fill\nplacement_min_free_bytes = 99999999999999999999999\n",
++    };
++    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
++        struct mds_config cfg; char path[128];
++        ASSERT_EQ(write_tmp_ini(bad[i], path), 0);
++        ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
++    }
++}
++
++static void test_generation_covers_the_poll_interval(void)
++{
++    struct mds_config a, b; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_capacity_poll_ms = 30000\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &a), MDS_OK);
++    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_capacity_poll_ms = 20000\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
++    ASSERT_TRUE(strcmp(a.placement_config_generation, b.placement_config_generation) != 0);
++}
++
+ static void test_rr_does_not_need_the_probe(void)
+ {
+     struct mds_config cfg; char path[128];
+@@ -229,6 +255,8 @@ int main(void)
+     RUN_TEST(test_legacy_keys_conflict_with_mode);
+     RUN_TEST(test_ranges);
+     RUN_TEST(test_rr_does_not_need_the_probe);
++    RUN_TEST(test_numbers_are_parsed_strictly);
++    RUN_TEST(test_generation_covers_the_poll_interval);
+     RUN_TEST(test_generation_is_stable_and_sensitive);
+     RUN_TEST(test_rr_keeps_geometry);
+     RUN_TEST(test_validate_is_pure);
+diff --git a/tests/unit/test_placement_create_boundary.c b/tests/unit/test_placement_create_boundary.c
+index 076aafc..ff59c62 100644
+--- a/tests/unit/test_placement_create_boundary.c
++++ b/tests/unit/test_placement_create_boundary.c
+@@ -253,6 +253,119 @@ static void test_ensure_creates_in_rr_and_refuses_full_ds_in_fill(void)
+     mds_catalogue_close(cat);
+ }
+ 
++static void test_admit_create_refuses_admin_offline_after_invalidate(void)
++{
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_with_ds(&cat, 1);
++    struct mds_config cfg;
++    struct placement_token tok;
++    enum placement_reason why;
++    ASSERT_TRUE(cache != NULL);
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.placement_mode = PM_FILL;
++    cfg.placement_mode_set = true;
++    cfg.placement_capacity_max_age_ms = 120000;
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    {
++        struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
++        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
++    }
++    placement_gate_publish_capacity();
++    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
++    /* admin sets the DS OFFLINE: the registry reloads, no capacity sweep runs */
++    {
++        struct mds_cat_txn *txn = NULL;
++        struct mds_ds_info info;
++        ASSERT_EQ(mds_cat_ds_get(cat, 1, &info), MDS_OK);
++        info.state = DS_OFFLINE;
++        ASSERT_EQ(mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
++        ASSERT_EQ(mds_cat_ds_put(cat, txn, &info), MDS_OK);
++        ASSERT_EQ(mds_cat_txn_commit(txn), MDS_OK);
++        ASSERT_EQ(ds_cache_invalidate(cache, cat), 0);
++    }
++    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_ERR_NOSPC);
++    ASSERT_EQ(why, PR_DS_OFFLINE);
++    /* the reload kept the observation: back ONLINE -> admitted at once */
++    {
++        struct mds_cat_txn *txn = NULL;
++        struct mds_ds_info info;
++        ASSERT_EQ(mds_cat_ds_get(cat, 1, &info), MDS_OK);
++        info.state = DS_ONLINE;
++        ASSERT_EQ(mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn), MDS_OK);
++        ASSERT_EQ(mds_cat_ds_put(cat, txn, &info), MDS_OK);
++        ASSERT_EQ(mds_cat_txn_commit(txn), MDS_OK);
++        ASSERT_EQ(ds_cache_invalidate(cache, cat), 0);
++    }
++    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
++    placement_gate_destroy();
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
++static void test_token_expires_after_two_publishes(void)
++{
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_with_ds(&cat, 1);
++    struct mds_config cfg;
++    struct placement_token tok;
++    enum placement_reason why;
++    ASSERT_TRUE(cache != NULL);
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.placement_mode = PM_FILL;
++    cfg.placement_mode_set = true;
++    cfg.placement_capacity_max_age_ms = 120000;
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    {
++        struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
++        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
++    }
++    placement_gate_publish_capacity();
++    ASSERT_EQ(placement_gate_admit_create(1, PP_NEW_OBJECT, &tok, &why), MDS_OK);
++    ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), true);
++    placement_gate_publish_capacity();                 /* one publish may race the create */
++    ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), true);
++    placement_gate_publish_capacity();                 /* two: the token predates the previous snapshot */
++    ASSERT_EQ(placement_token_valid(&tok, 1, ds_cache_mono_ms()), false);
++    placement_gate_destroy();
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
++static void test_batch_capture_does_not_create_on_a_refused_ds(void)
++{
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_with_ds(&cat, 1);
++    char *dir = make_ds_dir();
++    struct mds_proxy_ctx *proxy = NULL;
++    struct mds_config cfg;
++    struct mds_ds_map_entry entries[2];
++    ASSERT_TRUE(cache != NULL && dir != NULL);
++    ASSERT_EQ(mds_proxy_ctx_create(&proxy), MDS_OK);
++    ASSERT_EQ(mds_proxy_mount_set(proxy, 1, dir), MDS_OK);
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.placement_mode = PM_FILL;
++    cfg.placement_mode_set = true;
++    cfg.placement_capacity_max_age_ms = 120000;
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    {
++        struct ds_capacity_obs full = { 1000, 0, 1, ds_cache_mono_ms(), 0 };
++        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &full), 0);
++    }
++    placement_gate_publish_capacity();
++    memset(entries, 0, sizeof(entries));
++    entries[0].ds_id = 1;
++    entries[1].ds_id = 1;
++    ASSERT_EQ(mds_proxy_ensure_ds_file_fh_batch(proxy, 400, 2, entries, 2), 2u);   /* both slots failed */
++    ASSERT_EQ(entries[0].nfs_fh_len, 0u);
++    ASSERT_TRUE(!file_exists(dir, 400, 0, 0));
++    ASSERT_TRUE(!file_exists(dir, 400, 1, 0));
++    placement_gate_destroy();
++    mds_proxy_ctx_destroy(proxy);
++    rm_ds_dir(dir);
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
+ static void test_write_direct_does_not_create_on_a_refused_ds(void)
+ {
+     struct mds_catalogue *cat = NULL;
+@@ -296,6 +409,9 @@ int main(void)
+     RUN_TEST(test_admit_create_legacy_and_rr);
+     RUN_TEST(test_ensure_creates_in_rr_and_refuses_full_ds_in_fill);
+     RUN_TEST(test_write_direct_does_not_create_on_a_refused_ds);
++    RUN_TEST(test_admit_create_refuses_admin_offline_after_invalidate);
++    RUN_TEST(test_token_expires_after_two_publishes);
++    RUN_TEST(test_batch_capture_does_not_create_on_a_refused_ds);
+     printf("%d/%d passed\n", tests_passed, tests_run);
+     return tests_passed == tests_run ? 0 : 1;
+ }
+diff --git a/tests/unit/test_placement_gate.c b/tests/unit/test_placement_gate.c
+index 4a6509e..c56be3d 100644
+--- a/tests/unit/test_placement_gate.c
++++ b/tests/unit/test_placement_gate.c
+@@ -511,6 +511,84 @@ static void test_ds_admitted_single(void)
+     ASSERT_EQ(why, PR_DS_OFFLINE);
+ }
+ 
++static void test_registry_view_drives_n_and_aliases_with_a_filtered_list(void)
++{
++    /* Scenario A (review finding 1): ds1 of domain d is OFFLINE and the
++     * caller's list no longer contains it; N must still be 2. */
++    struct mds_ds_info listed[2];
++    reset();
++    mk_ds(&listed[0], 0, DS_ONLINE, "xi");
++    mk_ds(&listed[1], 2, DS_ONLINE, "other");
++    add_row(0, "xi", 1000, 500, 7, 1000000);
++    add_row(1, "xi", 1000, 500, 7, 1000000);
++    V.rows[1].state = DS_OFFLINE;
++    add_row(2, "other", 1000, 500, 8, 1000000);
++    snprintf(DOM[0], PM_DOMAIN_ID_MAX, "d");
++    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "d");
++    struct placement_ctx c = ctx_for(PM_FILL);
++    struct placement_candidate out[2];
++    ASSERT_EQ(placement_candidates(&c, listed, 2, out, NULL), 2u);
++    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 2, NULL));
++    ASSERT_TRUE(out[1].weight == placement_weight(50, 1000000, 1, NULL));
++    /* Scenario B: the filtered-out sibling is an undeclared proven alias. */
++    reset();
++    add_row(0, "xi", 1000, 500, 7, 1000000);
++    add_row(1, "xi", 1000, 500, 7, 1000000);
++    struct placement_reject_counts why;
++    ASSERT_EQ(placement_candidates(&c, listed, 1, out, &why), 0u);
++    ASSERT_EQ(why.by_reason[PR_SHARED_FS_ALIAS_UNMAPPED], 1u);
++    /* and the create boundary agrees with selection */
++    enum placement_reason r;
++    ASSERT_EQ(placement_ds_admitted(&c, listed, 1, 0, &r), false);
++    ASSERT_EQ(r, PR_SHARED_FS_ALIAS_UNMAPPED);
++}
++
++static void test_ds_admitted_reason_uses_domain_level_verdict(void)
++{
++    /* ds0 (avail 50) and ds1 (avail 800) share a domain; the conservative
++     * rule makes the domain full for min_free 100, ds1 included. */
++    struct mds_ds_info ds[2];
++    reset();
++    mk_ds(&ds[0], 0, DS_ONLINE, "xi");
++    mk_ds(&ds[1], 1, DS_ONLINE, "xi");
++    add_row(0, "xi", 1000, 50, 7, 1000000);
++    add_row(1, "xi", 1000, 800, 7, 1000000);
++    snprintf(DOM[0], PM_DOMAIN_ID_MAX, "d");
++    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "d");
++    struct placement_ctx c = ctx_for(PM_FILL);
++    c.min_free_bytes = 100;
++    struct placement_candidate out[2];
++    ASSERT_EQ(placement_candidates(&c, ds, 2, out, NULL), 0u);
++    enum placement_reason r;
++    ASSERT_EQ(placement_ds_admitted(&c, ds, 2, 1, &r), false);
++    ASSERT_EQ(r, PR_CAPACITY_FULL);
++    /* a total of 0 with a time stamp is UNKNOWN, not STALE */
++    reset();
++    mk_ds(&ds[0], 0, DS_ONLINE, "h");
++    add_row(0, "h", 0, 0, 1, 1000000);
++    struct placement_reject_counts why;
++    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
++    ASSERT_EQ(why.by_reason[PR_CAPACITY_UNKNOWN], 1u);
++}
++
++static void test_admit_counts_per_ds_reasons(void)
++{
++    struct mds_ds_info ds[3];
++    reset();
++    for (uint32_t i = 0; i < 3; i++) mk_ds(&ds[i], i, DS_ONLINE, "h");
++    add_row(0, "h", 1000, 500, 1, 1000000);
++    add_row(1, "h", 1000, 0, 2, 1000000);           /* full */
++    add_row(2, "h", 1000, 500, 3, 1000000 - 500000); /* stale */
++    struct placement_ctx c = ctx_for(PM_FILL);
++    uint64_t full_before = atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_FULL]);
++    uint64_t stale_before = atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_STALE]);
++    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
++    ASSERT_EQ(placement_admit(&c, ds, 3, &sc, 1, 0, &e, &why), MDS_OK);
++    ASSERT_EQ(e.ds_id, 0u);
++    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_FULL]), full_before + 1);
++    ASSERT_EQ(atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_STALE]), stale_before + 1);
++}
++
+ static void test_reason_names_are_bounded(void)
+ {
+     for (int r = 0; r < PR_COUNT; r++) {
+@@ -694,6 +772,19 @@ static void test_select_gated_legacy_path(void)
+     ASSERT_EQ(e.ds_id, 0u);
+ }
+ 
++static void test_select_gated_legacy_rr_at2_branch(void)
++{
++    struct mds_ds_info ds[2];
++    mk_ds(&ds[0], 10, DS_ONLINE, "a");
++    mk_ds(&ds[1], 11, DS_ONLINE, "b");
++    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
++    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
++    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 2, &sc, 1, 65536, 1, &e, &why), MDS_OK);
++    ASSERT_EQ(e.ds_id, 11u);   /* start = 1 % 2 */
++    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 2, &sc, 1, 65536, 2, &e, &why), MDS_OK);
++    ASSERT_EQ(e.ds_id, 10u);   /* start = 2 % 2 */
++}
++
+ static void test_select_gated_fill_path_uses_the_gate(void)
+ {
+     struct mds_config cfg = fill_cfg();
+@@ -776,6 +867,10 @@ int main(void)
+     RUN_TEST(test_singleton_rr_needs_no_cache);
+     RUN_TEST(test_singleton_publishes_capacity_from_cache);
+     RUN_TEST(test_select_gated_legacy_path);
++    RUN_TEST(test_select_gated_legacy_rr_at2_branch);
++    RUN_TEST(test_registry_view_drives_n_and_aliases_with_a_filtered_list);
++    RUN_TEST(test_ds_admitted_reason_uses_domain_level_verdict);
++    RUN_TEST(test_admit_counts_per_ds_reasons);
+     RUN_TEST(test_select_gated_fill_path_uses_the_gate);
+     RUN_TEST(test_rr_is_cyclic_over_the_gated_list);
+     RUN_TEST(test_rr_ignores_capacity);
