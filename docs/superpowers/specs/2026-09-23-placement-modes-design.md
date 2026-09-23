@@ -1,6 +1,9 @@
 # Lattice placement modes (`rr` / `fill` / `smart`) — design
 
-**Status:** design for review, 2026-09-23. Implements the requirements in
+**Status:** design for review, 2026-09-23, revision 2 (review findings 1–5
+of the same day folded in: admission at the create-if-absent boundary,
+full binding check per assessment, bounded manual weights, split readiness,
+explicit alias map). Implements the requirements in
 `lattice_placement_modes_mvp_requirements.md` (MODE-01…10, CLI-01…05,
 acceptance §7) on top of the connector MVP requirements (LAT-01…25).
 **Baseline:** PEAK-AIO/pnfs-lattice `main` @ `6b4dcde` (verified in code, see
@@ -42,7 +45,8 @@ Each shaped the design; all were read in the source, not inferred.
 | B2 | `fill_online_with_free` maps `weight == 0` to "unset" and a zero free-byte value to `1`; `ds_capacity_derive_auto_weight` floors at `1` | a full or unknown DS keeps a positive weight today; the gate excludes it before weights exist |
 | B3 | `mds_wrr_weighted_pick` returns `0` on an all-zero vector and the caller walks forward to the next free slot; the `>64` DS path uses `taken_heap` without masking | an all-denied set can still place; the kernel needs an explicit "no candidate" result and the same masking on both paths |
 | B4 | `probe_one` records `total`/`used` and (when `proportional`) `auto_weight`; nothing records *when* the last successful `statvfs` happened; a failed probe keeps the previous values silently; the cluster reload restamps peer observations as "now" | fill/smart need their own observation record with a monotonic timestamp and `f_fsid`; peer-reloaded values are not fresh evidence |
-| B5 | four call sites create backing objects: LAYOUTGET new-file path (`compound_layout.c` ≈1976–2032, dispatcher-aware), a second LAYOUTGET path (≈2217, legacy `placement_select`), `promote_inline_to_ds` (`compound_data_io.c` ≈1868, legacy), and the prealloc pop path (`ds_prealloc` — the community stub still selects a DS, SRC-06) | one admission function called from all four; the legacy `placement_select*` entry points are removed from those sites |
+| B5 | four sites *select* a DS for a new file: LAYOUTGET new-file path (`compound_layout.c` ≈1976–2032, dispatcher-aware), a second LAYOUTGET path (≈2217, legacy `placement_select`), `promote_inline_to_ds` (`compound_data_io.c` ≈1868, legacy), and the prealloc pop/peek/batch path (`ds_prealloc_stub.c` — the community stub selects with `placement_select_ex` / `placement_select_rr_at2`) | one selection function called from all four; the legacy `placement_select*` entry points are removed from those sites |
+| B5a | backing objects are *created* elsewhere, after selection: every `mds_proxy_ensure_ds_file*` in `proxy_io.c` opens with `O_WRONLY \| O_CREAT` and is idempotent create-if-absent; it is called by the `ds_prepare` worker (`ds_prepare.c` ≈241), by `layout_refresh_wide_stripe_fhs` on LAYOUTGET (`compound_layout.c` ≈1107, "re-creates the file if absent"), by the promotion write path, by the proxy READ/WRITE ensure calls (`compound_data_io.c` ≈2094, ≈2262), and by prealloc pop/batch/ensure | a grep for selectors does not find these; the gate must also sit at the create boundary — a lookup that never creates, and a create that needs admission (§5a) |
 | B6 | `placement_policy_enabled` also gates the default stripe/mirror geometry in the LAYOUTGET and promotion paths | an explicit mode always takes the dispatcher branch, so `rr` keeps geometry (MODE-03) |
 | B7 | `workload_profile` presets (`config.c` `g_profiles`) may set `placement_policy`; explicit keys override profile values; the parser is `key = value`, `#`/`;` comments, `[section]` lines skipped, last key wins | conflict detection must look at the profile's placement fields as well as explicit keys; the CLI can edit the file line-by-line |
 | B8 | `mds-admin` talks to the daemon over the cluster transport (`--mds-port`, default 9800; the lab daemons listen on `grpc_port` 50051) and already has `config show` | the live source for `show` is `config show` on the right port; no new RPC in the MVP |
@@ -93,7 +97,7 @@ MDS tests and the CLI helper (both read the same file in CI).
 | `placement_capacity_max_age_ms` | 120000 | `> ds_capacity_poll_ms`, ≤ 86400000 | fill, smart |
 | `placement_min_free_bytes` | 0 | uint64; a domain is a candidate only when `available > value` | fill, smart |
 | `ds_capacity_domain.<ds_id>` | unset = the DS is its own domain | non-empty string ≤ 128 bytes | fill (required for shared-FS aliases), smart (must agree with the connector) |
-| `placement_domain_weight.<domain>` | unset | uint32 ≥ 1; only with `placement_allow_manual_base_weights = true` | smart |
+| `placement_domain_weight.<domain>` | unset | 1..10000; only with `placement_allow_manual_base_weights = true` (the range keeps the weight bound of §5; larger values are a validation error) | smart |
 | `placement_allow_manual_base_weights` | false | bool | smart |
 | `placement_stripe_shrink` | `allow` | `allow` \| `strict` | all (LAT-13) |
 | `ds_connector_enabled` | derived | must be `true` iff mode is `smart`; an explicit contradiction is an error | smart |
@@ -179,22 +183,75 @@ enum mds_status placement_admit(const struct placement_ctx *ctx,
   (strict). Zero candidates → `MDS_ERR_NOSPC` with reason
   `NO_ELIGIBLE_DS`; callers keep returning `NFS4ERR_NOSPC` (LAT-20).
 - **Fixed-point weights.** `weight = domain_weight × ppm × SCALE / N`,
-  `SCALE = 65536`, `ppm = 1 000 000` in `fill`. Bounds: max
-  `100 × 10⁶ × 65536 = 6.6·10¹²` per DS, `× 256` DS `= 1.7·10¹⁵ < 2⁶²`;
-  min `1 × 1 × 65536 / 256 = 256 > 0`. So with `N ≤ 256` (`MDS_MAX_DS_NODES`)
-  no positive rational weight quantizes to zero; the bound is asserted in
-  a unit test and documented in the manifest (LAT-11, MODE-08).
-- **Call-site inventory (LAT-14):** LAYOUTGET create path, LAYOUTGET
-  fallback path, `promote_inline_to_ds`, prealloc pop/batch (stub and
+  `SCALE = 65536`, `ppm = 1 000 000` in `fill`. `domain_weight` is the
+  derived value (1..100) or, in `smart` with the advanced flag, the
+  manual override (1..10000, §4). Bounds with the override at its
+  maximum: `10⁴ × 10⁶ × 65536 = 6.6·10¹⁴` per DS, `× 256` DS
+  `= 1.7·10¹⁷ < 2⁶²`; min `1 × 1 × 65536 / 256 = 256 > 0`. The product is
+  computed in `unsigned __int128` and asserted `< 2⁶²` before the kernel
+  sees it, so a future range change cannot silently overflow (review
+  finding 3). With `N ≤ 256` (`MDS_MAX_DS_NODES`) no positive rational
+  weight quantizes to zero; both bounds are asserted in a unit test with
+  the extreme values and documented in the manifest (LAT-11, MODE-08).
+- **Selection-site inventory (LAT-14):** LAYOUTGET create path, LAYOUTGET
+  fallback path, `promote_inline_to_ds`, prealloc pop/peek/batch (stub and
   module). Each site: (1) native filter as today, (2) `placement_admit`,
   (3) no other selector. `grep -n "placement_select" src/` in CI must list
   only `placement.c`, `placement_gate.c` and the out-of-scope helpers
-  (`placement_select_replacement`, `placement_select_for_tier`).
+  (`placement_select_replacement`, `placement_select_for_tier`). This
+  grep proves selection only; creation is proven by §5a.
 - **Race boundary (LAT-16/17):** admission reads one atomic snapshot of
   the capacity and assessment views (a pointer swap published by the
   background threads; readers hold a refcount for the call). No network,
   no lock across the syscall. A layout that cannot be completed is not
   persisted; partial DS files go to the existing GC.
+
+### 5a. Admission at the create-if-absent boundary (LAT-15/16, review finding 1)
+
+Selection is necessary but not sufficient: a backing object is created
+later, by `mds_proxy_ensure_ds_file`, `mds_proxy_ensure_ds_file_fh` and
+`mds_proxy_ensure_ds_file_fh_batch` (B5a), from paths that never ran a
+selector — the `ds_prepare` worker, the LAYOUTGET filehandle refresh, the
+proxy READ/WRITE ensure calls, prealloc. The design therefore splits the
+proxy helpers:
+
+```c
+/* Opens an EXISTING DS file and returns its handle; never creates.
+ * MDS_ERR_NOTFOUND when the object is absent. Not gated: access to an
+ * existing object is never blocked by placement (LAT-15). */
+enum mds_status mds_proxy_lookup_ds_file_fh(ctx, ds_id, fileid, s, m, fh, &len);
+
+/* Creates the DS file (O_CREAT) and returns its handle. Requires an
+ * admission token minted by the gate for (ds_id, purpose, generations)
+ * immediately before the call; refuses without one. */
+enum mds_status mds_proxy_create_ds_file_fh(ctx, ds_id, fileid, s, m,
+                                             const struct placement_token *tok,
+                                             fh, &len);
+
+/* The former ensure_* helpers become: lookup; if absent →
+ * placement_gate_admit_create(gate, ds_id, PURPOSE_*, &tok) → create. */
+```
+
+`placement_gate_admit_create()` consults the same snapshot the selector
+uses. Purposes: `NEW_OBJECT` (the object of a just-selected layout: the
+DS was a candidate moments ago; the re-check catches a deny published in
+between — LAT-16) and `RECREATE_MISSING` (an existing stripe map whose
+object vanished). Rules per mode:
+
+| Mode | `NEW_OBJECT` | `RECREATE_MISSING` |
+|---|---|---|
+| legacy, `rr` | admitted when the DS is `DS_ONLINE` and not admin-excluded (today's behaviour, now explicit) | same |
+| `fill` | admitted when the DS's domain passes the capacity gate | same — a full or unknown domain does not get a new object even for an old file |
+| `smart` | admitted when the DS passes the capacity and assessment gates | same — a denied/UNKNOWN DS does not get a new object; the caller sees `MDS_ERR_NOSPC` with reason `CONNECTOR_DENIED` / `ASSESSMENT_UNKNOWN`, which the LAYOUTGET refresh turns into the existing `NFS4ERR_DELAY` (entry not ready) and the proxy READ/WRITE path into `NFS4ERR_DELAY` as well, never into a create elsewhere |
+
+The token is a small struct `{ds_id, purpose, snapshot_generation,
+mono_ms}` valid for one call and one DS; the create helper checks that
+`tok->ds_id == ds_id` and that the token is younger than
+`placement_token_max_age_ms` (default 2000). A token cannot be reused
+for another DS or stripe. Every proxy create site passes through this
+pair; the CI grep for `O_CREAT` in `proxy_io.c` must find only
+`mds_proxy_create_ds_file*`, and a unit test drives each former ensure
+caller with a denied DS and asserts no file is created (§13).
 
 ## 6. Capacity gate
 
@@ -226,6 +283,21 @@ struct ds_capacity_obs {
   more than 1 % the smaller value is used and a rate-limited WARN names
   both (LAT-10). `N` = all registered DS in the domain, offline or denied
   included; the share is `1/N` and is not redistributed (MODE-07).
+- **Aliases are declared, not discovered (review finding 5).** In `fill`
+  the operator map is the authority: two exports of one filesystem must
+  carry the same `ds_capacity_domain`, on every MDS. The `(host, f_fsid)`
+  probe is a check on that declaration, in three grades: (a) two DS in one
+  declared domain whose fresh observations report different `f_fsid` on
+  the same host string → `DOMAIN_MAP_CONTRADICTION`, both excluded; (b)
+  two DS with the same host string and the same `f_fsid` but no shared
+  declared domain → proven alias, `SHARED_FS_ALIAS_UNMAPPED`, startup
+  error once observed (both UNKNOWN before that); (c) equal `f_fsid`
+  behind *different* host strings (one xiNAS registered under two names
+  or addresses) cannot be proven from NFS → `ALIAS_SUSPECTED`, a
+  rate-limited WARN and a `verify`/`validate` finding, never silent and
+  never an automatic merge. `smart` takes the domain from the connector
+  (which knows the filesystem UUID) and treats an operator map that
+  disagrees as `DOMAIN_MAP_MISMATCH` (§4).
 - `rr` never consults the record. The existing `proportional` auto-weight
   path is untouched for legacy configurations.
 
@@ -237,22 +309,60 @@ our build; the module is a no-op when the mode is not `smart`):
 - **Poll loop:** every `ds_connector_poll_ms` it `GET`s
   `/v1/assessments` over the Unix socket with
   `ds_connector_request_deadline_ms` as connect+read deadline, parses the
-  batch with `jsmn` and validates: `contract_version` major matches,
-  `runtime_epoch`/`sequence` advance within an epoch (a stale or replayed
-  batch is dropped, counted), every record's `ds_id` is registered and
-  ≤ `ds_connector_max_ds`, `quality`, `allowed`, `multiplier_ppm`
-  (0..1 000 000), `remaining_ttl_ms`, `capacity_domain_id`,
-  `binding_generation`. A record that fails validation excludes that DS
-  (UNKNOWN); an envelope failure excludes every DS of that batch (LAT-06).
+  batch with `jsmn` and validates it in two layers (LAT-06, review
+  finding 2):
+  1. **Envelope.** `contract_version` major ==
+     `ds_connector_expected_contract_major`; `runtime_epoch` — a change
+     resets every instance's sequence line and every DS to UNKNOWN; per
+     `connector_instance_id`, `epoch` + `sequence` must advance (a
+     replayed or lower sequence within the same epoch drops the whole
+     batch, `pnfs_mds_connector_batches_dropped_total{reason=replay}`);
+     `generated_at` not older than the last accepted batch;
+     `config_digest` == `ds_connector_expected_config_digest` when that key
+     is set (LAT-22; `verify` compares the digests the MDS report even
+     when it is not set, LAT-24). An envelope failure excludes every DS
+     of that batch.
+  2. **Binding, per assessment** (all fields are required by the batch
+     contract, `contracts/connector-batch.schema.json`): `ds_id`
+     registered and ≤ `ds_connector_max_ds`; `scope == "ds"` and
+     `access_scope_id == ds_connector_access_scope` (default `global`);
+     `endpoint.server` and `endpoint.export_path` equal the registry's
+     `host` and `export_path` for that `ds_id` (exact strings — the
+     connector's binding must name the DS the way `ds[N]` registered it)
+     and `endpoint.port` equals `tcp_port` when the registry has one;
+     `profile.digest` equal to `ds_connector_expected_profile_digest` when
+     set, and identical across every record of the batch; `quality`,
+     `placement.allowed`, `placement.multiplier_ppm` (0..1 000 000),
+     `remaining_ttl_ms`, `resources.capacity_domain_id` well-typed. The
+     MDS pins, per `ds_id`, the tuple
+     `(connector_instance_id, binding_generation, datastore_id,
+     target_id, target_incarnation, profile.digest, access_scope_id)` of
+     the first accepted record. A later record must repeat the tuple
+     exactly, **or** carry a strictly higher `binding_generation` — that
+     re-pins the tuple and resets that DS to UNKNOWN until its fresh
+     record is accepted (the operator rebound the DS). A lower generation,
+     or the same generation with any other field changed (a DS id
+     re-assigned to another share, a share recreated without a rebind),
+     is `BINDING_MISMATCH`: the record is rejected, the DS is UNKNOWN,
+     the mismatch is counted and logged with both tuples. A record that
+     fails any check excludes only that DS.
 - **Cache:** an immutable array indexed by `ds_id`, published by pointer
   swap; each entry carries `allowed`, `ppm`, `quality`, `domain`,
   `reason[0..3]`, `expires_mono_ms = receive_mono + remaining_ttl_ms`. The
   MDS clock decides expiry (LAT-04). At startup every DS is UNKNOWN until
   the first valid batch (MODE-10). No DS state, weight or recall is ever
   changed by the connector (LAT-03).
-- **Readiness:** `smart` reports `ready = socket reachable ∧ last batch
-  valid ∧ every registered DS has a non-expired record`. Not ready means
-  those DS are excluded; it never falls back to `rr`/`fill`.
+- **Readiness is four facts, not one flag (review finding 4).**
+  `mode_active` (the effective mode is `smart`), `connector_config_valid`
+  (build flags, socket path, thresholds — fixed at startup),
+  `connector_reachable` (a successful poll within `3 × poll_ms`) with
+  `last_batch_valid`, and `coverage ∈ {full, partial, none}` with
+  `eligible_ds_count` and the list of UNKNOWN/denied/stale DS. A DS
+  without a fresh valid record is excluded from placement; the mode
+  keeps placing on the eligible remainder and never falls back to
+  `rr`/`fill`. `coverage = none` with `mode_active` is the operational
+  alarm ("smart is placing nothing"); `partial` is a degraded-but-correct
+  state and is reported as such by `show` and `verify` (§10).
 - **Candidate rule:** `quality == VALID ∧ allowed ∧ ppm > 0 ∧ not expired`.
   Reasons: `ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE`, `CONNECTOR_DENIED`,
   `ZERO_MULTIPLIER`, `NO_BINDING`.
@@ -315,9 +425,14 @@ Python 3.9 stdlib, same style as the connector CLI. Commands:
   `/var/lib/lattice-placement/audit.log`, re-validation of the result. It
   prints that running daemons still use the old mode and does not restart
   anything (CLI-03). Leaving `smart` prints the health-veto warning.
-- `mode verify --mds host[,host]` — every MDS reports the same effective
-  mode and generation and, for `smart`, `ready`; otherwise exit 1 (CLI-04
-  step 5).
+- `mode verify --mds host[,host]` — exit 1 when the MDS differ in
+  effective mode or generation, when a `smart` MDS reports
+  `connector_config_valid = false`, `connector_reachable = false` or
+  `coverage = none`, or when the connector `config_digest`/profile digests
+  the MDS report differ between MDS. `coverage = partial` is printed as a
+  warning with the affected DS and their reasons and exits 0 — one
+  UNKNOWN DS is a degraded DS, not a failed switch; `--require-full-coverage`
+  turns it into exit 1 for operators who want that gate (CLI-04 step 5).
 
 The supported switch procedure (validate → drain new creates → identical
 config on every MDS → controlled restart → verify → resume) is documented
@@ -353,7 +468,10 @@ the connector still stores no placement mode. The CLI helper calls it.
 | unit (cmocka, fork) | config parsing: absent key = legacy; each mode; every conflict and range error; profile conflict; alias map | §7.1 |
 | unit | `placement_candidates` / `placement_admit` on synthetic views: rr cyclic order; fill excludes full/stale/unknown; smart excludes deny/UNKNOWN/expired/ppm 0; single DS, 64/65/256 DS, multi-stripe, shrink vs strict, mirrors distinct, no zero weight reaches the kernel | §7.3, §7.4 |
 | unit | fairness with a seeded PRNG: equal fill → ≈ even; 80 %/20 % free → ≈ 4:1 over 100 000 draws within ±2 %; degraded 250 000 ppm vs healthy at equal capacity → ≈ 1:4; alias share: two DS on one domain vs one DS on another → domain totals equal | §7.2, §7.5 |
-| unit | connector client: schema, epoch/sequence replay, TTL expiry on the MDS clock, envelope failure excludes the batch, no fallback when the socket is gone | §7.3 |
+| unit | connector client: schema, epoch/sequence replay, TTL expiry on the MDS clock, envelope failure excludes the batch, no fallback when the socket is gone; binding: endpoint mismatch, re-assigned ds_id with the same generation, lower generation, higher generation re-pins and resets to UNKNOWN, profile digest mismatch, config digest pin | §7.3, LAT-06 |
+| unit | create boundary: with a denied (smart) or full/stale (fill) DS, each former ensure caller — ds_prepare job, LAYOUTGET refresh, promotion write, proxy READ/WRITE ensure, prealloc pop/batch/ensure — creates no file and returns the mapped status; lookup of an existing object still succeeds; a token for DS A is refused for DS B and after its max age | LAT-15/16, review finding 1 |
+| unit | weight bounds with the manual override at 10000 and N = 1 and 256: sum < 2⁶², min > 0; a value of 10001 is a config error | LAT-11, review finding 3 |
+| unit | readiness/verify: partial coverage = warning + exit 0, none = exit 1, `--require-full-coverage` | review finding 4 |
 | integration (fork tests) | the four call sites go through the gate: a denied DS never receives a backing object via CREATE, LAYOUTGET, promotion, prealloc pop | §7.3 |
 | stand (node223/node225, box + node 71) | `rr`: 40 files ≈ 20:20 in registry order; `fill` after filling one DS: skew follows free fraction; `smart` with the connector denying one DS: 0 files there, hold-down and recovery visible; existing files untouched; `show`/`verify` output | §7.2–7.6 |
 | perf (stand) | ≥ 3 runs of the create benchmark, `smart` vs legacy: ≤ 5 % create throughput loss, ≤ 10 % p99 placement latency growth | LAT-25 |
@@ -375,14 +493,20 @@ health; peer-observation freshness for metadata-only MDS.
    2026-09-23.
 2. A conflicting `workload_profile` placement policy is a validation error,
    as the requirement states, not a silent override.
-3. `fill` proves shared-FS aliases with `(host, f_fsid)` from the
-   back-mounts; the operator map is mandatory only when that proof fires.
+3. `fill` aliases are declared with `ds_capacity_domain`; the
+   `(host, f_fsid)` probe validates the declaration (contradiction and
+   proven-unmapped alias are errors, a suspected alias behind two host
+   strings is a diagnostic).
 4. Fixed-point weights with `SCALE = 65536` (bounds in §5).
 5. `show` uses `mds-admin config show` over the cluster transport port as
    the live source; the metrics endpoint is the secondary source.
-6. Delivery order: A (MDS core, `rr`/`fill`, kernel, gate at all call
-   sites) → B (`smart`, connector client, preflight) → C (CLI, examples,
-   manifest, stand and perf acceptance). Each stage ends green on the fork
+6. Delivery order: A (MDS core, `rr`/`fill`, kernel, selection gate at
+   all selection sites and the create-boundary split in `proxy_io.c`) →
+   B (`smart`, connector client with the binding check, preflight) → C
+   (CLI, examples, manifest, stand and perf acceptance).
+7. Review findings 1–5 (2026-09-23) are folded in: §5a, §7 (binding),
+   §4/§5 (override range and 128-bit check), §7/§10 (readiness split),
+   §6 (declared aliases). Each stage ends green on the fork
    CI and, for A and B, with a stand trial. Stand trials restart
    `pnfs-mds` on node223/node225 inside a maintenance window and are
    announced before they run.
