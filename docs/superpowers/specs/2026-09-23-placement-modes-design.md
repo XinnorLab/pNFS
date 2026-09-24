@@ -417,6 +417,17 @@ our build; the module is a no-op when the mode is not `smart`):
 - Structured reasons in the LAYOUTGET/promotion error log separate health
   deny from real `ENOSPC` (LAT-20).
 
+**Stage C additions (2026-09-24).** `config show` carries one build row in
+every mode, `placement_build = wrr=<0|1> connector=<0|1> prealloc=<0|1>`
+(the kernel is real, the connector client is compiled in, the enterprise
+prealloc module is compiled in) — `show`/`verify` compare it across MDS
+instead of reading journals. One latency histogram,
+`pnfs_mds_placement_admit_seconds` (the upstream 12-bucket layout, 100 µs
+… +Inf, with `_sum`/`_count`), is observed once per
+`placement_select_gated` call in **every** mode — legacy included, so the
+LAT-25 row compares like with like — and once per
+`placement_gate_admit_create`.
+
 ## 10. CLI helper `lattice-placement` (this repo, `tools/lattice-placement/`)
 
 Python 3.9 stdlib, same style as the connector CLI. Commands:
@@ -454,6 +465,49 @@ Python 3.9 stdlib, same style as the connector CLI. Commands:
 The supported switch procedure (validate → drain new creates → identical
 config on every MDS → controlled restart → verify → resume) is documented
 in `docs/placement-modes/operations.md`; no online switch (CLI-05).
+
+**Precisions fixed in Stage C (2026-09-24):**
+
+- *Live source.* `show`/`verify` run `mds-admin config show --json`
+  against each host (`--mds-admin` path, `--mds-port` default 50051,
+  `--env KEY=VALUE` passthrough for `LD_LIBRARY_PATH`) and, secondarily,
+  scrape `/metrics` (`--metrics-port` 9090, `--no-metrics`). The desired
+  mode comes from `--config <path>` (a local file) or `--ssh <user>` (`ssh
+  <user>@<host> cat <path>`); when neither is given it prints `?` — it is
+  never inferred from the effective mode. Exit 2 when an MDS cannot be
+  read.
+- *Profile rule in `validate`.* Every shipped `workload_profile` other than
+  `default` (`hpc`, `ai_training`, `genomics`, `media`) sets a placement
+  policy, so any of them with `placement_mode` is
+  `PLACEMENT_MODE_CONFLICT`; the manifest lists them
+  (`profiles_with_placement_policy`).
+- *Managed block in `set`.* The keys the helper owns live between
+  `# lattice-placement managed block` and `# end lattice-placement managed
+  block`; everything else in the file is preserved byte for byte
+  (line-preserving document, `config.c` grammar: `#`/`;` comments,
+  `[section]` lines skipped, first `=` splits, last key wins). `set
+  <rr|fill|smart>` removes the legacy keys (`placement_policy`,
+  `placement_policy_enabled`, `placement_capacity_weighting`,
+  `ds_weight.<id>`) and writes `placement_mode` plus `--set key=value`
+  pairs (manifest keys applying to that mode only). `set legacy` removes
+  the block and every `placement_*` / `ds_capacity_domain.*` /
+  `ds_connector_*` key and writes `placement_policy_enabled = true`,
+  `placement_policy = <--legacy-policy, default wrr>` and `ds_weight.<id>
+  = <w>` from `--ds-weight id=w`. The audit line is JSON: `ts, user,
+  sudo_user, host, file, old_mode, new_mode, old_sha256, new_sha256,
+  backup`. If the rewritten file fails validation the backup is restored
+  and the exit code is 1. Leaving `smart` prints the health-veto warning;
+  entering it prints that no DS is admitted before the first fresh VALID
+  assessment.
+- *`verify` comparison set.* Effective mode, `placement_config_generation`
+  and `placement_build` must be identical across MDS; a known desired
+  mode that differs from the effective one is an error (the daemon was
+  not restarted); in `smart` every MDS must report
+  `connector_config_valid=1`, `connector_reachable=1` and a coverage other
+  than `none`, and the connector `config_digest` / `profile_digest` must
+  be identical across MDS. `coverage=partial` is a warning (exit 0) that
+  lists the non-eligible DS with their reasons; `--require-full-coverage`
+  makes it exit 1.
 
 ## 11. Connector preflight (this repo)
 

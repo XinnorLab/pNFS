@@ -272,7 +272,8 @@
     "placement_readiness",
     "placement_connector_config_digest",
     "placement_connector_profile_digest",
-    "placement_connector_last_detail"
+    "placement_connector_last_detail",
+    "placement_build"
   ],
   "metrics": [
     "pnfs_mds_placement_mode",
@@ -284,7 +285,8 @@
     "pnfs_mds_connector_poll_errors_total",
     "pnfs_mds_connector_covered_ds",
     "pnfs_mds_connector_reachable",
-    "pnfs_mds_connector_last_success_mono_ms"
+    "pnfs_mds_connector_last_success_mono_ms",
+    "pnfs_mds_placement_admit_seconds"
   ],
   "connector_client": {
     "contract_version_major": 1,
@@ -341,5 +343,29 @@
     "-DENABLE_WRR=ON",
     "-DENABLE_DS_CONNECTOR=ON",
     "-DENABLE_DS_PREALLOC=OFF"
-  ]
+  ],
+  "profiles_with_placement_policy": [
+    "hpc",
+    "ai_training",
+    "genomics",
+    "media"
+  ],
+  "cli": {
+    "managed_block_begin": "# lattice-placement managed block",
+    "managed_block_end": "# end lattice-placement managed block",
+    "legacy_keys": [
+      "placement_policy",
+      "placement_policy_enabled",
+      "placement_capacity_weighting",
+      "ds_weight.<id>"
+    ],
+    "audit_log": "/var/lib/lattice-placement/audit.log",
+    "mds_admin_port_default": 50051,
+    "metrics_port_default": 9090,
+    "verify_exit": {
+      "0": "same effective mode, generation and build on every MDS; smart: connector valid and reachable on every MDS, coverage full or partial",
+      "1": "any difference, a desired mode not yet effective, connector invalid/unreachable, coverage none, or partial with --require-full-coverage",
+      "2": "an MDS could not be read"
+    }
+  }
 }
