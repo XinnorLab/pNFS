@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  connector:
+    name: lattice-ds-connector tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e 'connectors/lattice-ds-connector[test]'
+      - run: python -m pytest -q
+        working-directory: connectors/lattice-ds-connector
+
+  lattice-placement:
+    name: lattice-placement tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e 'tools/lattice-placement[test]'
+      - run: python -m pytest -q
+        working-directory: tools/lattice-placement
+      - name: the console script answers
+        run: lattice-placement --version
+
+  manifests:
+    name: manifests and patches match the fork
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone the fork at the recorded SHA
+        run: |
+          set -e
+          SHA=$(python3 -c 'import json;print(json.load(open("mds/manifest.json"))["fork_sha"])')
+          git clone -q --filter=blob:none https://github.com/XinnorLab/pnfs-lattice fork
+          git -C fork checkout -q "$SHA"
+      - run: python3 scripts/check-manifests.py --fork fork

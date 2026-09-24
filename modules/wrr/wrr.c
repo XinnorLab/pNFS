@@ -31,16 +31,30 @@
  * without a lock.  Seeded lazily from time + thread-unique address so
  * two MDS processes do not replay the same sequence.
  */
+static __thread unsigned int wrr_seed;
+static __thread int wrr_seeded;
+
+void mds_wrr_test_seed(uint32_t s)
+{
+    wrr_seed = (unsigned int)s;
+    wrr_seeded = 1;
+}
+
+uint32_t mds_wrr_kernel_id(void)
+{
+    return MDS_WRR_KERNEL_XINNOR_V1;
+}
+
 static unsigned int wrr_rand(void)
 {
-    static __thread unsigned int seed;
-    static __thread int seeded;
+    unsigned int *seed = &wrr_seed;
+    int *seeded = &wrr_seeded;
 
-    if (!seeded) {
-        seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)&seed;
-        seeded = 1;
+    if (!*seeded) {
+        *seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)seed;
+        *seeded = 1;
     }
-    return (unsigned int)rand_r(&seed);
+    return (unsigned int)rand_r(seed);
 }
 
 /* Uniform value in [0, bound) without modulo bias for 64-bit bounds. */
@@ -98,6 +112,38 @@ uint32_t mds_wrr_weighted_pick(const uint64_t *free_bytes, uint32_t n)
         }
     }
     return 0;
+}
+
+int mds_wrr_weighted_pick2(const uint64_t *w, uint32_t n, uint32_t *out)
+{
+    uint64_t total = 0;
+    uint64_t r;
+    uint32_t i;
+
+    if (w == NULL || n == 0 || out == NULL) {
+        return -1;
+    }
+    /* The sampler draws 62 bits; refuse a sum that reaches 2^62 instead
+     * of clipping it (the caller's weight bound guarantees it never
+     * happens with the shipped configuration ranges). */
+    for (i = 0; i < n; i++) {
+        if (w[i] > ((UINT64_C(1) << 62) - 1) - total) {
+            return -1;
+        }
+        total += w[i];
+    }
+    if (total == 0) {
+        return -1;
+    }
+    r = wrr_rand_below(total);
+    for (i = 0; i < n; i++) {
+        if (r < w[i]) {
+            *out = i;
+            return 0;
+        }
+        r -= w[i];
+    }
+    return -1; /* unreachable: r < total */
 }
 
 uint32_t mds_wrr_capacity_pick(const uint64_t *free_bytes, uint32_t n)

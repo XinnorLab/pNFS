@@ -64,6 +64,3 @@ entry when it lands.
   base commit (it does not keep the last synced modifications); a full
   run after a targeted run must sync again or push first. Done = the
   script prints which tree it tested (sha + "local mods" / "committed").
-- **Cross-repo manifest check.** `docs/placement-modes/contract-manifest.json`
-  is pinned by a fork unit test (`test_manifest_constants`) by hand; a CI
-  job that diffs the two is Stage C.
