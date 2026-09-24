@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 16:06:08 +0300
-Subject: [PATCH 21/22] fix(ds_connector): an unobserved incarnation on an
+Subject: [PATCH 21/23] fix(ds_connector): an unobserved incarnation on an
  UNKNOWN record is not a binding mismatch
 
 Stand finding (2026-09-24, smart on the lab MDS): with xinas-agent stopped

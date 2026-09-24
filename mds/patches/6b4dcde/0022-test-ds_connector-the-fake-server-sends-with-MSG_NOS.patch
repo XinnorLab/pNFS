@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 16:13:17 +0300
-Subject: [PATCH 22/22] test(ds_connector): the fake server sends with
+Subject: [PATCH 22/23] test(ds_connector): the fake server sends with
  MSG_NOSIGNAL
 
 The streamed-oversize case makes the client close early on purpose; the

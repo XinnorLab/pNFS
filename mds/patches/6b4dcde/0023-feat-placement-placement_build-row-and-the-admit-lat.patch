@@ -1,0 +1,328 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:48:37 +0300
+Subject: [PATCH 23/23] feat(placement): placement_build row and the
+ admit-latency histogram
+
+`config show` reports the build facts in every mode --
+`placement_build = wrr=<0|1> connector=<0|1> prealloc=<0|1>` -- so the
+Stage C helper compares them across MDS instead of reading journals
+(ENABLE_DS_PREALLOC now sets a compile definition like the connector
+option does).  `pnfs_mds_placement_admit_seconds` (the upstream 12-bucket
+histogram with _sum/_count) is observed once per placement_select_gated
+call in every mode, legacy included, and once per
+placement_gate_admit_create, so the LAT-25 row measures the gate alone.
+Design spec section 9 (Stage C additions).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      |  4 ++
+ docs/placement-modes.md             |  8 +++-
+ include/mds_metrics.h               |  4 ++
+ include/placement_modes.h           | 14 +++++++
+ src/cluster/cluster_transport.c     |  2 +
+ src/common/mds_metrics.c            | 15 ++++++++
+ src/fsal_obj/placement_gate.c       | 59 ++++++++++++++++++++++++-----
+ tests/unit/test_cluster_transport.c |  9 +++++
+ tests/unit/test_placement_gate.c    | 29 ++++++++++++++
+ 9 files changed, 133 insertions(+), 11 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index da093dd..dfc9e7c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -174,6 +174,10 @@ if(ENABLE_DS_CONNECTOR)
+ else()
+     message(STATUS "ds_connector: disabled (placement_mode = smart refused at startup)")
+ endif()
++if(ENABLE_DS_PREALLOC)
++    # visible to every TU: `placement_build = … prealloc=1` in config show
++    add_compile_definitions(ENABLE_DS_PREALLOC=1)
++endif()
+ 
+ # Optional codegen opt-ins for measurement runs (both intentionally
+ # OFF: neither belongs in a portable default build).
+diff --git a/docs/placement-modes.md b/docs/placement-modes.md
+index d97f4aa..d781d3d 100644
+--- a/docs/placement-modes.md
++++ b/docs/placement-modes.md
+@@ -201,7 +201,9 @@ the connector's side.
+ - `mds-admin config show --mds-host <cluster_bind_addr> --mds-port <grpc_port>`
+   (the transport listens on the bind address, not loopback):
+   `placement_mode`, `placement_mode_effective`,
+-  `placement_config_generation`, `placement_kernel_id`, the thresholds,
++  `placement_config_generation`, `placement_kernel_id`,
++  `placement_build = wrr=<0|1> connector=<0|1> prealloc=<0|1>` (the build
++  facts `verify` compares across MDS), the thresholds,
+   `ds_capacity_domain.<id>`, in `smart` `placement_readiness`,
+   `placement_connector_config_digest`, `placement_connector_profile_digest`,
+   `placement_connector_last_detail`, and one `placement_ds.<id> = domain=…
+@@ -211,6 +213,10 @@ the connector's side.
+ - Metrics: `pnfs_mds_placement_mode{mode}`,
+   `pnfs_mds_placement_eligible_ds`,
+   `pnfs_mds_placement_rejections_total{reason}`,
++  `pnfs_mds_placement_admit_seconds` (histogram, 100 µs … +Inf with
++  `_sum`/`_count`: time in the gate per selection or create admission,
++  observed in every mode — legacy included — so a legacy-vs-smart
++  comparison measures the gate alone),
+   `pnfs_mds_placement_alias_suspected_total`, plus the upstream
+   `pnfs_mds_placement_degraded_total` when a layout shrank.
+ - Connector: `pnfs_mds_connector_batches_accepted_total`,
+diff --git a/include/mds_metrics.h b/include/mds_metrics.h
+index 05e19c1..162ebc5 100644
+--- a/include/mds_metrics.h
++++ b/include/mds_metrics.h
+@@ -15,6 +15,7 @@
+ #include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stddef.h>
++#include "mds_histogram.h"
+ 
+ /* Live counters (written by hot paths, read by snapshot). */
+ struct mds_metrics {
+@@ -179,6 +180,9 @@ struct mds_branch_metrics {
+     _Atomic uint64_t connector_last_success_mono_ms;   /**< gauge source; 0 = never */
+     _Atomic uint64_t connector_covered_ds;             /**< gauge */
+     _Atomic uint64_t connector_reachable;              /**< gauge 0/1 */
++    /** Time in the placement gate per selection / create admission, every
++     *  mode (legacy included) -- `pnfs_mds_placement_admit_seconds`. */
++    struct mds_histogram placement_admit_hist;
+ 
+     /*
+      * IO_ADVISE accounting (RFC 7862 S15.5).  io_advise_total
+diff --git a/include/placement_modes.h b/include/placement_modes.h
+index 7adb9b9..ca63809 100644
+--- a/include/placement_modes.h
++++ b/include/placement_modes.h
+@@ -69,6 +69,20 @@ enum placement_shrink {
+ #define PM_DEFAULT_CONN_ACCESS_SCOPE "cluster-default"
+ #define PM_CONN_SCOPE                "NEW_ALLOCATION"
+ #define PM_DIGEST_MAX                128
++
++/* Build facts behind the `placement_build` config-show row (design
++ * section 9): the connector client and the enterprise prealloc module are
++ * compile-time options; the kernel identity is reported at run time. */
++#ifdef ENABLE_DS_CONNECTOR
++#define PM_BUILD_CONNECTOR 1
++#else
++#define PM_BUILD_CONNECTOR 0
++#endif
++#ifdef ENABLE_DS_PREALLOC
++#define PM_BUILD_PREALLOC 1
++#else
++#define PM_BUILD_PREALLOC 0
++#endif
+ #define PM_SCOPE_MAX                 64
+ 
+ /* Bounded reason vocabulary of the gate (metrics labels, logs, config show). */
+diff --git a/src/cluster/cluster_transport.c b/src/cluster/cluster_transport.c
+index a5801fc..9118cad 100644
+--- a/src/cluster/cluster_transport.c
++++ b/src/cluster/cluster_transport.c
+@@ -6659,6 +6659,8 @@ static void render_cfg_placement(const struct mds_config *cfg,
+                cfg->placement_config_generation[0] != '\0'
+                    ? cfg->placement_config_generation : "-");
+     RENDER_KEY("placement_kernel_id", "%08x", (unsigned)mds_wrr_kernel_id());
++    RENDER_KEY("placement_build", "wrr=%d connector=%d prealloc=%d",
++               mds_wrr_kernel_id() != 0 ? 1 : 0, PM_BUILD_CONNECTOR, PM_BUILD_PREALLOC);
+     if (cfg->placement_mode_set) {
+         RENDER_KEY("placement_capacity_max_age_ms", "%u",
+                    (unsigned)cfg->placement_capacity_max_age_ms);
+diff --git a/src/common/mds_metrics.c b/src/common/mds_metrics.c
+index cd5d0c0..2a6f9c9 100644
+--- a/src/common/mds_metrics.c
++++ b/src/common/mds_metrics.c
+@@ -618,6 +618,21 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
+             }
+             base += extra;
+         }
++        /* gate latency: one observation per selection or create admission */
++        extra = snprintf(buf + base, cap - (size_t)base,
++            "# HELP pnfs_mds_placement_admit_seconds Time in the placement gate per "
++            "selection or create admission, every mode.\n");
++        if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
++            return -1;
++        }
++        base += extra;
++        extra = mds_histogram_render(&branch->placement_admit_hist,
++                                     "pnfs_mds_placement_admit_seconds",
++                                     buf + base, cap - (size_t)base);
++        if (extra < 0) {
++            return -1;
++        }
++        base += extra;
+         /* connector client */
+         extra = snprintf(buf + base, cap - (size_t)base,
+             "# HELP pnfs_mds_connector_batches_accepted_total Connector batches accepted.\n"
+diff --git a/src/fsal_obj/placement_gate.c b/src/fsal_obj/placement_gate.c
+index db125b2..593ed47 100644
+--- a/src/fsal_obj/placement_gate.c
++++ b/src/fsal_obj/placement_gate.c
+@@ -14,6 +14,7 @@
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdatomic.h>
++#include <time.h>
+ 
+ #include "placement_gate.h"
+ #include "placement.h"
+@@ -1036,13 +1037,21 @@ static void note_refusal(enum placement_reason why)
+     }
+ }
+ 
+-enum mds_status placement_select_gated(bool legacy_policy_enabled,
+-                                       enum mds_placement_policy legacy_policy,
+-                                       const struct mds_ds_info *ds_list, uint32_t n,
+-                                       uint32_t *stripe_count, uint32_t mirror_count,
+-                                       uint32_t stripe_unit, uint64_t rr_key,
+-                                       struct mds_ds_map_entry *entries,
+-                                       enum placement_reason *reason)
++static uint64_t gate_mono_ns(void)
++{
++    struct timespec ts;
++
++    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++
++static enum mds_status select_gated_impl(bool legacy_policy_enabled,
++                                         enum mds_placement_policy legacy_policy,
++                                         const struct mds_ds_info *ds_list, uint32_t n,
++                                         uint32_t *stripe_count, uint32_t mirror_count,
++                                         uint32_t stripe_unit, uint64_t rr_key,
++                                         struct mds_ds_map_entry *entries,
++                                         enum placement_reason *reason)
+ {
+     struct placement_ctx ctx;
+     enum mds_status st;
+@@ -1077,6 +1086,25 @@ enum mds_status placement_select_gated(bool legacy_policy_enabled,
+     return st;
+ }
+ 
++/* Every mode is timed, legacy included, so a legacy-vs-smart comparison of
++ * `pnfs_mds_placement_admit_seconds` measures the gate and nothing else. */
++enum mds_status placement_select_gated(bool legacy_policy_enabled,
++                                       enum mds_placement_policy legacy_policy,
++                                       const struct mds_ds_info *ds_list, uint32_t n,
++                                       uint32_t *stripe_count, uint32_t mirror_count,
++                                       uint32_t stripe_unit, uint64_t rr_key,
++                                       struct mds_ds_map_entry *entries,
++                                       enum placement_reason *reason)
++{
++    uint64_t t0 = gate_mono_ns();
++    enum mds_status st = select_gated_impl(legacy_policy_enabled, legacy_policy, ds_list, n,
++                                           stripe_count, mirror_count, stripe_unit, rr_key,
++                                           entries, reason);
++
++    mds_histogram_observe(&g_branch_metrics.placement_admit_hist, gate_mono_ns() - t0);
++    return st;
++}
++
+ /* -----------------------------------------------------------------------
+  * Create-boundary admission (design section 5a)
+  * ----------------------------------------------------------------------- */
+@@ -1114,9 +1142,9 @@ static void mint_token(struct placement_token *tok, uint32_t ds_id,
+     tok->snapshot_gen = atomic_load_explicit(&g.snapshot_gen, memory_order_acquire);
+ }
+ 
+-enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpose p,
+-                                            struct placement_token *tok,
+-                                            enum placement_reason *reason)
++static enum mds_status admit_create_impl(uint32_t ds_id, enum placement_purpose p,
++                                         struct placement_token *tok,
++                                         enum placement_reason *reason)
+ {
+     struct placement_ctx ctx;
+     struct cap_view_ref *ref;
+@@ -1169,6 +1197,17 @@ enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpo
+     return MDS_OK;
+ }
+ 
++enum mds_status placement_gate_admit_create(uint32_t ds_id, enum placement_purpose p,
++                                            struct placement_token *tok,
++                                            enum placement_reason *reason)
++{
++    uint64_t t0 = gate_mono_ns();
++    enum mds_status st = admit_create_impl(ds_id, p, tok, reason);
++
++    mds_histogram_observe(&g_branch_metrics.placement_admit_hist, gate_mono_ns() - t0);
++    return st;
++}
++
+ /* -----------------------------------------------------------------------
+  * config show support (design section 9)
+  * ----------------------------------------------------------------------- */
+diff --git a/tests/unit/test_cluster_transport.c b/tests/unit/test_cluster_transport.c
+index 89b57b4..fe8e676 100644
+--- a/tests/unit/test_cluster_transport.c
++++ b/tests/unit/test_cluster_transport.c
+@@ -22,6 +22,8 @@
+ #include "test_helpers.h"
+ #include "cluster_transport.h"
+ #include "placement_gate.h"
++#include "placement_modes.h"
++#include "wrr.h"
+ #include "ds_cache.h"
+ #include "mds_catalogue.h"
+ #include "rename_2pc.h"
+@@ -1906,6 +1908,13 @@ static void test_config_show_placement_rows(void)
+     ASSERT_TRUE(strstr(text, "placement_mode_effective = fill\n") != NULL);
+     ASSERT_TRUE(strstr(text, "placement_config_generation = 0000000000000000000000000000000000000000000000000000000000000007\n") != NULL);
+     ASSERT_TRUE(strstr(text, "placement_kernel_id = 58494e01\n") != NULL);
++    {
++        char build_row[96];
++        (void)snprintf(build_row, sizeof(build_row),
++                       "placement_build = wrr=%d connector=%d prealloc=%d\n",
++                       mds_wrr_kernel_id() != 0 ? 1 : 0, PM_BUILD_CONNECTOR, PM_BUILD_PREALLOC);
++        ASSERT_TRUE(strstr(text, build_row) != NULL);
++    }
+     ASSERT_TRUE(strstr(text, "ds_capacity_domain.1 = xi/fs-1\n") != NULL);
+     ASSERT_TRUE(strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE capacity_age_ms=") != NULL);
+     ASSERT_TRUE(strstr(text, "avail=500 total=1000 weight=") != NULL);
+diff --git a/tests/unit/test_placement_gate.c b/tests/unit/test_placement_gate.c
+index bc227f0..397546f 100644
+--- a/tests/unit/test_placement_gate.c
++++ b/tests/unit/test_placement_gate.c
+@@ -1004,6 +1004,34 @@ static void test_singleton_smart_init_and_readiness(void)
+     mds_catalogue_close(cat);
+ }
+ 
++static void test_admit_histogram_counts_every_selection(void)
++{
++    uint64_t c0 = atomic_load(&g_branch_metrics.placement_admit_hist.count);
++    struct mds_ds_info ds[1]; mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
++    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
++    /* legacy (gate not initialised) is observed too: the perf row compares
++     * like with like */
++    ASSERT_EQ(placement_gate_mode(), PM_LEGACY);
++    ASSERT_EQ(placement_select_gated(false, PLACEMENT_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_OK);
++    ASSERT_TRUE(atomic_load(&g_branch_metrics.placement_admit_hist.count) == c0 + 1);
++    struct mds_config cfg = fill_cfg();
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_with_ds(&cat, 0);
++    ASSERT_TRUE(cache != NULL);
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
++    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &half), 0);
++    placement_gate_publish_capacity();
++    sc = 1;
++    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_OK);
++    struct placement_token tok;
++    ASSERT_EQ(placement_gate_admit_create(0, PP_NEW_OBJECT, &tok, &why), MDS_OK);
++    ASSERT_TRUE(atomic_load(&g_branch_metrics.placement_admit_hist.count) == c0 + 3);
++    placement_gate_destroy();
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
+ static void test_select_gated_legacy_path(void)
+ {
+     struct mds_ds_info ds[2];
+@@ -1117,6 +1145,7 @@ int main(void)
+     RUN_TEST(test_singleton_publishes_capacity_from_cache);
+     RUN_TEST(test_singleton_smart_init_and_readiness);
+     RUN_TEST(test_select_gated_legacy_path);
++    RUN_TEST(test_admit_histogram_counts_every_selection);
+     RUN_TEST(test_select_gated_legacy_rr_at2_branch);
+     RUN_TEST(test_registry_view_drives_n_and_aliases_with_a_filtered_list);
+     RUN_TEST(test_ds_admitted_reason_uses_domain_level_verdict);
