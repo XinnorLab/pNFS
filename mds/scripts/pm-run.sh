@@ -34,10 +34,10 @@ cd $REMOTE
 if [ "\$(git rev-parse HEAD)" != "$BASE" ]; then git fetch -q origin && git checkout -q -f $BASE; fi
 git checkout -q -- . && git clean -qfd -e build
 if [ "$SYNC" = 1 ]; then tar xzf /root/pm-sync.tgz -C $REMOTE; fi
-if [ ! -f build/CMakeCache.txt ]; then
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_RONDB=ON -DRonDB_ROOT=/opt/rondb \
-        -DENABLE_EBPF=OFF -DENABLE_TESTS=ON -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=OFF >/dev/null
-fi
+# (re)configure every time: cheap, and new options reach an existing build dir
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_RONDB=ON -DRonDB_ROOT=/opt/rondb \
+    -DENABLE_EBPF=OFF -DENABLE_TESTS=ON -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=OFF \
+    -DENABLE_DS_CONNECTOR=ON >/dev/null
 if ! cmake --build build -j32 > /tmp/pm-build.log 2>&1; then
     grep -E "error|Error|エラー" /tmp/pm-build.log | grep -v "error\.c" | head -40
     echo "PM_RESULT BUILD_FAILED"; exit 1
