@@ -95,3 +95,5 @@ def test_render_show_lists_everything_and_warns_on_differences():
     assert "m3: desired=? effective=legacy" in out and "readiness" not in out
     bad = MdsState(host="m4", ok=False, error="boom")
     assert render_show([bad]) == "m4: UNREADABLE: boom"
+    a.metrics_error = "http://m1:9090/metrics: refused"
+    assert "metrics: unavailable (http://m1:9090/metrics: refused)" in render_show([a])

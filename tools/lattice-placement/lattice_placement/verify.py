@@ -130,6 +130,8 @@ def render_show(states: List[MdsState]) -> str:
         for row in s.ds:
             lines.append(render_row(row))
         m = s.metrics
+        if s.metrics_error:
+            lines.append("  metrics: unavailable (%s)" % s.metrics_error)
         if m:
             elig = m.get("pnfs_mds_placement_eligible_ds")
             rej = {k[len("pnfs_mds_placement_rejections_total{reason=\""):-2]: int(val)

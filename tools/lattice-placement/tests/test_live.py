@@ -75,6 +75,14 @@ def test_state_from_show_smart_partial_and_none():
     assert legacy.mode_effective == "legacy" and legacy.readiness is None and legacy.build == {}
 
 
+def test_is_local_address():
+    from lattice_placement.live import is_local_address
+    assert is_local_address("127.0.0.1")
+    assert is_local_address("localhost")
+    assert not is_local_address("192.0.2.1")          # TEST-NET-1: never ours
+    assert not is_local_address("no-such-host.invalid")
+
+
 def test_read_desired_mode_local_and_ssh(tmp_path, monkeypatch):
     cfg = tmp_path / "mds.conf"
     cfg.write_text("placement_policy = wrr\n")
@@ -90,3 +98,5 @@ def test_read_desired_mode_local_and_ssh(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     assert read_desired_mode("/etc/pnfs-mds/remote.conf", ssh_target="root@10.0.0.1") == "smart"
     assert read_desired_mode("/etc/pnfs-mds/nope.conf", ssh_target="root@10.0.0.1") is None
+    # a local address reads the file directly, never through ssh
+    assert read_desired_mode(str(cfg), ssh_target="root@127.0.0.1") == "fill"

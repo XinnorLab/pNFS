@@ -75,6 +75,7 @@ class MdsState:
     last_detail: Optional[str] = None
     ds: List[DsRow] = field(default_factory=list)
     metrics: Dict[str, float] = field(default_factory=dict)
+    metrics_error: Optional[str] = None     # the scrape failed (e.g. /metrics bound to loopback)
     raw: Dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -85,7 +86,7 @@ class MdsState:
             "readiness": self.readiness.as_dict() if self.readiness else None,
             "config_digest": self.config_digest, "profile_digest": self.profile_digest,
             "last_detail": self.last_detail, "ds": [r.as_dict() for r in self.ds],
-            "metrics": dict(self.metrics),
+            "metrics": dict(self.metrics), "metrics_error": self.metrics_error,
         }
 
 
@@ -210,10 +211,37 @@ def state_from_show(host: str, show: Dict[str, str], metrics: Optional[Dict[str,
 # readers (subprocess / urllib)
 # ---------------------------------------------------------------------------
 
+def is_local_address(host: str) -> bool:
+    """True when `host` is an address of this machine: a UDP socket can be
+    bound to it.  Lets `--ssh` read the local file directly instead of
+    requiring root to ssh into itself."""
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, 0, 0, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    for family, kind, proto, _canon, addr in infos:
+        try:
+            s = socket.socket(family, kind, proto)
+        except OSError:
+            continue
+        try:
+            s.bind(addr)
+            return True
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return False
+
+
 def read_desired_mode(path: str, ssh_target: Optional[str] = None, timeout_s: float = 10.0) -> Optional[str]:
     """The `placement_mode` the file names (legacy when absent), None when
     the file cannot be read."""
     try:
+        if ssh_target and "@" in ssh_target and is_local_address(ssh_target.split("@", 1)[1]):
+            ssh_target = None
         if ssh_target:
             proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", ssh_target, "cat", path],
                                   capture_output=True, text=True, timeout=timeout_s, check=False)
@@ -251,10 +279,14 @@ def read_mds(host: str, *, mds_admin: str = "mds-admin", port: int = 50051,
         return MdsState(host=host, ok=False, desired_mode=desired,
                         error="config show has no placement_mode row: the daemon predates the placement modes")
     metrics: Dict[str, float] = {}
+    metrics_error: Optional[str] = None
     if metrics_port:
+        url = "http://%s:%d/metrics" % (host, metrics_port)
         try:
-            with urllib.request.urlopen("http://%s:%d/metrics" % (host, metrics_port), timeout=timeout_s) as resp:
+            with urllib.request.urlopen(url, timeout=timeout_s) as resp:
                 metrics = parse_metrics(resp.read().decode("utf-8", "replace"))
-        except Exception:      # noqa: BLE001 -- the metrics are secondary; the row says "no metrics"
-            metrics = {}
-    return state_from_show(host, show, metrics, desired)
+        except Exception as exc:      # noqa: BLE001 -- the metrics are secondary; the row says so
+            metrics_error = "%s: %s" % (url, exc)
+    st = state_from_show(host, show, metrics, desired)
+    st.metrics_error = metrics_error
+    return st
