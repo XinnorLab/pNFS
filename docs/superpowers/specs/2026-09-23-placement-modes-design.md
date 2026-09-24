@@ -547,8 +547,7 @@ the connector still stores no placement mode. The CLI helper calls it.
 | stand (node223/node225, box + node 71) | `rr`: 40 files ≈ 20:20 in registry order; `fill` after filling one DS: skew follows free fraction; `smart` with the connector denying one DS: 0 files there, hold-down and recovery visible; existing files untouched; `show`/`verify` output | §7.2–7.6 |
 | perf (stand) | ≥ 3 runs of the create benchmark, `smart` vs legacy: ≤ 5 % create throughput loss, ≤ 10 % p99 placement latency growth | LAT-25 |
 
-Until the gate tests pass on the built MDS, `smart` is documented as
-`NOT_READY` (§7.7).
+**Status (2026-09-24):** the gate tests pass on the built MDS and every stand row above has been run — `rr`/`fill` (`stand-2026-09-23.md`), `smart` with the agent and the connector stopped (`stand-2026-09-24.md`), the two-MDS switch through the helper with `show`/`verify` and the LAT-25 row (`stand-2026-09-24-stage-c.md`: no throughput loss, +1.7 µs per gate call, p99 inside the first bucket). `smart` is no longer documented as `NOT_READY`; what stays open is in `docs/TODO.md`.
 
 ## 14. Out of scope (deferred, recorded in `docs/TODO.md` of this repo)
 
@@ -575,6 +574,7 @@ health; peer-observation freshness for metadata-only MDS.
    all selection sites and the create-boundary split in `proxy_io.c`) →
    B (`smart`, connector client with the binding check, preflight) → C
    (CLI, examples, manifest, stand and perf acceptance).
+   Landed: A at fork `ced2043` (review wave 1) + stand 2026-09-23; B at `ccfbcaa` → `96d02b8` (review wave 2) → `3a76e6c` (stand finding) → `1bbd41d`; C at `2f1b52c` (build row + histogram) with the helper, CI, runbook and stand in this repo (`c3ff56e` … `0c92b87`).
 7. Review findings 1–5 (2026-09-23) are folded in: §5a, §7 (binding),
    §4/§5 (override range and 128-bit check), §7/§10 (readiness split),
    §6 (declared aliases). Each stage ends green on the fork

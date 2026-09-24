@@ -6,6 +6,8 @@
 # Stage A flags and runs the ctest targets matching the regex.
 #
 # Usage: pm-run.sh [--no-sync] <ctest-regex|all|build>
+#   --no-sync tests the PUSHED base commit only (the remote tree is reset);
+#   the PM_TREE line says which tree ran.
 # Env:   FORK (default ~/Documents/GitHub/pnfs-lattice)
 set -u
 FORK=${FORK:-$HOME/Documents/GitHub/pnfs-lattice}
@@ -19,8 +21,12 @@ TAR=/tmp/pm-sync.tgz
 if ! git -C "$FORK" merge-base --is-ancestor "$BASE" "origin/$(git -C "$FORK" rev-parse --abbrev-ref HEAD)" 2>/dev/null; then
     for i in 1 2 3; do git -C "$FORK" push -q origin HEAD 2>/dev/null && break; sleep 8; done
 fi
+MODS=$(git -C "$FORK" ls-files -m -o --exclude-standard | wc -l | tr -d ' ')
 if [ "$SYNC" = 1 ]; then
+    echo "PM_TREE base=${BASE:0:12} local_mods=$MODS (synced)"
     ( cd "$FORK" && git ls-files -m -o --exclude-standard -z | COPYFILE_DISABLE=1 tar --null --no-xattrs -T - -czf "$TAR" ) || exit 1
+else
+    echo "PM_TREE base=${BASE:0:12} committed only (--no-sync ignores $MODS local modification(s))"
     ok=0
     for i in 1 2 3 4; do
         scp -q -o ConnectTimeout=25 -o BatchMode=yes "$TAR" xinas-box:/root/pm-sync.tgz 2>/dev/null && { ok=1; break; }

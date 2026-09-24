@@ -6,15 +6,6 @@ entry when it lands.
 
 ## Placement modes (design `docs/superpowers/specs/2026-09-23-placement-modes-design.md`)
 
-- **Stage C — `lattice-placement` CLI, acceptance.** `mode show |
-  validate | set | verify`, the operations runbook, the stand and
-  performance acceptance rows (§10, §13).  Until then the mode is edited
-  by hand and verified with `mds-admin config show --mds-host <bind addr>
-  --mds-port <grpc_port>` plus `lattice-ds-connector preflight`.
-- **Second connector for MDS 1.** The lab runs the connector on node225
-  (MDS 2) only; MDS 1 in `smart` reports `coverage=none` and refuses new
-  placements by design. Done = the connector installed on node223 with
-  the viewer token and the same config (Stage C acceptance for two MDS).
 - **Live cluster-wide switch (CLI-05)**, `mirror_count > 1` in `smart`,
   `ENABLE_DS_PREALLOC=ON` with `smart` (LAT-18), per-filesystem mode
   override, health-driven rebalance: out of scope (spec §14).
@@ -25,10 +16,10 @@ entry when it lands.
 - **`config show` buffer.** Per-DS rows are appended to the 8 KiB
   response; on large clusters use the `placement_ds.<id>` filter.  Done =
   a paged or larger admin response in upstream.
-- **Adversarial review 2026-09-23, carried over.** (1) LAT-25 performance
-  budget is unmeasured: the create boundary runs the gate per stripe
-  slot; O(rows) per call after wave 1, but no benchmark vs legacy yet
-  (Stage C acceptance row). (2) `config show` prints four placement keys
+- **Adversarial review 2026-09-23, carried over.** (1) LAT-25 measured
+  2026-09-24 (`stand-2026-09-24-stage-c.md`): no throughput loss, +1.7 µs
+  per gate call; still open is the same row on a cluster with many DS
+  (the gate is O(registered DS) per call). (2) `config show` prints four placement keys
   in legacy mode too (additive, needed by `mode show`); the log line is
   the only legacy-visible text kept identical. (3) Upstream bug found
   during the work: `promote_inline_to_ds` loops over the *requested*
@@ -60,7 +51,18 @@ entry when it lands.
   is 123 bytes on the lab; the MDS row holds 127. A longer device path
   makes the record a shape error. Done = a length rule in
   `profile-xinas-mvp.md` (or a shorter domain form) and a connector-side
-  check. (2) `pm-run.sh --no-sync` resets the remote tree to the pushed
-  base commit (it does not keep the last synced modifications); a full
-  run after a targeted run must sync again or push first. Done = the
-  script prints which tree it tested (sha + "local mods" / "committed").
+  check. (2) `pm-run.sh` now prints the tree it tests (`PM_TREE …`);
+  `--no-sync` still means "the pushed base commit, no local changes".
+- **Stage C stand 2026-09-24, carried over.** (1) A connector just
+  (re)started reports its DS `VALID allowed=False RECOVERY_HOLD_DOWN`
+  for the hold-down window and `preflight` says READY (the record is
+  VALID and bound); an operator switching inside that window sees
+  `CONNECTOR_DENIED` for a few seconds. Done = `preflight` prints the
+  hold-down remaining as a note (or waits for it with `--wait`). (2)
+  The MDS metrics listener resets a connection now and then (`Connection
+  reset by peer` on `/metrics`); the helper retries once. Done = an
+  upstream look at the metrics HTTP server's accept/close path.
+- **Profile reload and clock-step rows** (from the wave-2 list above)
+  and the LAT-25 row on a many-DS cluster remain the open acceptance
+  rows; the `verify`-driven switch, partial coverage and the
+  `DESIRED_NE_EFFECTIVE` gate are covered by `stand-2026-09-24-stage-c.md`.
