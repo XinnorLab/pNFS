@@ -1,0 +1,919 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 11:14:34 +0300
+Subject: [PATCH 14/19] feat(config): ds_connector_* keys for placement_mode =
+ smart; vendor jsmn; ENABLE_DS_CONNECTOR option
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .github/workflows/placement-modes.yml |   6 +-
+ CMakeLists.txt                        |   8 +
+ deps/jsmn/README                      |   8 +
+ deps/jsmn/jsmn.h                      | 471 ++++++++++++++++++++++++++
+ docs/config-keys.md                   |  10 +
+ include/placement_modes.h             |  23 ++
+ include/pnfs_mds.h                    |  12 +
+ src/common/config.c                   |  67 ++++
+ src/common/placement_config.c         |  45 ++-
+ src/mds/CMakeLists.txt                |   1 +
+ tests/unit/test_placement_config.c    |  76 ++++-
+ 11 files changed, 720 insertions(+), 7 deletions(-)
+ create mode 100644 deps/jsmn/README
+ create mode 100644 deps/jsmn/jsmn.h
+
+diff --git a/.github/workflows/placement-modes.yml b/.github/workflows/placement-modes.yml
+index db561e4..8895fd5 100644
+--- a/.github/workflows/placement-modes.yml
++++ b/.github/workflows/placement-modes.yml
+@@ -14,7 +14,7 @@ permissions:
+ 
+ jobs:
+   build-test-prove:
+-    name: Build, test, prove (ENABLE_WRR=ON, ENABLE_DS_PREALLOC=OFF)
++    name: Build, test, prove (ENABLE_WRR=ON, ENABLE_DS_CONNECTOR=ON, ENABLE_DS_PREALLOC=OFF)
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
+@@ -27,7 +27,7 @@ jobs:
+       - name: Configure
+         run: |
+           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTS=ON \
+-            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=OFF
++            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=OFF -DENABLE_DS_CONNECTOR=ON
+       - name: Build
+         run: cmake --build build -j"$(nproc)"
+       - name: Unit and integration tests
+@@ -60,5 +60,5 @@ jobs:
+       - name: Configure and build the core library
+         run: |
+           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTS=OFF \
+-            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=ON
++            -DENABLE_EBPF=OFF -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=ON -DENABLE_DS_CONNECTOR=ON
+           cmake --build build -j"$(nproc)" --target pnfs_mds_core
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b79ebdf..da093dd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -73,6 +73,7 @@ option(ENABLE_LAYOUT_COMMIT_AGGREGATOR "Enable LAYOUTCOMMIT aggregator module (e
+ option(ENABLE_DS_GC         "Enable ds_gc module (enterprise-only)" ON)
+ option(ENABLE_DS_PREALLOC   "Enable ds_prealloc module (enterprise-only)" OFF)
+ option(ENABLE_WRR           "Enable wrr module (enterprise-only)" OFF)
++option(ENABLE_DS_CONNECTOR  "Enable the placement DS connector client (placement_mode = smart)" OFF)
+ option(ENABLE_QUOTA         "Enable quota module (enterprise-only)" OFF)
+ 
+ if(ENABLE_RONDB)
+@@ -167,6 +168,13 @@ endif()
+ # must never be relied on for control flow either way.
+ option(ENABLE_RELEASE_ASSERTS "Keep assert() enabled in Release builds" ON)
+ 
++if(ENABLE_DS_CONNECTOR)
++    add_compile_definitions(ENABLE_DS_CONNECTOR=1)
++    message(STATUS "ds_connector: enabled (placement_mode = smart available)")
++else()
++    message(STATUS "ds_connector: disabled (placement_mode = smart refused at startup)")
++endif()
++
+ # Optional codegen opt-ins for measurement runs (both intentionally
+ # OFF: neither belongs in a portable default build).
+ option(ENABLE_LTO         "Enable link-time optimisation" OFF)
+diff --git a/deps/jsmn/README b/deps/jsmn/README
+new file mode 100644
+index 0000000..6c4f743
+--- /dev/null
++++ b/deps/jsmn/README
+@@ -0,0 +1,8 @@
++jsmn -- minimalistic JSON tokenizer, vendored for the placement DS connector
++client (src/mds/ds_connector.c).
++
++Source:  https://github.com/zserge/jsmn
++Commit:  25647e692c7906b96ffd2b05ca54c097948e879c
++Licence: MIT (header kept verbatim in jsmn.h)
++Build:   included once with JSMN_STATIC, JSMN_PARENT_LINKS and JSMN_STRICT
++         defined by the including translation unit.
+diff --git a/deps/jsmn/jsmn.h b/deps/jsmn/jsmn.h
+new file mode 100644
+index 0000000..8ac14c1
+--- /dev/null
++++ b/deps/jsmn/jsmn.h
+@@ -0,0 +1,471 @@
++/*
++ * MIT License
++ *
++ * Copyright (c) 2010 Serge Zaitsev
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#ifndef JSMN_H
++#define JSMN_H
++
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifdef JSMN_STATIC
++#define JSMN_API static
++#else
++#define JSMN_API extern
++#endif
++
++/**
++ * JSON type identifier. Basic types are:
++ * 	o Object
++ * 	o Array
++ * 	o String
++ * 	o Other primitive: number, boolean (true/false) or null
++ */
++typedef enum {
++  JSMN_UNDEFINED = 0,
++  JSMN_OBJECT = 1 << 0,
++  JSMN_ARRAY = 1 << 1,
++  JSMN_STRING = 1 << 2,
++  JSMN_PRIMITIVE = 1 << 3
++} jsmntype_t;
++
++enum jsmnerr {
++  /* Not enough tokens were provided */
++  JSMN_ERROR_NOMEM = -1,
++  /* Invalid character inside JSON string */
++  JSMN_ERROR_INVAL = -2,
++  /* The string is not a full JSON packet, more bytes expected */
++  JSMN_ERROR_PART = -3
++};
++
++/**
++ * JSON token description.
++ * type		type (object, array, string etc.)
++ * start	start position in JSON data string
++ * end		end position in JSON data string
++ */
++typedef struct jsmntok {
++  jsmntype_t type;
++  int start;
++  int end;
++  int size;
++#ifdef JSMN_PARENT_LINKS
++  int parent;
++#endif
++} jsmntok_t;
++
++/**
++ * JSON parser. Contains an array of token blocks available. Also stores
++ * the string being parsed now and current position in that string.
++ */
++typedef struct jsmn_parser {
++  unsigned int pos;     /* offset in the JSON string */
++  unsigned int toknext; /* next token to allocate */
++  int toksuper;         /* superior token node, e.g. parent object or array */
++} jsmn_parser;
++
++/**
++ * Create JSON parser over an array of tokens
++ */
++JSMN_API void jsmn_init(jsmn_parser *parser);
++
++/**
++ * Run JSON parser. It parses a JSON data string into and array of tokens, each
++ * describing
++ * a single JSON object.
++ */
++JSMN_API int jsmn_parse(jsmn_parser *parser, const char *js, const size_t len,
++                        jsmntok_t *tokens, const unsigned int num_tokens);
++
++#ifndef JSMN_HEADER
++/**
++ * Allocates a fresh unused token from the token pool.
++ */
++static jsmntok_t *jsmn_alloc_token(jsmn_parser *parser, jsmntok_t *tokens,
++                                   const size_t num_tokens) {
++  jsmntok_t *tok;
++  if (parser->toknext >= num_tokens) {
++    return NULL;
++  }
++  tok = &tokens[parser->toknext++];
++  tok->start = tok->end = -1;
++  tok->size = 0;
++#ifdef JSMN_PARENT_LINKS
++  tok->parent = -1;
++#endif
++  return tok;
++}
++
++/**
++ * Fills token type and boundaries.
++ */
++static void jsmn_fill_token(jsmntok_t *token, const jsmntype_t type,
++                            const int start, const int end) {
++  token->type = type;
++  token->start = start;
++  token->end = end;
++  token->size = 0;
++}
++
++/**
++ * Fills next available token with JSON primitive.
++ */
++static int jsmn_parse_primitive(jsmn_parser *parser, const char *js,
++                                const size_t len, jsmntok_t *tokens,
++                                const size_t num_tokens) {
++  jsmntok_t *token;
++  int start;
++
++  start = parser->pos;
++
++  for (; parser->pos < len && js[parser->pos] != '\0'; parser->pos++) {
++    switch (js[parser->pos]) {
++#ifndef JSMN_STRICT
++    /* In strict mode primitive must be followed by "," or "}" or "]" */
++    case ':':
++#endif
++    case '\t':
++    case '\r':
++    case '\n':
++    case ' ':
++    case ',':
++    case ']':
++    case '}':
++      goto found;
++    default:
++                   /* to quiet a warning from gcc*/
++      break;
++    }
++    if (js[parser->pos] < 32 || js[parser->pos] >= 127) {
++      parser->pos = start;
++      return JSMN_ERROR_INVAL;
++    }
++  }
++#ifdef JSMN_STRICT
++  /* In strict mode primitive must be followed by a comma/object/array */
++  parser->pos = start;
++  return JSMN_ERROR_PART;
++#endif
++
++found:
++  if (tokens == NULL) {
++    parser->pos--;
++    return 0;
++  }
++  token = jsmn_alloc_token(parser, tokens, num_tokens);
++  if (token == NULL) {
++    parser->pos = start;
++    return JSMN_ERROR_NOMEM;
++  }
++  jsmn_fill_token(token, JSMN_PRIMITIVE, start, parser->pos);
++#ifdef JSMN_PARENT_LINKS
++  token->parent = parser->toksuper;
++#endif
++  parser->pos--;
++  return 0;
++}
++
++/**
++ * Fills next token with JSON string.
++ */
++static int jsmn_parse_string(jsmn_parser *parser, const char *js,
++                             const size_t len, jsmntok_t *tokens,
++                             const size_t num_tokens) {
++  jsmntok_t *token;
++
++  int start = parser->pos;
++  
++  /* Skip starting quote */
++  parser->pos++;
++  
++  for (; parser->pos < len && js[parser->pos] != '\0'; parser->pos++) {
++    char c = js[parser->pos];
++
++    /* Quote: end of string */
++    if (c == '\"') {
++      if (tokens == NULL) {
++        return 0;
++      }
++      token = jsmn_alloc_token(parser, tokens, num_tokens);
++      if (token == NULL) {
++        parser->pos = start;
++        return JSMN_ERROR_NOMEM;
++      }
++      jsmn_fill_token(token, JSMN_STRING, start + 1, parser->pos);
++#ifdef JSMN_PARENT_LINKS
++      token->parent = parser->toksuper;
++#endif
++      return 0;
++    }
++
++    /* Backslash: Quoted symbol expected */
++    if (c == '\\' && parser->pos + 1 < len) {
++      int i;
++      parser->pos++;
++      switch (js[parser->pos]) {
++      /* Allowed escaped symbols */
++      case '\"':
++      case '/':
++      case '\\':
++      case 'b':
++      case 'f':
++      case 'r':
++      case 'n':
++      case 't':
++        break;
++      /* Allows escaped symbol \uXXXX */
++      case 'u':
++        parser->pos++;
++        for (i = 0; i < 4 && parser->pos < len && js[parser->pos] != '\0';
++             i++) {
++          /* If it isn't a hex character we have an error */
++          if (!((js[parser->pos] >= 48 && js[parser->pos] <= 57) ||   /* 0-9 */
++                (js[parser->pos] >= 65 && js[parser->pos] <= 70) ||   /* A-F */
++                (js[parser->pos] >= 97 && js[parser->pos] <= 102))) { /* a-f */
++            parser->pos = start;
++            return JSMN_ERROR_INVAL;
++          }
++          parser->pos++;
++        }
++        parser->pos--;
++        break;
++      /* Unexpected symbol */
++      default:
++        parser->pos = start;
++        return JSMN_ERROR_INVAL;
++      }
++    }
++  }
++  parser->pos = start;
++  return JSMN_ERROR_PART;
++}
++
++/**
++ * Parse JSON string and fill tokens.
++ */
++JSMN_API int jsmn_parse(jsmn_parser *parser, const char *js, const size_t len,
++                        jsmntok_t *tokens, const unsigned int num_tokens) {
++  int r;
++  int i;
++  jsmntok_t *token;
++  int count = parser->toknext;
++
++  for (; parser->pos < len && js[parser->pos] != '\0'; parser->pos++) {
++    char c;
++    jsmntype_t type;
++
++    c = js[parser->pos];
++    switch (c) {
++    case '{':
++    case '[':
++      count++;
++      if (tokens == NULL) {
++        break;
++      }
++      token = jsmn_alloc_token(parser, tokens, num_tokens);
++      if (token == NULL) {
++        return JSMN_ERROR_NOMEM;
++      }
++      if (parser->toksuper != -1) {
++        jsmntok_t *t = &tokens[parser->toksuper];
++#ifdef JSMN_STRICT
++        /* In strict mode an object or array can't become a key */
++        if (t->type == JSMN_OBJECT) {
++          return JSMN_ERROR_INVAL;
++        }
++#endif
++        t->size++;
++#ifdef JSMN_PARENT_LINKS
++        token->parent = parser->toksuper;
++#endif
++      }
++      token->type = (c == '{' ? JSMN_OBJECT : JSMN_ARRAY);
++      token->start = parser->pos;
++      parser->toksuper = parser->toknext - 1;
++      break;
++    case '}':
++    case ']':
++      if (tokens == NULL) {
++        break;
++      }
++      type = (c == '}' ? JSMN_OBJECT : JSMN_ARRAY);
++#ifdef JSMN_PARENT_LINKS
++      if (parser->toknext < 1) {
++        return JSMN_ERROR_INVAL;
++      }
++      token = &tokens[parser->toknext - 1];
++      for (;;) {
++        if (token->start != -1 && token->end == -1) {
++          if (token->type != type) {
++            return JSMN_ERROR_INVAL;
++          }
++          token->end = parser->pos + 1;
++          parser->toksuper = token->parent;
++          break;
++        }
++        if (token->parent == -1) {
++          if (token->type != type || parser->toksuper == -1) {
++            return JSMN_ERROR_INVAL;
++          }
++          break;
++        }
++        token = &tokens[token->parent];
++      }
++#else
++      for (i = parser->toknext - 1; i >= 0; i--) {
++        token = &tokens[i];
++        if (token->start != -1 && token->end == -1) {
++          if (token->type != type) {
++            return JSMN_ERROR_INVAL;
++          }
++          parser->toksuper = -1;
++          token->end = parser->pos + 1;
++          break;
++        }
++      }
++      /* Error if unmatched closing bracket */
++      if (i == -1) {
++        return JSMN_ERROR_INVAL;
++      }
++      for (; i >= 0; i--) {
++        token = &tokens[i];
++        if (token->start != -1 && token->end == -1) {
++          parser->toksuper = i;
++          break;
++        }
++      }
++#endif
++      break;
++    case '\"':
++      r = jsmn_parse_string(parser, js, len, tokens, num_tokens);
++      if (r < 0) {
++        return r;
++      }
++      count++;
++      if (parser->toksuper != -1 && tokens != NULL) {
++        tokens[parser->toksuper].size++;
++      }
++      break;
++    case '\t':
++    case '\r':
++    case '\n':
++    case ' ':
++      break;
++    case ':':
++      parser->toksuper = parser->toknext - 1;
++      break;
++    case ',':
++      if (tokens != NULL && parser->toksuper != -1 &&
++          tokens[parser->toksuper].type != JSMN_ARRAY &&
++          tokens[parser->toksuper].type != JSMN_OBJECT) {
++#ifdef JSMN_PARENT_LINKS
++        parser->toksuper = tokens[parser->toksuper].parent;
++#else
++        for (i = parser->toknext - 1; i >= 0; i--) {
++          if (tokens[i].type == JSMN_ARRAY || tokens[i].type == JSMN_OBJECT) {
++            if (tokens[i].start != -1 && tokens[i].end == -1) {
++              parser->toksuper = i;
++              break;
++            }
++          }
++        }
++#endif
++      }
++      break;
++#ifdef JSMN_STRICT
++    /* In strict mode primitives are: numbers and booleans */
++    case '-':
++    case '0':
++    case '1':
++    case '2':
++    case '3':
++    case '4':
++    case '5':
++    case '6':
++    case '7':
++    case '8':
++    case '9':
++    case 't':
++    case 'f':
++    case 'n':
++      /* And they must not be keys of the object */
++      if (tokens != NULL && parser->toksuper != -1) {
++        const jsmntok_t *t = &tokens[parser->toksuper];
++        if (t->type == JSMN_OBJECT ||
++            (t->type == JSMN_STRING && t->size != 0)) {
++          return JSMN_ERROR_INVAL;
++        }
++      }
++#else
++    /* In non-strict mode every unquoted value is a primitive */
++    default:
++#endif
++      r = jsmn_parse_primitive(parser, js, len, tokens, num_tokens);
++      if (r < 0) {
++        return r;
++      }
++      count++;
++      if (parser->toksuper != -1 && tokens != NULL) {
++        tokens[parser->toksuper].size++;
++      }
++      break;
++
++#ifdef JSMN_STRICT
++    /* Unexpected char in strict mode */
++    default:
++      return JSMN_ERROR_INVAL;
++#endif
++    }
++  }
++
++  if (tokens != NULL) {
++    for (i = parser->toknext - 1; i >= 0; i--) {
++      /* Unmatched opened object or array */
++      if (tokens[i].start != -1 && tokens[i].end == -1) {
++        return JSMN_ERROR_PART;
++      }
++    }
++  }
++
++  return count;
++}
++
++/**
++ * Creates a new parser based over a given buffer with an array of tokens
++ * available.
++ */
++JSMN_API void jsmn_init(jsmn_parser *parser) {
++  parser->pos = 0;
++  parser->toknext = 0;
++  parser->toksuper = -1;
++}
++
++#endif /* JSMN_HEADER */
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* JSMN_H */
+diff --git a/docs/config-keys.md b/docs/config-keys.md
+index 8dfd4e3..c203ac9 100644
+--- a/docs/config-keys.md
++++ b/docs/config-keys.md
+@@ -91,6 +91,16 @@ the legacy keys behave exactly as documented above.
+ - `placement_domain_weight.<domain>` — manual base weight of a domain (1..10000); smart only, needs the flag above (`DOMAIN_WEIGHT_FORBIDDEN` otherwise).
+ - `ds_weight.<id>` is a conflict in `fill` (`PLACEMENT_MODE_CONFLICT`).
+ - `fill`/`smart` require `ds_capacity_poll_ms > 0` (`RANGE`).
++Connector client keys (`smart` only; the connector is a prerequisite of the
++mode, `ds_connector_enabled` is derived from it and an explicit
++contradiction is `PLACEMENT_MODE_CONFLICT`):
++- `ds_connector_socket` — absolute path of the per-MDS `lattice-ds-connector` Unix socket.  Default: `/run/lattice-ds-connector/connector.sock`.
++- `ds_connector_poll_ms` — poll interval (200..10000).  Default: 1000.
++- `ds_connector_request_deadline_ms` — connect + read deadline per poll (50..poll).  Default: 500.
++- `ds_connector_expected_contract_major` — accepted `contract_version` major.  Default: 1.
++- `ds_connector_max_ds` — highest accepted `ds_id` count (1..256).  Default: 256.
++- `ds_connector_access_scope` — required `access_scope_id` of every assessment.  Default: `cluster-default`.
++- `ds_connector_expected_profile_digest` / `ds_connector_expected_config_digest` — optional pins; a batch or record with another digest is dropped.
+ The daemon logs `placement_mode=<mode> generation=<sha256[:12]> …` at startup; `placement_config_generation` (a SHA-256 of the managed keys) is what `lattice-placement mode verify` compares across MDS.
+ ## Authentication
+ - `nfs_auth_mode` — `sys|krb5|krb5i|krb5p`.
+diff --git a/include/placement_modes.h b/include/placement_modes.h
+index d581243..c4f8883 100644
+--- a/include/placement_modes.h
++++ b/include/placement_modes.h
+@@ -48,6 +48,29 @@ enum placement_shrink {
+ #define PM_WEIGHT_SCALE             65536u
+ #define PM_MAX_DOMAINS              256   /* == MDS_MAX_DS_NODES; asserted in placement_config.c */
+ 
++/* Connector client (placement_mode = smart), design section 7. */
++#define PM_KEY_CONN_ENABLED          "ds_connector_enabled"
++#define PM_KEY_CONN_SOCKET           "ds_connector_socket"
++#define PM_KEY_CONN_POLL_MS          "ds_connector_poll_ms"
++#define PM_KEY_CONN_DEADLINE_MS      "ds_connector_request_deadline_ms"
++#define PM_KEY_CONN_CONTRACT_MAJOR   "ds_connector_expected_contract_major"
++#define PM_KEY_CONN_MAX_DS           "ds_connector_max_ds"
++#define PM_KEY_CONN_ACCESS_SCOPE     "ds_connector_access_scope"
++#define PM_KEY_CONN_PROFILE_DIGEST   "ds_connector_expected_profile_digest"
++#define PM_KEY_CONN_CONFIG_DIGEST    "ds_connector_expected_config_digest"
++#define PM_DEFAULT_CONN_SOCKET       "/run/lattice-ds-connector/connector.sock"
++#define PM_DEFAULT_CONN_POLL_MS      1000u
++#define PM_CONN_POLL_MS_MIN          200u
++#define PM_CONN_POLL_MS_MAX          10000u
++#define PM_DEFAULT_CONN_DEADLINE_MS  500u
++#define PM_CONN_DEADLINE_MS_MIN      50u
++#define PM_DEFAULT_CONN_CONTRACT_MAJOR 1u
++#define PM_DEFAULT_CONN_MAX_DS       256u
++#define PM_DEFAULT_CONN_ACCESS_SCOPE "cluster-default"
++#define PM_CONN_SCOPE                "NEW_ALLOCATION"
++#define PM_DIGEST_MAX                128
++#define PM_SCOPE_MAX                 64
++
+ /* Bounded reason vocabulary of the gate (metrics labels, logs, config show). */
+ enum placement_reason {
+     PR_NONE = 0,
+diff --git a/include/pnfs_mds.h b/include/pnfs_mds.h
+index cb6833f..db17182 100644
+--- a/include/pnfs_mds.h
++++ b/include/pnfs_mds.h
+@@ -731,6 +731,18 @@ struct mds_config {
+     bool                  placement_allow_manual_base_weights;
+     enum placement_shrink placement_stripe_shrink;
+     char                  placement_config_generation[65];   /* hex sha256; "" in legacy */
++    /* Connector client (smart).  ds_connector_enabled is derived from the
++     * mode; the *_set flag only serves the contradiction check. */
++    bool                  ds_connector_enabled;
++    bool                  ds_connector_enabled_set;
++    char                  ds_connector_socket[MDS_MAX_PATH];
++    uint32_t              ds_connector_poll_ms;
++    uint32_t              ds_connector_request_deadline_ms;
++    uint32_t              ds_connector_expected_contract_major;
++    uint32_t              ds_connector_max_ds;
++    char                  ds_connector_access_scope[PM_SCOPE_MAX];
++    char                  ds_connector_expected_profile_digest[PM_DIGEST_MAX];
++    char                  ds_connector_expected_config_digest[PM_DIGEST_MAX];
+ 
+     /*
+      * Per-DS I/O limit probe interval (milliseconds).  The prober
+diff --git a/src/common/config.c b/src/common/config.c
+index 0685db5..99878aa 100644
+--- a/src/common/config.c
++++ b/src/common/config.c
+@@ -320,6 +320,14 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+     cfg->placement_mode = PM_LEGACY;
+     cfg->placement_capacity_max_age_ms = PM_DEFAULT_CAP_MAX_AGE_MS;
+     cfg->placement_stripe_shrink = PM_SHRINK_ALLOW;
++    (void)snprintf(cfg->ds_connector_socket, sizeof(cfg->ds_connector_socket),
++                   "%s", PM_DEFAULT_CONN_SOCKET);
++    cfg->ds_connector_poll_ms = PM_DEFAULT_CONN_POLL_MS;
++    cfg->ds_connector_request_deadline_ms = PM_DEFAULT_CONN_DEADLINE_MS;
++    cfg->ds_connector_expected_contract_major = PM_DEFAULT_CONN_CONTRACT_MAJOR;
++    cfg->ds_connector_max_ds = PM_DEFAULT_CONN_MAX_DS;
++    (void)snprintf(cfg->ds_connector_access_scope, sizeof(cfg->ds_connector_access_scope),
++                   "%s", PM_DEFAULT_CONN_ACCESS_SCOPE);
+ 
+     /* Per-DS I/O limit (FSINFO) probe interval (ms).  60s by
+      * default; 0 disables and restores the legacy 1 MiB wire
+@@ -1383,6 +1391,63 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+         } else if (strcmp(key, PM_KEY_ALLOW_MANUAL) == 0) {
+             cfg->placement_allow_manual_base_weights =
+                 (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
++        } else if (strcmp(key, PM_KEY_CONN_ENABLED) == 0) {
++            cfg->ds_connector_enabled =
++                (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
++            cfg->ds_connector_enabled_set = true;
++        } else if (strcmp(key, PM_KEY_CONN_SOCKET) == 0) {
++            if (val[0] != '/' || strlen(val) >= sizeof(cfg->ds_connector_socket)) {
++                (void)fprintf(stderr,
++                    "ERROR: %s must be an absolute path shorter than %zu\n",
++                    key, sizeof(cfg->ds_connector_socket));
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
++            (void)snprintf(cfg->ds_connector_socket, sizeof(cfg->ds_connector_socket),
++                           "%s", val);
++        } else if (strcmp(key, PM_KEY_CONN_POLL_MS) == 0 ||
++                   strcmp(key, PM_KEY_CONN_DEADLINE_MS) == 0 ||
++                   strcmp(key, PM_KEY_CONN_CONTRACT_MAJOR) == 0 ||
++                   strcmp(key, PM_KEY_CONN_MAX_DS) == 0) {
++            uint64_t v = 0;
++            if (!parse_u64_strict(val, &v) || v > UINT32_MAX) {
++                (void)fprintf(stderr,
++                    "ERROR: %s='%s' is not a non-negative integer\n", key, val);
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
++            if (strcmp(key, PM_KEY_CONN_POLL_MS) == 0) {
++                cfg->ds_connector_poll_ms = (uint32_t)v;
++            } else if (strcmp(key, PM_KEY_CONN_DEADLINE_MS) == 0) {
++                cfg->ds_connector_request_deadline_ms = (uint32_t)v;
++            } else if (strcmp(key, PM_KEY_CONN_CONTRACT_MAJOR) == 0) {
++                cfg->ds_connector_expected_contract_major = (uint32_t)v;
++            } else {
++                cfg->ds_connector_max_ds = (uint32_t)v;
++            }
++        } else if (strcmp(key, PM_KEY_CONN_ACCESS_SCOPE) == 0 ||
++                   strcmp(key, PM_KEY_CONN_PROFILE_DIGEST) == 0 ||
++                   strcmp(key, PM_KEY_CONN_CONFIG_DIGEST) == 0) {
++            char *dst;
++            size_t dcap;
++            if (strcmp(key, PM_KEY_CONN_ACCESS_SCOPE) == 0) {
++                dst = cfg->ds_connector_access_scope;
++                dcap = sizeof(cfg->ds_connector_access_scope);
++            } else if (strcmp(key, PM_KEY_CONN_PROFILE_DIGEST) == 0) {
++                dst = cfg->ds_connector_expected_profile_digest;
++                dcap = sizeof(cfg->ds_connector_expected_profile_digest);
++            } else {
++                dst = cfg->ds_connector_expected_config_digest;
++                dcap = sizeof(cfg->ds_connector_expected_config_digest);
++            }
++            if (val[0] == '\0' || strlen(val) >= dcap) {
++                (void)fprintf(stderr,
++                    "ERROR: %s must be a non-empty string shorter than %zu\n",
++                    key, dcap);
++                (void)fclose(fp);
++                return MDS_ERR_INVAL;
++            }
++            (void)snprintf(dst, dcap, "%s", val);
+         } else if (strcmp(key, PM_KEY_SHRINK) == 0) {
+             if (strcmp(val, "allow") == 0) {
+                 cfg->placement_stripe_shrink = PM_SHRINK_ALLOW;
+@@ -1630,6 +1695,8 @@ enum mds_status mds_config_load(const char *path, struct mds_config *cfg)
+         cfg->placement_policy_enabled = true;
+         cfg->placement_policy = (cfg->placement_mode == PM_RR)
+             ? PLACEMENT_RR : PLACEMENT_WEIGHTED_RR;
++        /* The connector is a prerequisite of smart, not a separate switch. */
++        cfg->ds_connector_enabled = (cfg->placement_mode == PM_SMART);
+         placement_config_generation(cfg, cfg->placement_config_generation);
+     }
+ 
+diff --git a/src/common/placement_config.c b/src/common/placement_config.c
+index 5767b3d..7e4bd54 100644
+--- a/src/common/placement_config.c
++++ b/src/common/placement_config.c
+@@ -131,15 +131,48 @@ enum mds_status placement_config_validate(const struct mds_config *cfg,
+                 "RANGE: placement_capacity_max_age_ms must exceed ds_capacity_poll_ms");
+         }
+     }
++    /* ds_connector_enabled is derived from the mode; an explicit value that
++     * contradicts it is a mistake, not a setting (design section 4). */
++    if (cfg->ds_connector_enabled_set) {
++        if (cfg->placement_mode == PM_SMART && !cfg->ds_connector_enabled) {
++            return fail(err, cap,
++                "PLACEMENT_MODE_CONFLICT: smart needs the connector; "
++                "ds_connector_enabled = false contradicts placement_mode");
++        }
++        if (cfg->placement_mode != PM_SMART && cfg->ds_connector_enabled) {
++            return fail(err, cap,
++                "PLACEMENT_MODE_CONFLICT: ds_connector_enabled = true is only "
++                "meaningful with placement_mode = smart");
++        }
++    }
+     if (cfg->placement_mode == PM_SMART) {
+         if (cfg->default_mirror_count > 1) {
+             return fail(err, cap,
+                 "MIRROR_COUNT_UNSUPPORTED: smart requires default_mirror_count = 1");
+         }
++        if (cfg->ds_connector_poll_ms < PM_CONN_POLL_MS_MIN ||
++            cfg->ds_connector_poll_ms > PM_CONN_POLL_MS_MAX) {
++            return fail(err, cap,
++                "RANGE: ds_connector_poll_ms must be 200..10000");
++        }
++        if (cfg->ds_connector_request_deadline_ms < PM_CONN_DEADLINE_MS_MIN ||
++            cfg->ds_connector_request_deadline_ms > cfg->ds_connector_poll_ms) {
++            return fail(err, cap,
++                "RANGE: ds_connector_request_deadline_ms must be 50..ds_connector_poll_ms");
++        }
++        if (cfg->ds_connector_max_ds == 0 || cfg->ds_connector_max_ds > MDS_MAX_DS_NODES) {
++            return fail(err, cap, "RANGE: ds_connector_max_ds must be 1..256");
++        }
++        if (cfg->ds_connector_expected_contract_major == 0) {
++            return fail(err, cap, "RANGE: ds_connector_expected_contract_major must be >= 1");
++        }
++        if (cfg->ds_connector_socket[0] != '/') {
++            return fail(err, cap, "RANGE: ds_connector_socket must be an absolute path");
++        }
+ #ifndef ENABLE_DS_CONNECTOR
+         return fail(err, cap,
+             "PLACEMENT_MODE_UNSUPPORTED_BUILD: smart needs a binary built "
+-            "with ENABLE_DS_CONNECTOR=ON (not yet available in this build)");
++            "with ENABLE_DS_CONNECTOR=ON");
+ #endif
+     }
+     return MDS_OK;
+@@ -204,6 +237,16 @@ void placement_config_generation(const struct mds_config *cfg, char out[65])
+     }
+     APPEND("stripe=%u\n", (unsigned)cfg->default_stripe_count);
+     APPEND("mirror=%u\n", (unsigned)cfg->default_mirror_count);
++    if (cfg->placement_mode == PM_SMART) {
++        APPEND("conn_socket=%s\n", cfg->ds_connector_socket);
++        APPEND("conn_poll=%u\n", (unsigned)cfg->ds_connector_poll_ms);
++        APPEND("conn_deadline=%u\n", (unsigned)cfg->ds_connector_request_deadline_ms);
++        APPEND("conn_major=%u\n", (unsigned)cfg->ds_connector_expected_contract_major);
++        APPEND("conn_max_ds=%u\n", (unsigned)cfg->ds_connector_max_ds);
++        APPEND("conn_scope=%s\n", cfg->ds_connector_access_scope);
++        APPEND("conn_profile=%s\n", cfg->ds_connector_expected_profile_digest);
++        APPEND("conn_config=%s\n", cfg->ds_connector_expected_config_digest);
++    }
+ #undef APPEND
+ 
+     (void)SHA256((const unsigned char *)buf, off, digest);
+diff --git a/src/mds/CMakeLists.txt b/src/mds/CMakeLists.txt
+index a82ef47..1726565 100644
+--- a/src/mds/CMakeLists.txt
++++ b/src/mds/CMakeLists.txt
+@@ -95,6 +95,7 @@ endif()
+ 
+ target_include_directories(pnfs_mds_core
+     PUBLIC ${PROJECT_SOURCE_DIR}/include
++    PRIVATE ${PROJECT_SOURCE_DIR}/deps
+     PRIVATE ${PROJECT_SOURCE_DIR}/src/catalogue
+ )
+ 
+diff --git a/tests/unit/test_placement_config.c b/tests/unit/test_placement_config.c
+index a33e9cc..0c4c0e7 100644
+--- a/tests/unit/test_placement_config.c
++++ b/tests/unit/test_placement_config.c
+@@ -88,11 +88,79 @@ static void test_each_mode_parses_with_defaults(void)
+     }
+ }
+ 
+-static void test_smart_is_unsupported_in_this_build(void)
++static void test_smart_parses_with_connector_defaults(void)
+ {
+     struct mds_config cfg; char path[128];
+     ASSERT_EQ(write_tmp_ini("placement_mode = smart\n", path), 0);
+-    ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);   /* ENABLE_DS_CONNECTOR build */
++    ASSERT_EQ(cfg.placement_mode, PM_SMART);
++    ASSERT_EQ(cfg.ds_connector_enabled, true);
++    ASSERT_EQ(cfg.ds_connector_enabled_set, false);
++    ASSERT_EQ(strcmp(cfg.ds_connector_socket, "/run/lattice-ds-connector/connector.sock"), 0);
++    ASSERT_EQ(cfg.ds_connector_poll_ms, 1000u);
++    ASSERT_EQ(cfg.ds_connector_request_deadline_ms, 500u);
++    ASSERT_EQ(cfg.ds_connector_expected_contract_major, 1u);
++    ASSERT_EQ(cfg.ds_connector_max_ds, 256u);
++    ASSERT_EQ(strcmp(cfg.ds_connector_access_scope, "cluster-default"), 0);
++    ASSERT_EQ(cfg.ds_connector_expected_profile_digest[0], '\0');
++    ASSERT_EQ(cfg.placement_policy, PLACEMENT_WEIGHTED_RR);
++    ASSERT_EQ(strlen(cfg.placement_config_generation), 64u);
++    /* explicit, consistent values */
++    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_enabled = true\nds_connector_socket = /tmp/c.sock\nds_connector_poll_ms = 5000\nds_connector_request_deadline_ms = 4000\nds_connector_max_ds = 8\nds_connector_access_scope = lab\nds_connector_expected_profile_digest = sha256:abc\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++    ASSERT_EQ(strcmp(cfg.ds_connector_socket, "/tmp/c.sock"), 0);
++    ASSERT_EQ(cfg.ds_connector_poll_ms, 5000u);
++    ASSERT_EQ(cfg.ds_connector_request_deadline_ms, 4000u);
++    ASSERT_EQ(cfg.ds_connector_max_ds, 8u);
++    ASSERT_EQ(strcmp(cfg.ds_connector_access_scope, "lab"), 0);
++    ASSERT_EQ(strcmp(cfg.ds_connector_expected_profile_digest, "sha256:abc"), 0);
++}
++
++static void test_smart_connector_conflicts_and_ranges(void)
++{
++    const char *bad[] = {
++        "placement_mode = smart\nds_connector_enabled = false\n",
++        "placement_mode = rr\nds_connector_enabled = true\n",
++        "placement_mode = fill\nds_connector_enabled = true\n",
++        "placement_mode = smart\ndefault_mirror_count = 2\n",
++        "placement_mode = smart\nds_capacity_poll_ms = 0\n",
++        "placement_mode = smart\nds_connector_poll_ms = 100\n",
++        "placement_mode = smart\nds_connector_poll_ms = 20000\n",
++        "placement_mode = smart\nds_connector_request_deadline_ms = 2000\n",
++        "placement_mode = smart\nds_connector_request_deadline_ms = 10\n",
++        "placement_mode = smart\nds_connector_max_ds = 0\n",
++        "placement_mode = smart\nds_connector_max_ds = 257\n",
++        "placement_mode = smart\nds_connector_expected_contract_major = 0\n",
++        "placement_mode = smart\nds_connector_socket = relative.sock\n",
++        "placement_mode = smart\nds_connector_poll_ms = 1s\n",
++        "placement_mode = smart\nds_connector_access_scope = \n",
++    };
++    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
++        struct mds_config cfg; char path[128];
++        ASSERT_EQ(write_tmp_ini(bad[i], path), 0);
++        ASSERT_EQ(mds_config_load(path, &cfg), MDS_ERR_INVAL);
++    }
++    /* rr/fill ignore the connector keys other than the enabled switch */
++    struct mds_config cfg; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_connector_socket = /tmp/x.sock\nds_connector_enabled = false\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &cfg), MDS_OK);
++    ASSERT_EQ(cfg.ds_connector_enabled, false);
++}
++
++static void test_generation_covers_connector_keys(void)
++{
++    struct mds_config a, b; char path[128];
++    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_socket = /run/a.sock\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &a), MDS_OK);
++    ASSERT_EQ(write_tmp_ini("placement_mode = smart\nds_connector_socket = /run/b.sock\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
++    ASSERT_TRUE(strcmp(a.placement_config_generation, b.placement_config_generation) != 0);
++    /* in fill the connector keys are not part of the managed set */
++    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_connector_socket = /run/a.sock\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &a), MDS_OK);
++    ASSERT_EQ(write_tmp_ini("placement_mode = fill\nds_connector_socket = /run/b.sock\n", path), 0);
++    ASSERT_EQ(mds_config_load(path, &b), MDS_OK);
++    ASSERT_EQ(strcmp(a.placement_config_generation, b.placement_config_generation), 0);
+ }
+ 
+ static void test_legacy_keys_conflict_with_mode(void)
+@@ -251,7 +319,9 @@ int main(void)
+     printf("test_placement_config\n");
+     RUN_TEST(test_absent_key_is_legacy);
+     RUN_TEST(test_each_mode_parses_with_defaults);
+-    RUN_TEST(test_smart_is_unsupported_in_this_build);
++    RUN_TEST(test_smart_parses_with_connector_defaults);
++    RUN_TEST(test_smart_connector_conflicts_and_ranges);
++    RUN_TEST(test_generation_covers_connector_keys);
+     RUN_TEST(test_legacy_keys_conflict_with_mode);
+     RUN_TEST(test_ranges);
+     RUN_TEST(test_rr_does_not_need_the_probe);

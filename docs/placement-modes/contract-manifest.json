@@ -2,30 +2,335 @@
   "name": "lattice-placement-modes",
   "version": "1.0",
   "design": "docs/superpowers/specs/2026-09-23-placement-modes-design.md",
-  "mds": { "fork": "XinnorLab/pnfs-lattice", "branch": "xinnor/placement-modes", "upstream_base": "6b4dcde3cd6a8b02e8a012695ff0c29e93a0caf4" },
-  "modes": ["rr", "fill", "smart"],
-  "legacy_policy_values": ["rr", "wrr", "weighted_rr", "capacity"],
-  "keys": [
-    { "key": "placement_mode", "values": ["rr", "fill", "smart"], "default": null, "applies_to": ["all"], "note": "absent = legacy placement_policy* behaviour" },
-    { "key": "ds_capacity_poll_ms", "type": "uint32", "default": 60000, "range": [0, 86400000], "applies_to": ["all"], "note": "fill/smart require > 0" },
-    { "key": "placement_capacity_max_age_ms", "type": "uint32", "default": 120000, "range": [1, 86400000], "applies_to": ["fill", "smart"], "note": "must exceed ds_capacity_poll_ms" },
-    { "key": "placement_min_free_bytes", "type": "uint64", "default": 0, "applies_to": ["fill", "smart"], "note": "candidate iff available > value" },
-    { "key": "ds_capacity_domain.<ds_id>", "type": "string", "max_len": 127, "default": null, "applies_to": ["fill", "smart"], "note": "unset = the DS is its own domain" },
-    { "key": "placement_stripe_shrink", "values": ["allow", "strict"], "default": "allow", "applies_to": ["all"] },
-    { "key": "placement_allow_manual_base_weights", "type": "bool", "default": false, "applies_to": ["smart"] },
-    { "key": "placement_domain_weight.<domain>", "type": "uint32", "range": [1, 10000], "default": null, "applies_to": ["smart"], "note": "needs placement_allow_manual_base_weights = true" },
-    { "key": "ds_connector_enabled", "type": "bool", "derived": true, "applies_to": ["smart"], "stage": "B" },
-    { "key": "ds_connector_socket", "type": "path", "default": "/run/lattice-ds-connector/connector.sock", "applies_to": ["smart"], "stage": "B" },
-    { "key": "ds_connector_poll_ms", "type": "uint32", "default": 1000, "range": [200, 10000], "applies_to": ["smart"], "stage": "B" },
-    { "key": "ds_connector_request_deadline_ms", "type": "uint32", "default": 500, "range": [50, 10000], "applies_to": ["smart"], "stage": "B", "note": "<= ds_connector_poll_ms" },
-    { "key": "ds_connector_expected_contract_major", "type": "uint32", "default": 1, "applies_to": ["smart"], "stage": "B" },
-    { "key": "ds_connector_max_ds", "type": "uint32", "default": 256, "range": [1, 256], "applies_to": ["smart"], "stage": "B" }
+  "mds": {
+    "fork": "XinnorLab/pnfs-lattice",
+    "branch": "xinnor/placement-modes",
+    "upstream_base": "6b4dcde3cd6a8b02e8a012695ff0c29e93a0caf4"
+  },
+  "modes": [
+    "rr",
+    "fill",
+    "smart"
   ],
-  "validation_errors": ["PLACEMENT_MODE_CONFLICT", "PLACEMENT_MODE_UNSUPPORTED_BUILD", "RANGE", "DOMAIN_WEIGHT_FORBIDDEN", "MIRROR_COUNT_UNSUPPORTED"],
-  "weight": { "formula": "domain_weight * ppm * scale / n_aliases", "scale": 65536, "ppm_fill": 1000000, "domain_weight_derived_range": [1, 100], "domain_weight_manual_range": [1, 10000], "max_ds": 256, "sum_bound_log2": 62, "min_positive_weight": 256 },
-  "reasons": ["NONE", "DS_OFFLINE", "CAPACITY_UNKNOWN", "CAPACITY_STALE", "CAPACITY_FULL", "DOMAIN_MAP_CONTRADICTION", "SHARED_FS_ALIAS_UNMAPPED", "ASSESSMENT_UNKNOWN", "ASSESSMENT_STALE", "CONNECTOR_DENIED", "ZERO_MULTIPLIER", "NO_BINDING", "NO_ELIGIBLE_DS", "INSUFFICIENT_ELIGIBLE_DS", "MODE_NOT_READY", "WEIGHT_OVERFLOW"],
-  "kernel": { "id": "0x58494e01", "stub_id": 0 },
+  "legacy_policy_values": [
+    "rr",
+    "wrr",
+    "weighted_rr",
+    "capacity"
+  ],
+  "keys": [
+    {
+      "key": "placement_mode",
+      "values": [
+        "rr",
+        "fill",
+        "smart"
+      ],
+      "default": null,
+      "applies_to": [
+        "all"
+      ],
+      "note": "absent = legacy placement_policy* behaviour"
+    },
+    {
+      "key": "ds_capacity_poll_ms",
+      "type": "uint32",
+      "default": 60000,
+      "range": [
+        0,
+        86400000
+      ],
+      "applies_to": [
+        "all"
+      ],
+      "note": "fill/smart require > 0"
+    },
+    {
+      "key": "placement_capacity_max_age_ms",
+      "type": "uint32",
+      "default": 120000,
+      "range": [
+        1,
+        86400000
+      ],
+      "applies_to": [
+        "fill",
+        "smart"
+      ],
+      "note": "must exceed ds_capacity_poll_ms"
+    },
+    {
+      "key": "placement_min_free_bytes",
+      "type": "uint64",
+      "default": 0,
+      "applies_to": [
+        "fill",
+        "smart"
+      ],
+      "note": "candidate iff available > value"
+    },
+    {
+      "key": "ds_capacity_domain.<ds_id>",
+      "type": "string",
+      "max_len": 127,
+      "default": null,
+      "applies_to": [
+        "fill",
+        "smart"
+      ],
+      "note": "unset = the DS is its own domain"
+    },
+    {
+      "key": "placement_stripe_shrink",
+      "values": [
+        "allow",
+        "strict"
+      ],
+      "default": "allow",
+      "applies_to": [
+        "all"
+      ]
+    },
+    {
+      "key": "placement_allow_manual_base_weights",
+      "type": "bool",
+      "default": false,
+      "applies_to": [
+        "smart"
+      ]
+    },
+    {
+      "key": "placement_domain_weight.<domain>",
+      "type": "uint32",
+      "range": [
+        1,
+        10000
+      ],
+      "default": null,
+      "applies_to": [
+        "smart"
+      ],
+      "note": "needs placement_allow_manual_base_weights = true"
+    },
+    {
+      "key": "ds_connector_enabled",
+      "type": "bool",
+      "derived": true,
+      "applies_to": [
+        "smart"
+      ],
+      "implemented": "B"
+    },
+    {
+      "key": "ds_connector_socket",
+      "type": "path",
+      "default": "/run/lattice-ds-connector/connector.sock",
+      "applies_to": [
+        "smart"
+      ],
+      "implemented": "B"
+    },
+    {
+      "key": "ds_connector_poll_ms",
+      "type": "uint32",
+      "default": 1000,
+      "range": [
+        200,
+        10000
+      ],
+      "applies_to": [
+        "smart"
+      ],
+      "implemented": "B"
+    },
+    {
+      "key": "ds_connector_request_deadline_ms",
+      "type": "uint32",
+      "default": 500,
+      "range": [
+        50,
+        10000
+      ],
+      "applies_to": [
+        "smart"
+      ],
+      "note": "<= ds_connector_poll_ms",
+      "implemented": "B"
+    },
+    {
+      "key": "ds_connector_expected_contract_major",
+      "type": "uint32",
+      "default": 1,
+      "applies_to": [
+        "smart"
+      ],
+      "implemented": "B"
+    },
+    {
+      "key": "ds_connector_max_ds",
+      "type": "uint32",
+      "default": 256,
+      "range": [
+        1,
+        256
+      ],
+      "applies_to": [
+        "smart"
+      ],
+      "implemented": "B"
+    },
+    {
+      "key": "ds_connector_access_scope",
+      "type": "string",
+      "default": "cluster-default",
+      "applies_to": [
+        "smart"
+      ],
+      "implemented": "B",
+      "note": "required access_scope_id of every assessment"
+    },
+    {
+      "key": "ds_connector_expected_profile_digest",
+      "type": "string",
+      "default": null,
+      "applies_to": [
+        "smart"
+      ],
+      "implemented": "B",
+      "note": "optional pin"
+    },
+    {
+      "key": "ds_connector_expected_config_digest",
+      "type": "string",
+      "default": null,
+      "applies_to": [
+        "smart"
+      ],
+      "implemented": "B",
+      "note": "optional pin"
+    }
+  ],
+  "validation_errors": [
+    "PLACEMENT_MODE_CONFLICT",
+    "PLACEMENT_MODE_UNSUPPORTED_BUILD",
+    "RANGE",
+    "DOMAIN_WEIGHT_FORBIDDEN",
+    "MIRROR_COUNT_UNSUPPORTED"
+  ],
+  "weight": {
+    "formula": "domain_weight * ppm * scale / n_aliases",
+    "scale": 65536,
+    "ppm_fill": 1000000,
+    "domain_weight_derived_range": [
+      1,
+      100
+    ],
+    "domain_weight_manual_range": [
+      1,
+      10000
+    ],
+    "max_ds": 256,
+    "sum_bound_log2": 62,
+    "min_positive_weight": 256
+  },
+  "reasons": [
+    "NONE",
+    "DS_OFFLINE",
+    "CAPACITY_UNKNOWN",
+    "CAPACITY_STALE",
+    "CAPACITY_FULL",
+    "DOMAIN_MAP_CONTRADICTION",
+    "SHARED_FS_ALIAS_UNMAPPED",
+    "ASSESSMENT_UNKNOWN",
+    "ASSESSMENT_STALE",
+    "CONNECTOR_DENIED",
+    "ZERO_MULTIPLIER",
+    "NO_BINDING",
+    "NO_ELIGIBLE_DS",
+    "INSUFFICIENT_ELIGIBLE_DS",
+    "MODE_NOT_READY",
+    "WEIGHT_OVERFLOW",
+    "DOMAIN_MAP_MISMATCH"
+  ],
+  "kernel": {
+    "id": "0x58494e01",
+    "stub_id": 0
+  },
   "token_max_age_ms": 2000,
-  "config_show_keys": ["placement_mode", "placement_mode_effective", "placement_config_generation", "placement_kernel_id", "placement_capacity_max_age_ms", "placement_min_free_bytes", "placement_stripe_shrink", "ds_capacity_domain.<id>", "placement_ds.<id>"],
-  "metrics": ["pnfs_mds_placement_mode", "pnfs_mds_placement_eligible_ds", "pnfs_mds_placement_rejections_total", "pnfs_mds_placement_alias_suspected_total"]
+  "config_show_keys": [
+    "placement_mode",
+    "placement_mode_effective",
+    "placement_config_generation",
+    "placement_kernel_id",
+    "placement_capacity_max_age_ms",
+    "placement_min_free_bytes",
+    "placement_stripe_shrink",
+    "ds_capacity_domain.<id>",
+    "placement_ds.<id>",
+    "placement_readiness",
+    "placement_connector_config_digest",
+    "placement_connector_profile_digest",
+    "placement_connector_last_detail"
+  ],
+  "metrics": [
+    "pnfs_mds_placement_mode",
+    "pnfs_mds_placement_eligible_ds",
+    "pnfs_mds_placement_rejections_total",
+    "pnfs_mds_placement_alias_suspected_total",
+    "pnfs_mds_connector_batches_accepted_total",
+    "pnfs_mds_connector_batches_dropped_total",
+    "pnfs_mds_connector_poll_errors_total",
+    "pnfs_mds_connector_covered_ds",
+    "pnfs_mds_connector_reachable",
+    "pnfs_mds_connector_last_success_mono_ms"
+  ],
+  "connector_client": {
+    "contract_version_major": 1,
+    "scope": "NEW_ALLOCATION",
+    "endpoint_rule": "endpoint.server == registry.host; endpoint.port == registry.tcp_port when both set; registry.export_path == endpoint.export_path or lies under it",
+    "binding_pin": [
+      "connector_instance_id",
+      "binding_generation",
+      "datastore_id",
+      "target_id",
+      "target_incarnation",
+      "profile.digest",
+      "access_scope_id"
+    ],
+    "rebind_rule": "a strictly higher binding_generation re-pins and leaves the DS UNKNOWN for that batch; any other change is BINDING_MISMATCH",
+    "batch_drops": [
+      "JSON",
+      "SCHEMA",
+      "CONTRACT_MAJOR",
+      "REPLAY",
+      "OLD_GENERATED_AT",
+      "CONFIG_DIGEST",
+      "TOO_LARGE"
+    ],
+    "poll_errors": [
+      "CONNECT",
+      "TIMEOUT",
+      "HTTP",
+      "UNAVAILABLE",
+      "DROP"
+    ],
+    "readiness_facts": [
+      "mode_active",
+      "connector_config_valid",
+      "connector_reachable",
+      "last_batch_valid",
+      "coverage(full|partial|none)",
+      "registered_ds",
+      "covered_ds",
+      "eligible_ds"
+    ],
+    "reachable_rule": "a successful poll within 3 x ds_connector_poll_ms",
+    "ttl_max_ms": 3600000,
+    "batch_max_bytes": 4194304
+  },
+  "cmake_flags": [
+    "-DENABLE_WRR=ON",
+    "-DENABLE_DS_CONNECTOR=ON",
+    "-DENABLE_DS_PREALLOC=OFF"
+  ]
 }

@@ -1,0 +1,1359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 11:30:20 +0300
+Subject: [PATCH 16/19] feat(ds_connector): Unix-socket HTTP client, poll
+ thread, published assessment view, readiness facts, metrics
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/ds_connector.h         |  38 ++-
+ include/mds_metrics.h          |   7 +
+ include/placement_gate.h       |  37 ++-
+ include/placement_modes.h      |  26 ++
+ src/common/mds_metrics.c       |  51 ++++
+ src/common/placement_config.c  |  36 +++
+ src/fsal_obj/placement_gate.c  | 163 +++++++++-
+ src/mds/ds_connector.c         | 534 +++++++++++++++++++++++++++++++--
+ tests/unit/test_ds_connector.c | 273 +++++++++++++++++
+ 9 files changed, 1122 insertions(+), 43 deletions(-)
+
+diff --git a/include/ds_connector.h b/include/ds_connector.h
+index 658cc85..eaebe27 100644
+--- a/include/ds_connector.h
++++ b/include/ds_connector.h
+@@ -76,17 +76,7 @@ struct ds_connector_state {
+     uint64_t last_generated_at_ms;   /* 0 = none yet */
+ };
+ 
+-enum ds_connector_drop {
+-    DC_OK = 0,
+-    DC_JSON,              /* not parseable */
+-    DC_SCHEMA,            /* envelope/instance shape */
+-    DC_CONTRACT_MAJOR,
+-    DC_REPLAY,            /* an instance's sequence did not advance */
+-    DC_OLD_GENERATED_AT,
+-    DC_CONFIG_DIGEST,
+-    DC_TOO_LARGE,
+-    DC_COUNT
+-};
++/* enum ds_connector_drop and ds_connector_drop_name() live in placement_modes.h. */
+ 
+ struct ds_connector_report {
+     enum ds_connector_drop drop;
+@@ -114,8 +104,6 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
+                                                 struct placement_assessment_view *out,
+                                                 struct ds_connector_report *rep);
+ 
+-const char *ds_connector_drop_name(enum ds_connector_drop d);
+-
+ /* "YYYY-MM-DDTHH:MM:SS[.fff]Z" -> milliseconds since the epoch; 0 on error. */
+ uint64_t ds_connector_iso8601_ms(const char *s, size_t len);
+ 
+@@ -125,4 +113,28 @@ bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
+                                    const char *server, const char *export_path,
+                                    uint32_t port);
+ 
++/* -----------------------------------------------------------------------
++ * I/O half
++ * ----------------------------------------------------------------------- */
++
++struct ds_cache;
++
++/*
++ * One HTTP/1.1 GET over the Unix socket.  MDS_OK with a malloc'd body on
++ * 200; MDS_ERR_DELAY on 503 (connector not ready); MDS_ERR_INVAL on any
++ * other status; MDS_ERR_IO on connect failure, timeout, oversize or an
++ * unparsable response.  The deadline covers connect + the full read.
++ */
++enum mds_status ds_connector_http_get(const char *socket_path, const char *path,
++                                      uint32_t deadline_ms, char **body, size_t *len,
++                                      int *http_status);
++
++/* Configure without a thread (tests); start = configure + thread. */
++int  ds_connector_configure(const struct mds_config *cfg, struct ds_cache *cache);
++int  ds_connector_start(const struct mds_config *cfg, struct ds_cache *cache);
++void ds_connector_stop(void);
++/* One synchronous poll: GET, validate, publish, update the facts. */
++enum mds_status ds_connector_poll_once(void);
++void ds_connector_facts(struct placement_connector_facts *out);
++
+ #endif /* DS_CONNECTOR_H */
+diff --git a/include/mds_metrics.h b/include/mds_metrics.h
+index 588ad08..d873229 100644
+--- a/include/mds_metrics.h
++++ b/include/mds_metrics.h
+@@ -172,6 +172,13 @@ struct mds_branch_metrics {
+     _Atomic uint64_t placement_eligible_ds;          /**< gauge: candidates at the last admit */
+     _Atomic uint64_t placement_alias_suspected_total;
+     _Atomic uint64_t placement_mode_gauge;           /**< enum placement_mode of the gate (0 = legacy) */
++    /* Connector client (smart). */
++    _Atomic uint64_t connector_poll_errors_total[8];   /**< by enum ds_connector_poll_error */
++    _Atomic uint64_t connector_batches_dropped_total[8]; /**< by enum ds_connector_drop */
++    _Atomic uint64_t connector_batches_accepted_total;
++    _Atomic uint64_t connector_last_success_mono_ms;   /**< gauge source; 0 = never */
++    _Atomic uint64_t connector_covered_ds;             /**< gauge */
++    _Atomic uint64_t connector_reachable;              /**< gauge 0/1 */
+ 
+     /*
+      * IO_ADVISE accounting (RFC 7862 S15.5).  io_advise_total
+diff --git a/include/placement_gate.h b/include/placement_gate.h
+index 8a4c5cb..ecf45eb 100644
+--- a/include/placement_gate.h
++++ b/include/placement_gate.h
+@@ -74,8 +74,13 @@ struct placement_ctx {
+     const struct placement_capacity_view   *cap;      /* NULL in rr/legacy */
+     const struct placement_assessment_view *assess;   /* NULL until Stage B */
+     _Atomic uint32_t     *rr_counter;                 /* shared rr cursor; NULL = rr_key only */
+-    /* Singleton bookkeeping: the view reference held by this ctx. */
++    /* Manual base weights (smart, placement_allow_manual_base_weights). */
++    const char          (*domain_weight_id)[PM_DOMAIN_ID_MAX];
++    const uint32_t       *domain_weight;
++    uint32_t              domain_weight_count;
++    /* Singleton bookkeeping: the view references held by this ctx. */
+     void                 *view_ref;
++    void                 *assess_ref;
+ };
+ 
+ struct placement_candidate {
+@@ -137,6 +142,36 @@ void placement_gate_note_rejections(const struct placement_reject_counts *why);
+  * Process singleton (Task 5) -- declared here, implemented alongside.
+  * ----------------------------------------------------------------------- */
+ 
++/* Connector-side facts the poll thread reports (smart). */
++struct placement_connector_facts {
++    bool     config_valid;
++    bool     reachable;              /* a successful poll within 3 x poll_ms */
++    bool     last_batch_valid;
++    uint64_t last_success_mono_ms;   /* 0 = never */
++    enum ds_connector_poll_error last_error;
++    enum ds_connector_drop last_drop;
++    char     last_detail[160];
++};
++void placement_gate_publish_assessments(const struct placement_assessment_view *view);
++void placement_gate_set_connector_facts(const struct placement_connector_facts *f);
++
++/* The four readiness facts + coverage (design section 7, review finding 4). */
++struct placement_readiness {
++    bool     mode_active;              /* effective mode is smart */
++    bool     connector_config_valid;
++    bool     connector_reachable;
++    bool     last_batch_valid;
++    uint32_t registered_ds;
++    uint32_t covered_ds;               /* fresh valid records */
++    uint32_t eligible_ds;              /* covered and allowed with ppm > 0 */
++    char     coverage[8];              /* "full" | "partial" | "none" | "n/a" */
++    uint64_t last_success_mono_ms;
++    char     config_digest[PM_DIGEST_MAX];
++    char     profile_digest[PM_DIGEST_MAX];
++    char     last_detail[160];
++};
++void placement_gate_readiness(struct placement_readiness *out);
++
+ int  placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache);
+ void placement_gate_destroy(void);
+ enum placement_mode placement_gate_mode(void);        /* PM_LEGACY when not initialised */
+diff --git a/include/placement_modes.h b/include/placement_modes.h
+index c4f8883..9186cd2 100644
+--- a/include/placement_modes.h
++++ b/include/placement_modes.h
+@@ -93,6 +93,32 @@ enum placement_reason {
+ };
+ 
+ const char *placement_reason_name(enum placement_reason r);
++
++/* Why a connector batch was dropped whole (ds_connector.c); metrics label set. */
++enum ds_connector_drop {
++    DC_OK = 0,
++    DC_JSON,              /* not parseable */
++    DC_SCHEMA,            /* envelope/instance shape */
++    DC_CONTRACT_MAJOR,
++    DC_REPLAY,            /* an instance's sequence did not advance */
++    DC_OLD_GENERATED_AT,
++    DC_CONFIG_DIGEST,
++    DC_TOO_LARGE,
++    DC_COUNT
++};
++const char *ds_connector_drop_name(enum ds_connector_drop d);
++
++/* Transport-level poll outcomes (metrics label set). */
++enum ds_connector_poll_error {
++    DCP_NONE = 0,
++    DCP_CONNECT,          /* socket absent / refused */
++    DCP_TIMEOUT,
++    DCP_HTTP,             /* non-200 status or unparsable response */
++    DCP_UNAVAILABLE,      /* 503: the connector is not ready */
++    DCP_DROP,             /* the batch was dropped (see the drop counters) */
++    DCP_COUNT
++};
++const char *ds_connector_poll_error_name(enum ds_connector_poll_error e);
+ const char *placement_mode_name(enum placement_mode m);     /* "legacy"|"rr"|"fill"|"smart" */
+ const char *placement_shrink_name(enum placement_shrink s); /* "allow"|"strict" */
+ 
+diff --git a/src/common/mds_metrics.c b/src/common/mds_metrics.c
+index 754ce27..cd5d0c0 100644
+--- a/src/common/mds_metrics.c
++++ b/src/common/mds_metrics.c
+@@ -618,6 +618,57 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
+             }
+             base += extra;
+         }
++        /* connector client */
++        extra = snprintf(buf + base, cap - (size_t)base,
++            "# HELP pnfs_mds_connector_batches_accepted_total Connector batches accepted.\n"
++            "# TYPE pnfs_mds_connector_batches_accepted_total counter\n"
++            "pnfs_mds_connector_batches_accepted_total %lu\n"
++            "# HELP pnfs_mds_connector_covered_ds Registered DS with a fresh VALID assessment.\n"
++            "# TYPE pnfs_mds_connector_covered_ds gauge\n"
++            "pnfs_mds_connector_covered_ds %lu\n"
++            "# HELP pnfs_mds_connector_reachable 1 when the last poll within 3 intervals succeeded.\n"
++            "# TYPE pnfs_mds_connector_reachable gauge\n"
++            "pnfs_mds_connector_reachable %lu\n"
++            "# HELP pnfs_mds_connector_last_success_mono_ms Monotonic ms of the last accepted batch (0 = never).\n"
++            "# TYPE pnfs_mds_connector_last_success_mono_ms gauge\n"
++            "pnfs_mds_connector_last_success_mono_ms %lu\n"
++            "# HELP pnfs_mds_connector_poll_errors_total Connector polls that produced no accepted batch, by code.\n"
++            "# TYPE pnfs_mds_connector_poll_errors_total counter\n",
++            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_batches_accepted_total),
++            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_covered_ds),
++            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_reachable),
++            (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_last_success_mono_ms));
++        if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
++            return -1;
++        }
++        base += extra;
++        for (int e = 1; e < DCP_COUNT && e < 8; e++) {
++            extra = snprintf(buf + base, cap - (size_t)base,
++                "pnfs_mds_connector_poll_errors_total{code=\"%s\"} %lu\n",
++                ds_connector_poll_error_name((enum ds_connector_poll_error)e),
++                (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_poll_errors_total[e]));
++            if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
++                return -1;
++            }
++            base += extra;
++        }
++        extra = snprintf(buf + base, cap - (size_t)base,
++            "# HELP pnfs_mds_connector_batches_dropped_total Connector batches dropped whole, by reason.\n"
++            "# TYPE pnfs_mds_connector_batches_dropped_total counter\n");
++        if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
++            return -1;
++        }
++        base += extra;
++        for (int r = 1; r < DC_COUNT && r < 8; r++) {
++            extra = snprintf(buf + base, cap - (size_t)base,
++                "pnfs_mds_connector_batches_dropped_total{reason=\"%s\"} %lu\n",
++                ds_connector_drop_name((enum ds_connector_drop)r),
++                (unsigned long)atomic_load((_Atomic uint64_t *)&branch->connector_batches_dropped_total[r]));
++            if (extra < 0 || ((size_t)base + (size_t)extra) >= cap) {
++                return -1;
++            }
++            base += extra;
++        }
+     }
+ 
+     extra = snprintf(buf + base, cap - (size_t)base,
+diff --git a/src/common/placement_config.c b/src/common/placement_config.c
+index 7e4bd54..1aa1a9a 100644
+--- a/src/common/placement_config.c
++++ b/src/common/placement_config.c
+@@ -66,6 +66,42 @@ const char *placement_reason_name(enum placement_reason r)
+     return reason_names[r];
+ }
+ 
++static const char *const drop_names[DC_COUNT] = {
++    [DC_OK] = "OK",
++    [DC_JSON] = "JSON",
++    [DC_SCHEMA] = "SCHEMA",
++    [DC_CONTRACT_MAJOR] = "CONTRACT_MAJOR",
++    [DC_REPLAY] = "REPLAY",
++    [DC_OLD_GENERATED_AT] = "OLD_GENERATED_AT",
++    [DC_CONFIG_DIGEST] = "CONFIG_DIGEST",
++    [DC_TOO_LARGE] = "TOO_LARGE",
++};
++
++const char *ds_connector_drop_name(enum ds_connector_drop d)
++{
++    if ((unsigned)d >= DC_COUNT || drop_names[d] == NULL) {
++        return "UNKNOWN";
++    }
++    return drop_names[d];
++}
++
++static const char *const poll_error_names[DCP_COUNT] = {
++    [DCP_NONE] = "NONE",
++    [DCP_CONNECT] = "CONNECT",
++    [DCP_TIMEOUT] = "TIMEOUT",
++    [DCP_HTTP] = "HTTP",
++    [DCP_UNAVAILABLE] = "UNAVAILABLE",
++    [DCP_DROP] = "DROP",
++};
++
++const char *ds_connector_poll_error_name(enum ds_connector_poll_error e)
++{
++    if ((unsigned)e >= DCP_COUNT || poll_error_names[e] == NULL) {
++        return "UNKNOWN";
++    }
++    return poll_error_names[e];
++}
++
+ const char *placement_shrink_name(enum placement_shrink s)
+ {
+     return (s == PM_SHRINK_STRICT) ? "strict" : "allow";
+diff --git a/src/fsal_obj/placement_gate.c b/src/fsal_obj/placement_gate.c
+index 91c0f69..0e48ad6 100644
+--- a/src/fsal_obj/placement_gate.c
++++ b/src/fsal_obj/placement_gate.c
+@@ -605,12 +605,32 @@ static struct {
+     char                  domain_of[MDS_MAX_DS_NODES][PM_DOMAIN_ID_MAX];
+     char                  generation[65];
+     struct ds_cache      *cache;
+-    pthread_rwlock_t      lock;     /* guards cur */
++    pthread_rwlock_t      lock;     /* guards cur and cur_assess */
+     struct cap_view_ref  *cur;
++    struct assess_view_ref *cur_assess;
++    struct placement_connector_facts conn;
++    uint32_t              poll_ms;
++    char                  domain_weight_id[PM_MAX_DOMAINS][PM_DOMAIN_ID_MAX];
++    uint32_t              domain_weight[PM_MAX_DOMAINS];
++    uint32_t              domain_weight_count;
++    bool                  allow_manual_weights;
+     _Atomic uint32_t      rr_counter;
+     _Atomic uint32_t      snapshot_gen;
+ } g;
+ 
++struct assess_view_ref {
++    _Atomic uint32_t refs;
++    struct placement_assessment_view view;
++};
++
++static void assess_unref(struct assess_view_ref *ref)
++{
++    if (ref != NULL &&
++        atomic_fetch_sub_explicit(&ref->refs, 1, memory_order_acq_rel) == 1) {
++        free(ref);
++    }
++}
++
+ static void view_unref(struct cap_view_ref *ref)
+ {
+     if (ref != NULL &&
+@@ -683,26 +703,134 @@ void placement_gate_ctx(struct placement_ctx *out, uint64_t now_mono_ms)
+     out->min_free_bytes = g.min_free;
+     out->domain_of = (const char (*)[PM_DOMAIN_ID_MAX])g.domain_of;
+     out->rr_counter = &g.rr_counter;
++    if (g.allow_manual_weights && g.domain_weight_count > 0) {
++        out->domain_weight_id = (const char (*)[PM_DOMAIN_ID_MAX])g.domain_weight_id;
++        out->domain_weight = g.domain_weight;
++        out->domain_weight_count = g.domain_weight_count;
++    }
+     if (g.mode == PM_FILL || g.mode == PM_SMART) {
++        struct assess_view_ref *aref = NULL;
++
+         pthread_rwlock_rdlock(&g.lock);
+         ref = g.cur;
+         if (ref != NULL) {
+             atomic_fetch_add_explicit(&ref->refs, 1, memory_order_acq_rel);
+         }
++        if (g.mode == PM_SMART) {
++            aref = g.cur_assess;
++            if (aref != NULL) {
++                atomic_fetch_add_explicit(&aref->refs, 1, memory_order_acq_rel);
++            }
++        }
+         pthread_rwlock_unlock(&g.lock);
+         out->cap = (ref != NULL) ? &ref->view : NULL;
+         out->view_ref = ref;
++        out->assess = (aref != NULL) ? &aref->view : NULL;
++        out->assess_ref = aref;
+     }
+ }
+ 
+ void placement_gate_ctx_release(struct placement_ctx *ctx)
+ {
+-    if (ctx == NULL || ctx->view_ref == NULL) {
++    if (ctx == NULL) {
++        return;
++    }
++    if (ctx->view_ref != NULL) {
++        view_unref((struct cap_view_ref *)ctx->view_ref);
++        ctx->view_ref = NULL;
++        ctx->cap = NULL;
++    }
++    if (ctx->assess_ref != NULL) {
++        assess_unref((struct assess_view_ref *)ctx->assess_ref);
++        ctx->assess_ref = NULL;
++        ctx->assess = NULL;
++    }
++}
++
++void placement_gate_publish_assessments(const struct placement_assessment_view *view)
++{
++    struct assess_view_ref *fresh;
++    struct assess_view_ref *old;
++
++    if (!g.initialised || view == NULL) {
+         return;
+     }
+-    view_unref((struct cap_view_ref *)ctx->view_ref);
+-    ctx->view_ref = NULL;
+-    ctx->cap = NULL;
++    fresh = calloc(1, sizeof(*fresh));
++    if (fresh == NULL) {
++        return;
++    }
++    atomic_store_explicit(&fresh->refs, 1, memory_order_relaxed);
++    fresh->view = *view;
++    pthread_rwlock_wrlock(&g.lock);
++    old = g.cur_assess;
++    g.cur_assess = fresh;
++    pthread_rwlock_unlock(&g.lock);
++    atomic_fetch_add_explicit(&g.snapshot_gen, 1, memory_order_release);
++    assess_unref(old);
++}
++
++void placement_gate_set_connector_facts(const struct placement_connector_facts *f)
++{
++    if (!g.initialised || f == NULL) {
++        return;
++    }
++    pthread_rwlock_wrlock(&g.lock);
++    g.conn = *f;
++    pthread_rwlock_unlock(&g.lock);
++}
++
++void placement_gate_readiness(struct placement_readiness *out)
++{
++    struct placement_ctx ctx;
++    uint64_t now = ds_cache_mono_ms();
++
++    if (out == NULL) {
++        return;
++    }
++    memset(out, 0, sizeof(*out));
++    (void)snprintf(out->coverage, sizeof(out->coverage), "n/a");
++    if (!g.initialised || g.mode != PM_SMART) {
++        return;
++    }
++    out->mode_active = true;
++    pthread_rwlock_rdlock(&g.lock);
++    out->connector_config_valid = g.conn.config_valid;
++    out->connector_reachable = g.conn.reachable &&
++        (g.conn.last_success_mono_ms != 0) &&
++        (now - g.conn.last_success_mono_ms) <= 3ULL * g.poll_ms;
++    out->last_batch_valid = g.conn.last_batch_valid;
++    out->last_success_mono_ms = g.conn.last_success_mono_ms;
++    memcpy(out->last_detail, g.conn.last_detail, sizeof(out->last_detail));
++    pthread_rwlock_unlock(&g.lock);
++    placement_gate_ctx(&ctx, now);
++    if (ctx.cap != NULL) {
++        out->registered_ds = ctx.cap->count;
++    }
++    if (ctx.assess != NULL) {
++        uint32_t i;
++
++        memcpy(out->config_digest, ctx.assess->config_digest, sizeof(out->config_digest));
++        memcpy(out->profile_digest, ctx.assess->profile_digest, sizeof(out->profile_digest));
++        for (i = 0; i < ctx.assess->count; i++) {
++            const struct placement_assessment_row *r = &ctx.assess->rows[i];
++
++            if (!r->present || !r->valid || now >= r->expires_mono_ms) {
++                continue;
++            }
++            out->covered_ds++;
++            if (r->allowed && r->multiplier_ppm > 0) {
++                out->eligible_ds++;
++            }
++        }
++    }
++    placement_gate_ctx_release(&ctx);
++    if (out->registered_ds == 0 || out->covered_ds == 0) {
++        (void)snprintf(out->coverage, sizeof(out->coverage), "none");
++    } else if (out->covered_ds >= out->registered_ds) {
++        (void)snprintf(out->coverage, sizeof(out->coverage), "full");
++    } else {
++        (void)snprintf(out->coverage, sizeof(out->coverage), "partial");
++    }
+ }
+ 
+ int placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache)
+@@ -722,6 +850,14 @@ int placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache)
+     memcpy(g.generation, cfg->placement_config_generation, sizeof(g.generation));
+     g.generation[64] = '\0';
+     g.cache = cache;
++    g.poll_ms = cfg->ds_connector_poll_ms ? cfg->ds_connector_poll_ms : 1000;
++    g.allow_manual_weights = cfg->placement_allow_manual_base_weights;
++    g.domain_weight_count = cfg->placement_domain_weight_count;
++    if (g.domain_weight_count > PM_MAX_DOMAINS) {
++        g.domain_weight_count = PM_MAX_DOMAINS;
++    }
++    memcpy(g.domain_weight_id, cfg->placement_domain_weight_id, sizeof(g.domain_weight_id));
++    memcpy(g.domain_weight, cfg->placement_domain_weight, sizeof(g.domain_weight));
+     if ((g.mode == PM_FILL || g.mode == PM_SMART) && mds_wrr_kernel_id() == 0) {
+         MDS_LOG_ERROR(LOG_COMP_FSAL,
+             "placement: mode %s needs the XinnorLab wrr kernel; this binary "
+@@ -758,11 +894,18 @@ void placement_gate_destroy(void)
+     if (!g.initialised) {
+         return;
+     }
+-    pthread_rwlock_wrlock(&g.lock);
+-    old = g.cur;
+-    g.cur = NULL;
+-    pthread_rwlock_unlock(&g.lock);
+-    view_unref(old);
++    {
++        struct assess_view_ref *aold;
++
++        pthread_rwlock_wrlock(&g.lock);
++        old = g.cur;
++        g.cur = NULL;
++        aold = g.cur_assess;
++        g.cur_assess = NULL;
++        pthread_rwlock_unlock(&g.lock);
++        view_unref(old);
++        assess_unref(aold);
++    }
+     pthread_rwlock_destroy(&g.lock);
+     g.initialised = false;
+     g.cache = NULL;
+diff --git a/src/mds/ds_connector.c b/src/mds/ds_connector.c
+index 2598566..9f182c6 100644
+--- a/src/mds/ds_connector.c
++++ b/src/mds/ds_connector.c
+@@ -175,25 +175,6 @@ static bool tok_is_null(const struct jdoc *d, int i)
+  * Public helpers
+  * ----------------------------------------------------------------------- */
+ 
+-static const char *const drop_names[DC_COUNT] = {
+-    [DC_OK] = "OK",
+-    [DC_JSON] = "JSON",
+-    [DC_SCHEMA] = "SCHEMA",
+-    [DC_CONTRACT_MAJOR] = "CONTRACT_MAJOR",
+-    [DC_REPLAY] = "REPLAY",
+-    [DC_OLD_GENERATED_AT] = "OLD_GENERATED_AT",
+-    [DC_CONFIG_DIGEST] = "CONFIG_DIGEST",
+-    [DC_TOO_LARGE] = "TOO_LARGE",
+-};
+-
+-const char *ds_connector_drop_name(enum ds_connector_drop d)
+-{
+-    if ((unsigned)d >= DC_COUNT || drop_names[d] == NULL) {
+-        return "UNKNOWN";
+-    }
+-    return drop_names[d];
+-}
+-
+ uint64_t ds_connector_iso8601_ms(const char *s, size_t len)
+ {
+     struct tm tm;
+@@ -903,3 +884,518 @@ out_drop:
+     rep->drop = drop;
+     return drop;
+ }
++
++/* =======================================================================
++ * I/O half: Unix-socket HTTP client, poll thread, publication
++ * ======================================================================= */
++
++#include <errno.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <signal.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <stdatomic.h>
++
++#include "ds_cache.h"
++#include "mds_metrics.h"
++
++#define DC_HEADERS_MAX (64u * 1024u)
++
++static uint64_t dc_now_ms(void)
++{
++    return ds_cache_mono_ms();
++}
++
++static int wait_fd(int fd, short events, uint64_t deadline_ms)
++{
++    uint64_t now = dc_now_ms();
++    struct pollfd pfd;
++    int rc;
++
++    if (now >= deadline_ms) {
++        return 0;
++    }
++    pfd.fd = fd;
++    pfd.events = events;
++    pfd.revents = 0;
++    rc = poll(&pfd, 1, (int)(deadline_ms - now));
++    return rc;
++}
++
++enum mds_status ds_connector_http_get(const char *socket_path, const char *path,
++                                      uint32_t deadline_ms, char **body, size_t *len,
++                                      int *http_status)
++{
++    struct sockaddr_un addr;
++    char req[512];
++    char *buf = NULL;
++    size_t cap = 0;
++    size_t used = 0;
++    uint64_t deadline;
++    int fd;
++    int rc;
++    enum mds_status st = MDS_ERR_IO;
++    char *hdr_end = NULL;
++    long content_length = -1;
++    int status = 0;
++
++    if (body != NULL) {
++        *body = NULL;
++    }
++    if (len != NULL) {
++        *len = 0;
++    }
++    if (http_status != NULL) {
++        *http_status = 0;
++    }
++    if (socket_path == NULL || path == NULL || body == NULL || len == NULL ||
++        strlen(socket_path) >= sizeof(addr.sun_path)) {
++        return MDS_ERR_INVAL;
++    }
++    deadline = dc_now_ms() + deadline_ms;
++
++    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++    if (fd < 0) {
++        return MDS_ERR_IO;
++    }
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    (void)snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
++    rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
++    if (rc != 0 && errno == EINPROGRESS) {
++        int err = 0;
++        socklen_t elen = sizeof(err);
++
++        if (wait_fd(fd, POLLOUT, deadline) <= 0) {
++            close(fd);
++            return MDS_ERR_IO;
++        }
++        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
++            close(fd);
++            return MDS_ERR_IO;
++        }
++    } else if (rc != 0) {
++        close(fd);
++        return MDS_ERR_IO;
++    }
++
++    rc = snprintf(req, sizeof(req),
++                  "GET %s HTTP/1.1\r\nHost: connector\r\nAccept: application/json\r\n"
++                  "Connection: close\r\n\r\n", path);
++    if (rc < 0 || (size_t)rc >= sizeof(req)) {
++        close(fd);
++        return MDS_ERR_INVAL;
++    }
++    {
++        size_t off = 0;
++
++        while (off < (size_t)rc) {
++            ssize_t n;
++
++            if (wait_fd(fd, POLLOUT, deadline) <= 0) {
++                close(fd);
++                return MDS_ERR_IO;
++            }
++            n = write(fd, req + off, (size_t)rc - off);
++            if (n < 0) {
++                if (errno == EAGAIN || errno == EINTR) {
++                    continue;
++                }
++                close(fd);
++                return MDS_ERR_IO;
++            }
++            off += (size_t)n;
++        }
++    }
++
++    /* Read until EOF or Content-Length satisfied, within the deadline. */
++    cap = 16 * 1024;
++    buf = malloc(cap);
++    if (buf == NULL) {
++        close(fd);
++        return MDS_ERR_NOMEM;
++    }
++    for (;;) {
++        ssize_t n;
++        size_t body_have;
++
++        if (used + 1 >= cap) {
++            size_t ncap = cap * 2;
++            char *nb;
++
++            if (ncap > DC_BATCH_MAX + DC_HEADERS_MAX) {
++                ncap = DC_BATCH_MAX + DC_HEADERS_MAX;
++                if (used + 1 >= ncap) {
++                    goto out_io;   /* oversize response */
++                }
++            }
++            nb = realloc(buf, ncap);
++            if (nb == NULL) {
++                st = MDS_ERR_NOMEM;
++                goto out;
++            }
++            buf = nb;
++            cap = ncap;
++        }
++        rc = wait_fd(fd, POLLIN, deadline);
++        if (rc <= 0) {
++            goto out_io;   /* timeout */
++        }
++        n = read(fd, buf + used, cap - used - 1);
++        if (n < 0) {
++            if (errno == EAGAIN || errno == EINTR) {
++                continue;
++            }
++            goto out_io;
++        }
++        if (n == 0) {
++            break;   /* EOF */
++        }
++        used += (size_t)n;
++        buf[used] = '\0';
++        if (hdr_end == NULL) {
++            hdr_end = strstr(buf, "\r\n\r\n");
++            if (hdr_end != NULL) {
++                const char *cl;
++
++                if (sscanf(buf, "HTTP/1.%*d %d", &status) != 1) {
++                    goto out_io;
++                }
++                cl = strcasestr(buf, "\r\ncontent-length:");
++                if (cl != NULL && cl < hdr_end) {
++                    content_length = strtol(cl + 17, NULL, 10);
++                    if (content_length < 0 || (size_t)content_length > DC_BATCH_MAX) {
++                        goto out_io;
++                    }
++                }
++            } else if (used > DC_HEADERS_MAX) {
++                goto out_io;
++            }
++        }
++        if (hdr_end != NULL && content_length >= 0) {
++            body_have = used - (size_t)((hdr_end + 4) - buf);
++            if (body_have >= (size_t)content_length) {
++                break;
++            }
++        }
++    }
++    if (hdr_end == NULL) {
++        goto out_io;
++    }
++    if (http_status != NULL) {
++        *http_status = status;
++    }
++    {
++        size_t body_off = (size_t)((hdr_end + 4) - buf);
++        size_t body_len = used - body_off;
++
++        if (content_length >= 0 && (size_t)content_length < body_len) {
++            body_len = (size_t)content_length;
++        }
++        if (status == 200) {
++            char *b = malloc(body_len + 1);
++
++            if (b == NULL) {
++                st = MDS_ERR_NOMEM;
++                goto out;
++            }
++            memcpy(b, buf + body_off, body_len);
++            b[body_len] = '\0';
++            *body = b;
++            *len = body_len;
++            st = MDS_OK;
++        } else if (status == 503) {
++            st = MDS_ERR_DELAY;
++        } else {
++            st = MDS_ERR_INVAL;
++        }
++    }
++    goto out;
++
++out_io:
++    st = MDS_ERR_IO;
++out:
++    free(buf);
++    close(fd);
++    return st;
++}
++
++/* -----------------------------------------------------------------------
++ * Poll loop
++ * ----------------------------------------------------------------------- */
++
++static struct {
++    bool                     configured;
++    _Atomic bool             running;
++    pthread_t                thread;
++    int                      stop_pipe[2];
++    char                     socket_path[MDS_MAX_PATH];
++    uint32_t                 poll_ms;
++    uint32_t                 deadline_ms;
++    struct ds_cache         *cache;
++    pthread_mutex_t          lock;
++    struct ds_connector_state st;
++    struct placement_connector_facts facts;
++} g_dc = { .stop_pipe = { -1, -1 }, .lock = PTHREAD_MUTEX_INITIALIZER };
++
++static void registry_from_cache(struct ds_connector_registry *reg)
++{
++    struct ds_capacity_view_row *rows;
++    uint32_t n;
++    uint32_t i;
++
++    memset(reg, 0, sizeof(*reg));
++    if (g_dc.cache == NULL) {
++        return;
++    }
++    rows = calloc(MDS_MAX_DS_NODES, sizeof(*rows));
++    if (rows == NULL) {
++        return;
++    }
++    n = ds_cache_capacity_view(g_dc.cache, rows, MDS_MAX_DS_NODES);
++    for (i = 0; i < n && reg->count < MDS_MAX_DS_NODES; i++) {
++        struct mds_ds_info info;
++        struct ds_connector_registry_ds *d = &reg->ds[reg->count];
++
++        if (ds_cache_get(g_dc.cache, rows[i].ds_id, &info) != MDS_OK) {
++            continue;
++        }
++        d->ds_id = info.ds_id;
++        memcpy(d->host, info.host, sizeof(d->host));
++        memcpy(d->export_path, info.export_path, sizeof(d->export_path));
++        d->tcp_port = info.tcp_port != 0 ? info.tcp_port : info.port;
++        reg->count++;
++    }
++    free(rows);
++}
++
++static void note_poll_error(enum ds_connector_poll_error e, enum ds_connector_drop d,
++                            const char *detail)
++{
++    if ((unsigned)e < 8) {
++        atomic_fetch_add_explicit(&g_branch_metrics.connector_poll_errors_total[e], 1,
++                                  memory_order_relaxed);
++    }
++    if (e == DCP_DROP && (unsigned)d < 8) {
++        atomic_fetch_add_explicit(&g_branch_metrics.connector_batches_dropped_total[d], 1,
++                                  memory_order_relaxed);
++    }
++    pthread_mutex_lock(&g_dc.lock);
++    g_dc.facts.last_error = e;
++    g_dc.facts.last_drop = d;
++    g_dc.facts.last_batch_valid = false;
++    (void)snprintf(g_dc.facts.last_detail, sizeof(g_dc.facts.last_detail), "%s", detail);
++    if (e == DCP_CONNECT || e == DCP_TIMEOUT) {
++        uint64_t now = dc_now_ms();
++
++        if (g_dc.facts.last_success_mono_ms == 0 ||
++            now - g_dc.facts.last_success_mono_ms > 3ULL * g_dc.poll_ms) {
++            g_dc.facts.reachable = false;
++        }
++    }
++    placement_gate_set_connector_facts(&g_dc.facts);
++    atomic_store_explicit(&g_branch_metrics.connector_reachable,
++                          g_dc.facts.reachable ? 1 : 0, memory_order_relaxed);
++    pthread_mutex_unlock(&g_dc.lock);
++}
++
++enum mds_status ds_connector_poll_once(void)
++{
++    char *body = NULL;
++    size_t len = 0;
++    int status = 0;
++    enum mds_status st;
++    struct ds_connector_registry *reg;
++    struct placement_assessment_view *view;
++    struct ds_connector_report rep;
++    enum ds_connector_drop drop;
++    uint64_t now;
++    uint32_t covered = 0;
++    uint32_t i;
++
++    if (!g_dc.configured) {
++        return MDS_ERR_INVAL;
++    }
++    st = ds_connector_http_get(g_dc.socket_path, "/v1/assessments", g_dc.deadline_ms,
++                               &body, &len, &status);
++    if (st != MDS_OK) {
++        char detail[160];
++
++        if (st == MDS_ERR_DELAY) {
++            (void)snprintf(detail, sizeof(detail), "connector not ready (503)");
++            note_poll_error(DCP_UNAVAILABLE, DC_OK, detail);
++        } else if (st == MDS_ERR_INVAL) {
++            (void)snprintf(detail, sizeof(detail), "unexpected HTTP status %d", status);
++            note_poll_error(DCP_HTTP, DC_OK, detail);
++        } else if (status == 0 && st == MDS_ERR_IO) {
++            (void)snprintf(detail, sizeof(detail), "socket %.100s: connect/read failed or timed out",
++                           g_dc.socket_path);
++            note_poll_error(DCP_TIMEOUT, DC_OK, detail);
++        } else {
++            (void)snprintf(detail, sizeof(detail), "transport failure (%d)", (int)st);
++            note_poll_error(DCP_CONNECT, DC_OK, detail);
++        }
++        free(body);
++        return st;
++    }
++    reg = calloc(1, sizeof(*reg));
++    view = calloc(1, sizeof(*view));
++    if (reg == NULL || view == NULL) {
++        free(reg);
++        free(view);
++        free(body);
++        return MDS_ERR_NOMEM;
++    }
++    registry_from_cache(reg);
++    now = dc_now_ms();
++    pthread_mutex_lock(&g_dc.lock);
++    drop = ds_connector_apply_batch(&g_dc.st, body, len, reg, now, view, &rep);
++    pthread_mutex_unlock(&g_dc.lock);
++    free(body);
++    if (drop != DC_OK) {
++        note_poll_error(DCP_DROP, drop, rep.detail);
++        free(reg);
++        free(view);
++        return MDS_ERR_INVAL;
++    }
++    placement_gate_publish_assessments(view);
++    for (i = 0; i < view->count; i++) {
++        if (view->rows[i].present && view->rows[i].valid) {
++            covered++;
++        }
++    }
++    atomic_fetch_add_explicit(&g_branch_metrics.connector_batches_accepted_total, 1,
++                              memory_order_relaxed);
++    atomic_store_explicit(&g_branch_metrics.connector_covered_ds, covered, memory_order_relaxed);
++    atomic_store_explicit(&g_branch_metrics.connector_last_success_mono_ms, now,
++                          memory_order_relaxed);
++    atomic_store_explicit(&g_branch_metrics.connector_reachable, 1, memory_order_relaxed);
++    pthread_mutex_lock(&g_dc.lock);
++    g_dc.facts.reachable = true;
++    g_dc.facts.last_batch_valid = true;
++    g_dc.facts.last_success_mono_ms = now;
++    g_dc.facts.last_error = DCP_NONE;
++    g_dc.facts.last_drop = DC_OK;
++    if (rep.rejected_binding != 0 || rep.rejected_shape != 0) {
++        (void)snprintf(g_dc.facts.last_detail, sizeof(g_dc.facts.last_detail),
++                       "accepted %u, rejected %u (%.100s)", rep.accepted,
++                       rep.rejected_binding + rep.rejected_shape, rep.detail);
++    } else {
++        (void)snprintf(g_dc.facts.last_detail, sizeof(g_dc.facts.last_detail),
++                       "accepted %u", rep.accepted);
++    }
++    placement_gate_set_connector_facts(&g_dc.facts);
++    pthread_mutex_unlock(&g_dc.lock);
++    free(reg);
++    free(view);
++    return MDS_OK;
++}
++
++static void *dc_thread(void *arg)
++{
++    sigset_t mask;
++
++    (void)arg;
++    sigfillset(&mask);
++    pthread_sigmask(SIG_BLOCK, &mask, NULL);
++    (void)ds_connector_poll_once();
++    while (atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
++        struct pollfd pfd = { .fd = g_dc.stop_pipe[0], .events = POLLIN, .revents = 0 };
++        int pr = poll(&pfd, 1, (int)g_dc.poll_ms);
++
++        if (pr > 0 || !atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
++            break;
++        }
++        (void)ds_connector_poll_once();
++    }
++    return NULL;
++}
++
++int ds_connector_configure(const struct mds_config *cfg, struct ds_cache *cache)
++{
++    struct ds_connector_cfg dcfg;
++
++    if (cfg == NULL || cfg->placement_mode != PM_SMART) {
++        return -1;
++    }
++    memset(&dcfg, 0, sizeof(dcfg));
++    dcfg.contract_major = cfg->ds_connector_expected_contract_major;
++    dcfg.max_ds = cfg->ds_connector_max_ds;
++    (void)snprintf(dcfg.access_scope, sizeof(dcfg.access_scope), "%s", cfg->ds_connector_access_scope);
++    (void)snprintf(dcfg.expected_profile_digest, sizeof(dcfg.expected_profile_digest), "%s",
++                   cfg->ds_connector_expected_profile_digest);
++    (void)snprintf(dcfg.expected_config_digest, sizeof(dcfg.expected_config_digest), "%s",
++                   cfg->ds_connector_expected_config_digest);
++    pthread_mutex_lock(&g_dc.lock);
++    ds_connector_state_init(&g_dc.st, &dcfg);
++    (void)snprintf(g_dc.socket_path, sizeof(g_dc.socket_path), "%s", cfg->ds_connector_socket);
++    g_dc.poll_ms = cfg->ds_connector_poll_ms;
++    g_dc.deadline_ms = cfg->ds_connector_request_deadline_ms;
++    g_dc.cache = cache;
++    memset(&g_dc.facts, 0, sizeof(g_dc.facts));
++    g_dc.facts.config_valid = true;
++    g_dc.configured = true;
++    placement_gate_set_connector_facts(&g_dc.facts);
++    pthread_mutex_unlock(&g_dc.lock);
++    return 0;
++}
++
++int ds_connector_start(const struct mds_config *cfg, struct ds_cache *cache)
++{
++    if (ds_connector_configure(cfg, cache) != 0) {
++        return -1;
++    }
++    if (atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
++        return 0;
++    }
++    if (pipe(g_dc.stop_pipe) != 0) {
++        return -1;
++    }
++    atomic_store_explicit(&g_dc.running, true, memory_order_release);
++    if (pthread_create(&g_dc.thread, NULL, dc_thread, NULL) != 0) {
++        atomic_store_explicit(&g_dc.running, false, memory_order_release);
++        close(g_dc.stop_pipe[0]);
++        close(g_dc.stop_pipe[1]);
++        g_dc.stop_pipe[0] = -1;
++        g_dc.stop_pipe[1] = -1;
++        return -1;
++    }
++    MDS_LOG_INFO(LOG_COMP_MDS,
++        "ds_connector: polling %s every %u ms (deadline %u ms, contract major %u)",
++        g_dc.socket_path, (unsigned)g_dc.poll_ms, (unsigned)g_dc.deadline_ms,
++        (unsigned)g_dc.st.cfg.contract_major);
++    return 0;
++}
++
++void ds_connector_stop(void)
++{
++    if (!atomic_load_explicit(&g_dc.running, memory_order_acquire)) {
++        g_dc.configured = false;
++        return;
++    }
++    atomic_store_explicit(&g_dc.running, false, memory_order_release);
++    if (g_dc.stop_pipe[1] >= 0) {
++        (void)write(g_dc.stop_pipe[1], "x", 1);
++    }
++    (void)pthread_join(g_dc.thread, NULL);
++    if (g_dc.stop_pipe[0] >= 0) {
++        close(g_dc.stop_pipe[0]);
++        close(g_dc.stop_pipe[1]);
++        g_dc.stop_pipe[0] = -1;
++        g_dc.stop_pipe[1] = -1;
++    }
++    g_dc.configured = false;
++}
++
++void ds_connector_facts(struct placement_connector_facts *out)
++{
++    if (out == NULL) {
++        return;
++    }
++    pthread_mutex_lock(&g_dc.lock);
++    *out = g_dc.facts;
++    pthread_mutex_unlock(&g_dc.lock);
++}
+diff --git a/tests/unit/test_ds_connector.c b/tests/unit/test_ds_connector.c
+index ca0a62d..82ab3e0 100644
+--- a/tests/unit/test_ds_connector.c
++++ b/tests/unit/test_ds_connector.c
+@@ -11,6 +11,8 @@
+ 
+ #include "pnfs_mds.h"
+ #include "ds_connector.h"
++#include "mds_metrics.h"
++#include <stdatomic.h>
+ 
+ static int tests_run;
+ static int tests_passed;
+@@ -352,9 +354,280 @@ static void test_iso8601(void)
+     ASSERT_EQ(ds_connector_iso8601_ms("2026-13-24T10:00:00Z", 20), 0u);
+ }
+ 
++/* -----------------------------------------------------------------------
++ * I/O half: a fake connector on a Unix socket
++ * ----------------------------------------------------------------------- */
++
++#include <unistd.h>
++#include <pthread.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include "ds_cache.h"
++#include "mds_catalogue.h"
++#include "placement_gate.h"
++
++struct mds_catalogue *catalogue_memdb_open(void);
++
++struct fake_srv {
++    char        dir[64];
++    char        path[100];
++    int         status;
++    const char *body;
++    long        content_length;   /* -1 = real length */
++    int         delay_ms;
++    bool        silent;           /* accept, never answer */
++    int         listen_fd;
++    pthread_t   th;
++};
++
++static void *fake_srv_thread(void *a)
++{
++    struct fake_srv *s = a;
++    struct pollfd pfd = { .fd = s->listen_fd, .events = POLLIN, .revents = 0 };
++    int c;
++    char req[2048];
++
++    if (poll(&pfd, 1, 5000) <= 0) {
++        return NULL;
++    }
++    c = accept(s->listen_fd, NULL, NULL);
++    if (c < 0) {
++        return NULL;
++    }
++    pfd.fd = c;
++    if (poll(&pfd, 1, 1000) > 0) {
++        (void)read(c, req, sizeof(req));
++    }
++    if (s->delay_ms > 0) {
++        usleep((useconds_t)s->delay_ms * 1000);
++    }
++    if (!s->silent) {
++        char hdr[256];
++        size_t blen = s->body ? strlen(s->body) : 0;
++        long cl = (s->content_length >= 0) ? s->content_length : (long)blen;
++        int n = snprintf(hdr, sizeof(hdr),
++                         "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
++                         "Content-Length: %ld\r\nConnection: close\r\n\r\n",
++                         s->status, s->status == 200 ? "OK" : "Nope", cl);
++        (void)write(c, hdr, (size_t)n);
++        if (blen > 0) {
++            (void)write(c, s->body, blen);
++        }
++    } else {
++        usleep(3000 * 1000);
++    }
++    close(c);
++    return NULL;
++}
++
++static int fake_srv_start(struct fake_srv *s, int status, const char *body)
++{
++    struct sockaddr_un addr;
++
++    snprintf(s->dir, sizeof(s->dir), "/tmp/pnfs-dc-XXXXXX");
++    if (mkdtemp(s->dir) == NULL) {
++        return -1;
++    }
++    snprintf(s->path, sizeof(s->path), "%s/c.sock", s->dir);
++    s->status = status;
++    s->body = body;
++    if (s->content_length == 0) {
++        s->content_length = -1;
++    }
++    s->listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (s->listen_fd < 0) {
++        return -1;
++    }
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", s->path);
++    if (bind(s->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
++        listen(s->listen_fd, 4) != 0) {
++        return -1;
++    }
++    return pthread_create(&s->th, NULL, fake_srv_thread, s);
++}
++
++static void fake_srv_stop(struct fake_srv *s)
++{
++    (void)pthread_join(s->th, NULL);
++    close(s->listen_fd);
++    (void)unlink(s->path);
++    (void)rmdir(s->dir);
++}
++
++static uint64_t mono_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
++}
++
++static void test_http_get_200_body(void)
++{
++    struct fake_srv s; memset(&s, 0, sizeof(s));
++    char *body = NULL; size_t len = 0; int status = 0;
++    ASSERT_EQ(fake_srv_start(&s, 200, "{\"hello\":1}"), 0);
++    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_OK);
++    ASSERT_EQ(status, 200);
++    ASSERT_EQ(len, 11u);
++    ASSERT_EQ(strcmp(body, "{\"hello\":1}"), 0);
++    free(body);
++    fake_srv_stop(&s);
++}
++
++static void test_http_get_503_and_other_statuses(void)
++{
++    struct fake_srv s; memset(&s, 0, sizeof(s));
++    char *body = NULL; size_t len = 0; int status = 0;
++    ASSERT_EQ(fake_srv_start(&s, 503, "{\"ready\":false}"), 0);
++    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_ERR_DELAY);
++    ASSERT_EQ(status, 503);
++    ASSERT_TRUE(body == NULL);
++    fake_srv_stop(&s);
++    memset(&s, 0, sizeof(s));
++    ASSERT_EQ(fake_srv_start(&s, 404, "{}"), 0);
++    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_ERR_INVAL);
++    ASSERT_EQ(status, 404);
++    fake_srv_stop(&s);
++}
++
++static void test_http_get_timeout_and_no_socket(void)
++{
++    struct fake_srv s; memset(&s, 0, sizeof(s));
++    char *body = NULL; size_t len = 0; int status = 0;
++    s.silent = true;
++    ASSERT_EQ(fake_srv_start(&s, 200, "{}"), 0);
++    uint64_t t0 = mono_ms();
++    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 200, &body, &len, &status), MDS_ERR_IO);
++    ASSERT_TRUE(mono_ms() - t0 < 1000);
++    fake_srv_stop(&s);
++    ASSERT_EQ(ds_connector_http_get("/tmp/pnfs-dc-no-such/c.sock", "/v1/assessments", 200, &body, &len, &status), MDS_ERR_IO);
++    ASSERT_EQ(ds_connector_http_get(NULL, "/x", 200, &body, &len, &status), MDS_ERR_INVAL);
++}
++
++static void test_http_get_oversize(void)
++{
++    struct fake_srv s; memset(&s, 0, sizeof(s));
++    char *body = NULL; size_t len = 0; int status = 0;
++    s.content_length = 5L * 1024 * 1024;
++    ASSERT_EQ(fake_srv_start(&s, 200, "{}"), 0);
++    ASSERT_EQ(ds_connector_http_get(s.path, "/v1/assessments", 1000, &body, &len, &status), MDS_ERR_IO);
++    ASSERT_TRUE(body == NULL);
++    fake_srv_stop(&s);
++}
++
++static struct ds_cache *cache_two_ds(struct mds_catalogue **cat_out)
++{
++    struct mds_catalogue *cat = catalogue_memdb_open();
++    struct ds_cache *c = NULL;
++    const char *hosts[2] = { "192.168.64.51", "192.168.64.71" };
++    uint32_t i;
++
++    if (cat == NULL) {
++        return NULL;
++    }
++    for (i = 0; i < 2; i++) {
++        struct mds_cat_txn *txn = NULL;
++        struct mds_ds_info info;
++        memset(&info, 0, sizeof(info));
++        info.ds_id = i;
++        info.state = DS_ONLINE;
++        info.port = 2049;
++        info.tcp_port = 2049;
++        snprintf(info.host, sizeof(info.host), "%s", hosts[i]);
++        snprintf(info.export_path, sizeof(info.export_path), "/mnt/data/pnfs-ds");
++        if (mds_cat_txn_begin(cat, MDS_CAT_TXN_WRITE, &txn) != MDS_OK ||
++            mds_cat_ds_put(cat, txn, &info) != MDS_OK || mds_cat_txn_commit(txn) != MDS_OK) {
++            return NULL;
++        }
++    }
++    if (ds_cache_create(cat, &c) != 0) {
++        return NULL;
++    }
++    *cat_out = cat;
++    return c;
++}
++
++static void test_poll_once_publishes_and_readiness(void)
++{
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_two_ds(&cat);
++    struct mds_config cfg;
++    struct fake_srv s;
++    struct placement_readiness r;
++    ASSERT_TRUE(cache != NULL);
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.placement_mode = PM_SMART;
++    cfg.placement_mode_set = true;
++    cfg.placement_capacity_max_age_ms = 120000;
++    cfg.ds_connector_poll_ms = 200;
++    cfg.ds_connector_request_deadline_ms = 150;
++    cfg.ds_connector_expected_contract_major = 1;
++    cfg.ds_connector_max_ds = 256;
++    snprintf(cfg.ds_connector_access_scope, sizeof(cfg.ds_connector_access_scope), "cluster-default");
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    placement_gate_readiness(&r);
++    ASSERT_EQ(r.mode_active, true);
++    ASSERT_EQ(r.connector_config_valid, false);        /* not configured yet */
++    ASSERT_EQ(strcmp(r.coverage, "none"), 0);
++
++    memset(&s, 0, sizeof(s));
++    ASSERT_EQ(fake_srv_start(&s, 200, batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg-d", "COMPLETE", rec_ok(0))), 0);
++    snprintf(cfg.ds_connector_socket, sizeof(cfg.ds_connector_socket), "%s", s.path);
++    ASSERT_EQ(ds_connector_configure(&cfg, cache), 0);
++    ASSERT_EQ(ds_connector_poll_once(), MDS_OK);
++    fake_srv_stop(&s);
++    placement_gate_readiness(&r);
++    ASSERT_EQ(r.connector_config_valid, true);
++    ASSERT_EQ(r.connector_reachable, true);
++    ASSERT_EQ(r.last_batch_valid, true);
++    ASSERT_EQ(r.registered_ds, 2u);
++    ASSERT_EQ(r.covered_ds, 1u);
++    ASSERT_EQ(r.eligible_ds, 1u);
++    ASSERT_EQ(strcmp(r.coverage, "partial"), 0);
++    ASSERT_EQ(strcmp(r.config_digest, "cfg-d"), 0);
++    ASSERT_EQ(strcmp(r.profile_digest, "sha256:p"), 0);
++    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_covered_ds), 1u);
++
++    /* garbage: the batch is dropped, the previous view stays until it ages out */
++    memset(&s, 0, sizeof(s));
++    ASSERT_EQ(fake_srv_start(&s, 200, "{garbage"), 0);
++    snprintf(cfg.ds_connector_socket, sizeof(cfg.ds_connector_socket), "%s", s.path);
++    ASSERT_EQ(ds_connector_configure(&cfg, cache), 0);   /* new socket path; state reset is fine here */
++    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_INVAL);
++    fake_srv_stop(&s);
++    placement_gate_readiness(&r);
++    ASSERT_EQ(r.last_batch_valid, false);
++    ASSERT_EQ(r.covered_ds, 1u);
++    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_batches_dropped_total[DC_JSON]) >= 1u, true);
++
++    /* socket gone: no fallback -- reachability lapses after 3 x poll and the
++     * rows expire on their own TTL */
++    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_IO);
++    usleep(700 * 1000);
++    ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_IO);
++    placement_gate_readiness(&r);
++    ASSERT_EQ(r.connector_reachable, false);
++    ASSERT_EQ(r.covered_ds, 1u);                        /* 15 s TTL not yet over */
++    ASSERT_EQ(atomic_load(&g_branch_metrics.connector_reachable), 0u);
++
++    ds_connector_stop();
++    placement_gate_destroy();
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
+ int main(void)
+ {
+     printf("test_ds_connector\n");
++    RUN_TEST(test_http_get_200_body);
++    RUN_TEST(test_http_get_503_and_other_statuses);
++    RUN_TEST(test_http_get_timeout_and_no_socket);
++    RUN_TEST(test_http_get_oversize);
++    RUN_TEST(test_poll_once_publishes_and_readiness);
+     RUN_TEST(test_iso8601);
+     RUN_TEST(test_endpoint_rule);
+     RUN_TEST(test_healthy_batch_is_accepted);

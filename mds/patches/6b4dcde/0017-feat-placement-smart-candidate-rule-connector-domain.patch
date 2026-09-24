@@ -1,0 +1,533 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 11:35:21 +0300
+Subject: [PATCH 17/19] feat(placement): smart candidate rule, connector
+ domains, manual base weights, readiness in config show
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/mds_metrics.h            |   2 +-
+ include/placement_gate.h         |   8 ++
+ include/placement_modes.h        |   1 +
+ src/cluster/cluster_transport.c  |  65 ++++++++++--
+ src/common/placement_config.c    |   1 +
+ src/fsal_obj/placement_gate.c    | 114 +++++++++++++++++++-
+ tests/unit/test_placement_gate.c | 174 +++++++++++++++++++++++++++++++
+ 7 files changed, 351 insertions(+), 14 deletions(-)
+
+diff --git a/include/mds_metrics.h b/include/mds_metrics.h
+index d873229..05e19c1 100644
+--- a/include/mds_metrics.h
++++ b/include/mds_metrics.h
+@@ -168,7 +168,7 @@ struct mds_branch_metrics {
+     _Atomic uint64_t placement_degraded_total;
+ 
+     /* XinnorLab placement modes (placement_gate.c). */
+-    _Atomic uint64_t placement_rejections_total[16]; /**< indexed by enum placement_reason */
++    _Atomic uint64_t placement_rejections_total[32]; /**< indexed by enum placement_reason */
+     _Atomic uint64_t placement_eligible_ds;          /**< gauge: candidates at the last admit */
+     _Atomic uint64_t placement_alias_suspected_total;
+     _Atomic uint64_t placement_mode_gauge;           /**< enum placement_mode of the gate (0 = legacy) */
+diff --git a/include/placement_gate.h b/include/placement_gate.h
+index ecf45eb..882e0a5 100644
+--- a/include/placement_gate.h
++++ b/include/placement_gate.h
+@@ -203,6 +203,14 @@ struct placement_ds_status {
+     uint64_t total_bytes;
+     uint64_t weight;            /* 0 when not a candidate */
+     enum placement_reason reason;
++    /* smart */
++    bool     assessed;          /* a record exists */
++    bool     assessment_valid;
++    bool     assessment_allowed;
++    uint32_t assessment_ppm;
++    uint64_t assessment_age_ms; /* UINT64_MAX when none */
++    uint64_t assessment_ttl_ms; /* remaining, 0 when expired/none */
++    char     assessment_reason[PA_REASON_LEN];
+ };
+ 
+ /* DS ids in the published view (0 in rr/legacy or before the first publish). */
+diff --git a/include/placement_modes.h b/include/placement_modes.h
+index 9186cd2..7adb9b9 100644
+--- a/include/placement_modes.h
++++ b/include/placement_modes.h
+@@ -89,6 +89,7 @@ enum placement_reason {
+     PR_INSUFFICIENT_ELIGIBLE_DS,
+     PR_MODE_NOT_READY,
+     PR_WEIGHT_OVERFLOW,
++    PR_DOMAIN_MAP_MISMATCH,   /* smart: declared domain != the connector's */
+     PR_COUNT
+ };
+ 
+diff --git a/src/cluster/cluster_transport.c b/src/cluster/cluster_transport.c
+index bccff99..a5801fc 100644
+--- a/src/cluster/cluster_transport.c
++++ b/src/cluster/cluster_transport.c
+@@ -6675,6 +6675,25 @@ static void render_cfg_placement(const struct mds_config *cfg,
+             }
+         }
+     }
++    if (placement_gate_mode() == PM_SMART) {
++        struct placement_readiness rd;
++
++        placement_gate_readiness(&rd);
++        RENDER_KEY("placement_readiness",
++                   "mode_active=%d connector_config_valid=%d connector_reachable=%d "
++                   "last_batch_valid=%d coverage=%s registered_ds=%u covered_ds=%u "
++                   "eligible_ds=%u",
++                   rd.mode_active ? 1 : 0, rd.connector_config_valid ? 1 : 0,
++                   rd.connector_reachable ? 1 : 0, rd.last_batch_valid ? 1 : 0,
++                   rd.coverage, (unsigned)rd.registered_ds,
++                   (unsigned)rd.covered_ds, (unsigned)rd.eligible_ds);
++        RENDER_KEY("placement_connector_config_digest", "%s",
++                   rd.config_digest[0] != '\0' ? rd.config_digest : "-");
++        RENDER_KEY("placement_connector_profile_digest", "%s",
++                   rd.profile_digest[0] != '\0' ? rd.profile_digest : "-");
++        RENDER_KEY("placement_connector_last_detail", "%s",
++                   rd.last_detail[0] != '\0' ? rd.last_detail : "-");
++    }
+     {
+         uint32_t ids[MDS_MAX_DS_NODES];
+         uint32_t n = placement_gate_ds_ids(ids, MDS_MAX_DS_NODES);
+@@ -6682,6 +6701,7 @@ static void render_cfg_placement(const struct mds_config *cfg,
+             struct placement_ds_status ps;
+             char keybuf[40];
+             char age[24];
++            char aage[24];
+ 
+             if (!placement_gate_ds_status(ids[i], &ps)) {
+                 continue;
+@@ -6692,18 +6712,43 @@ static void render_cfg_placement(const struct mds_config *cfg,
+                 (void)snprintf(age, sizeof(age), "%llu",
+                                (unsigned long long)ps.capacity_age_ms);
+             }
++            if (ps.assessment_age_ms == UINT64_MAX) {
++                (void)snprintf(aage, sizeof(aage), "none");
++            } else {
++                (void)snprintf(aage, sizeof(aage), "%llu",
++                               (unsigned long long)ps.assessment_age_ms);
++            }
+             (void)snprintf(keybuf, sizeof(keybuf), "placement_ds.%u",
+                            (unsigned)ids[i]);
+-            RENDER_KEY(keybuf,
+-                       "domain=%s state=%s capacity_age_ms=%s avail=%llu "
+-                       "total=%llu weight=%llu reason=%s",
+-                       ps.domain,
+-                       (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
+-                       age,
+-                       (unsigned long long)ps.avail_bytes,
+-                       (unsigned long long)ps.total_bytes,
+-                       (unsigned long long)ps.weight,
+-                       placement_reason_name(ps.reason));
++            if (placement_gate_mode() == PM_SMART) {
++                RENDER_KEY(keybuf,
++                           "domain=%s state=%s capacity_age_ms=%s avail=%llu "
++                           "total=%llu assessment_age_ms=%s quality=%s allowed=%d "
++                           "ppm=%u ttl_ms=%llu weight=%llu reason=%s",
++                           ps.domain,
++                           (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
++                           age,
++                           (unsigned long long)ps.avail_bytes,
++                           (unsigned long long)ps.total_bytes,
++                           aage,
++                           !ps.assessed ? "NONE" : (ps.assessment_valid ? "VALID" : "UNKNOWN"),
++                           ps.assessment_allowed ? 1 : 0,
++                           (unsigned)ps.assessment_ppm,
++                           (unsigned long long)ps.assessment_ttl_ms,
++                           (unsigned long long)ps.weight,
++                           placement_reason_name(ps.reason));
++            } else {
++                RENDER_KEY(keybuf,
++                           "domain=%s state=%s capacity_age_ms=%s avail=%llu "
++                           "total=%llu weight=%llu reason=%s",
++                           ps.domain,
++                           (ps.state == DS_ONLINE) ? "ONLINE" : "OFFLINE",
++                           age,
++                           (unsigned long long)ps.avail_bytes,
++                           (unsigned long long)ps.total_bytes,
++                           (unsigned long long)ps.weight,
++                           placement_reason_name(ps.reason));
++            }
+         }
+     }
+     *offp = off;
+diff --git a/src/common/placement_config.c b/src/common/placement_config.c
+index 1aa1a9a..d7e86a1 100644
+--- a/src/common/placement_config.c
++++ b/src/common/placement_config.c
+@@ -56,6 +56,7 @@ static const char *const reason_names[PR_COUNT] = {
+     [PR_INSUFFICIENT_ELIGIBLE_DS] = "INSUFFICIENT_ELIGIBLE_DS",
+     [PR_MODE_NOT_READY]           = "MODE_NOT_READY",
+     [PR_WEIGHT_OVERFLOW]          = "WEIGHT_OVERFLOW",
++    [PR_DOMAIN_MAP_MISMATCH]      = "DOMAIN_MAP_MISMATCH",
+ };
+ 
+ const char *placement_reason_name(enum placement_reason r)
+diff --git a/src/fsal_obj/placement_gate.c b/src/fsal_obj/placement_gate.c
+index 0e48ad6..851c7ba 100644
+--- a/src/fsal_obj/placement_gate.c
++++ b/src/fsal_obj/placement_gate.c
+@@ -21,7 +21,7 @@
+ #include "mds_log.h"
+ #include "wrr.h"
+ 
+-_Static_assert(PR_COUNT <= 16, "placement_rejections_total[16] must hold every reason");
++_Static_assert(PR_COUNT <= 32, "placement_rejections_total[32] must hold every reason");
+ 
+ /* -----------------------------------------------------------------------
+  * Weight
+@@ -117,9 +117,44 @@ static bool row_fresh(const struct placement_ctx *ctx,
+ struct row_scratch {
+     char domain[PM_DOMAIN_ID_MAX];
+     bool declared;
+-    bool observed;   /* has an fsid and a total: usable for alias checks */
++    bool observed;       /* has an fsid and a total: usable for alias checks */
++    bool map_mismatch;   /* smart: operator map disagrees with the connector */
+ };
+ 
++static const struct placement_assessment_row *
++assess_row(const struct placement_assessment_view *v, uint32_t ds_id)
++{
++    uint32_t i;
++
++    if (v == NULL) {
++        return NULL;
++    }
++    for (i = 0; i < v->count; i++) {
++        if (v->rows[i].ds_id == ds_id) {
++            return &v->rows[i];
++        }
++    }
++    return NULL;
++}
++
++/* Manual base weight for a domain (smart, placement_allow_manual_base_weights). */
++static bool manual_domain_weight(const struct placement_ctx *ctx, const char *domain,
++                                 uint32_t *out)
++{
++    uint32_t i;
++
++    if (ctx->domain_weight_id == NULL || ctx->domain_weight == NULL) {
++        return false;
++    }
++    for (i = 0; i < ctx->domain_weight_count; i++) {
++        if (strcmp(ctx->domain_weight_id[i], domain) == 0) {
++            *out = ctx->domain_weight[i];
++            return true;
++        }
++    }
++    return false;
++}
++
+ static uint32_t domain_weight_of(uint64_t avail, uint64_t total)
+ {
+     uint64_t w;
+@@ -178,6 +213,22 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+         rs[j].declared = declared_domain(ctx, cap->rows[j].ds_id);
+         rs[j].observed = (cap->rows[j].obs.observed_mono_ms != 0 &&
+                           cap->rows[j].obs.total_bytes != 0);
++        rs[j].map_mismatch = false;
++        if (ctx->mode == PM_SMART) {
++            /* The connector knows the filesystem: its capacity_domain_id is
++             * the domain; an operator map that disagrees is a mismatch
++             * (design section 4).  No connector domain -> the DS's own. */
++            const struct placement_assessment_row *ar =
++                assess_row(ctx->assess, cap->rows[j].ds_id);
++
++            if (ar != NULL && ar->present && ar->domain[0] != '\0') {
++                if (rs[j].declared && strcmp(rs[j].domain, ar->domain) != 0) {
++                    rs[j].map_mismatch = true;
++                }
++                (void)snprintf(rs[j].domain, PM_DOMAIN_ID_MAX, "%s", ar->domain);
++                rs[j].declared = true;   /* a connector domain counts as declared */
++            }
++        }
+     }
+ 
+     for (i = 0; i < n; i++) {
+@@ -192,6 +243,7 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+         uint64_t avail;
+         uint64_t total;
+         uint32_t domain_weight;
++        uint32_t ppm;
+         uint64_t weight;
+         bool ovf = false;
+ 
+@@ -246,6 +298,10 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+             count_reason(why, PR_SHARED_FS_ALIAS_UNMAPPED);
+             continue;
+         }
++        if (rs[r_i].map_mismatch) {
++            count_reason(why, PR_DOMAIN_MAP_MISMATCH);
++            continue;
++        }
+ 
+         /* Domain aggregation over ALL registered members (any state): N,
+          * the canonical (lowest id, fresh) observation, the conservative
+@@ -288,7 +344,37 @@ static uint32_t candidates_weighted(const struct placement_ctx *ctx,
+             continue;
+         }
+         domain_weight = domain_weight_of(avail, total);
+-        weight = placement_weight(domain_weight, 1000000u, n_aliases, &ovf);
++        ppm = 1000000u;
++        if (ctx->mode == PM_SMART) {
++            const struct placement_assessment_row *ar = assess_row(ctx->assess, ds_list[i].ds_id);
++            uint32_t manual = 0;
++
++            if (ar == NULL || !ar->present) {
++                count_reason(why, PR_NO_BINDING);
++                continue;
++            }
++            if (!ar->valid) {
++                count_reason(why, PR_ASSESSMENT_UNKNOWN);
++                continue;
++            }
++            if (ctx->now_mono_ms >= ar->expires_mono_ms) {
++                count_reason(why, PR_ASSESSMENT_STALE);
++                continue;
++            }
++            if (!ar->allowed) {
++                count_reason(why, PR_CONNECTOR_DENIED);
++                continue;
++            }
++            if (ar->multiplier_ppm == 0) {
++                count_reason(why, PR_ZERO_MULTIPLIER);
++                continue;
++            }
++            ppm = ar->multiplier_ppm;
++            if (manual_domain_weight(ctx, rs[r_i].domain, &manual)) {
++                domain_weight = manual;
++            }
++        }
++        weight = placement_weight(domain_weight, ppm, n_aliases, &ovf);
+         if (weight == 0 || ovf) {
+             count_reason(why, PR_WEIGHT_OVERFLOW);
+             continue;
+@@ -1108,6 +1194,7 @@ bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
+     }
+     memset(out, 0, sizeof(*out));
+     out->capacity_age_ms = UINT64_MAX;
++    out->assessment_age_ms = UINT64_MAX;
+     out->reason = PR_DS_OFFLINE;
+     placement_gate_ctx(&ctx, ds_cache_mono_ms());
+     ref = (struct cap_view_ref *)ctx.view_ref;
+@@ -1136,6 +1223,27 @@ bool placement_gate_ds_status(uint32_t ds_id, struct placement_ds_status *out)
+         return false;
+     }
+     domain_for(&ctx, ds_id, out->domain);
++    if (ctx.mode == PM_SMART) {
++        const struct placement_assessment_row *ar = assess_row(ctx.assess, ds_id);
++
++        if (ar != NULL && ar->present) {
++            out->assessed = true;
++            out->assessment_valid = ar->valid;
++            out->assessment_allowed = ar->allowed;
++            out->assessment_ppm = ar->multiplier_ppm;
++            if (ctx.now_mono_ms >= ar->received_mono_ms) {
++                out->assessment_age_ms = ctx.now_mono_ms - ar->received_mono_ms;
++            }
++            out->assessment_ttl_ms = (ctx.now_mono_ms < ar->expires_mono_ms)
++                ? ar->expires_mono_ms - ctx.now_mono_ms : 0;
++            if (ar->reason_count > 0) {
++                memcpy(out->assessment_reason, ar->reasons[0], PA_REASON_LEN);
++            }
++            if (ar->domain[0] != '\0') {
++                (void)snprintf(out->domain, PM_DOMAIN_ID_MAX, "%s", ar->domain);
++            }
++        }
++    }
+     cands = calloc(ref->n_infos, sizeof(*cands));
+     if (cands != NULL) {
+         n_c = placement_candidates(&ctx, ref->infos, ref->n_infos, cands, NULL);
+diff --git a/tests/unit/test_placement_gate.c b/tests/unit/test_placement_gate.c
+index c56be3d..cefe13b 100644
+--- a/tests/unit/test_placement_gate.c
++++ b/tests/unit/test_placement_gate.c
+@@ -589,6 +589,174 @@ static void test_admit_counts_per_ds_reasons(void)
+     ASSERT_EQ(atomic_load(&g_branch_metrics.placement_rejections_total[PR_CAPACITY_STALE]), stale_before + 1);
+ }
+ 
++/* -----------------------------------------------------------------------
++ * smart (Stage B): assessment view, connector domains, manual weights
++ * ----------------------------------------------------------------------- */
++
++static struct placement_assessment_view A;
++static char DWID[PM_MAX_DOMAINS][PM_DOMAIN_ID_MAX];
++static uint32_t DW[PM_MAX_DOMAINS];
++
++static void add_assess(uint32_t id, bool valid, bool allowed, uint32_t ppm, uint64_t ttl_ms,
++                       const char *domain)
++{
++    struct placement_assessment_row *r = &A.rows[A.count++];
++    memset(r, 0, sizeof(*r));
++    r->ds_id = id;
++    r->present = true;
++    r->valid = valid;
++    r->allowed = allowed;
++    r->multiplier_ppm = ppm;
++    r->received_mono_ms = 1000000 - 1000;
++    r->expires_mono_ms = 1000000 - 1000 + ttl_ms;
++    if (domain != NULL) snprintf(r->domain, PM_DOMAIN_ID_MAX, "%s", domain);
++    A.batch_valid = true;
++}
++
++static struct placement_ctx smart_ctx(void)
++{
++    struct placement_ctx c = ctx_for(PM_SMART);
++    c.assess = &A;
++    return c;
++}
++
++static void reset_smart(void)
++{
++    reset();
++    memset(&A, 0, sizeof(A));
++    memset(DWID, 0, sizeof(DWID));
++    memset(DW, 0, sizeof(DW));
++}
++
++static void test_smart_healthy_row_is_a_candidate(void)
++{
++    struct mds_ds_info ds[1];
++    reset_smart();
++    mk_ds(&ds[0], 0, DS_ONLINE, "h");
++    add_row(0, "h", 1000, 500, 1, 1000000);
++    add_assess(0, true, true, 1000000, 15000, NULL);
++    struct placement_ctx c = smart_ctx();
++    struct placement_candidate out[1];
++    ASSERT_EQ(placement_candidates(&c, ds, 1, out, NULL), 1u);
++    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));
++    A.rows[0].multiplier_ppm = 250000;
++    ASSERT_EQ(placement_candidates(&c, ds, 1, out, NULL), 1u);
++    ASSERT_TRUE(out[0].weight == placement_weight(50, 250000, 1, NULL));
++}
++
++static void test_smart_reasons(void)
++{
++    struct mds_ds_info ds[5];
++    reset_smart();
++    for (uint32_t i = 0; i < 5; i++) { mk_ds(&ds[i], i, DS_ONLINE, "h"); add_row(i, "h", 1000, 500, 10 + i, 1000000); }
++    /* ds0: no record; ds1: UNKNOWN; ds2: expired; ds3: denied; ds4: ppm 0 */
++    add_assess(1, false, true, 1000000, 15000, NULL);
++    add_assess(2, true, true, 1000000, 500, NULL);      /* received at -1000, ttl 500 -> expired */
++    add_assess(3, true, false, 1000000, 15000, NULL);
++    add_assess(4, true, true, 0, 15000, NULL);
++    struct placement_ctx c = smart_ctx();
++    struct placement_candidate out[5]; struct placement_reject_counts why;
++    ASSERT_EQ(placement_candidates(&c, ds, 5, out, &why), 0u);
++    ASSERT_EQ(why.by_reason[PR_NO_BINDING], 1u);
++    ASSERT_EQ(why.by_reason[PR_ASSESSMENT_UNKNOWN], 1u);
++    ASSERT_EQ(why.by_reason[PR_ASSESSMENT_STALE], 1u);
++    ASSERT_EQ(why.by_reason[PR_CONNECTOR_DENIED], 1u);
++    ASSERT_EQ(why.by_reason[PR_ZERO_MULTIPLIER], 1u);
++    /* capacity comes first: a full domain is CAPACITY_FULL even with a fine assessment */
++    reset_smart();
++    mk_ds(&ds[0], 0, DS_ONLINE, "h");
++    add_row(0, "h", 1000, 0, 1, 1000000);
++    add_assess(0, true, true, 1000000, 15000, NULL);
++    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
++    ASSERT_EQ(why.by_reason[PR_CAPACITY_FULL], 1u);
++    /* per-DS verdict agrees */
++    enum placement_reason r;
++    ASSERT_EQ(placement_ds_admitted(&c, ds, 1, 0, &r), false);
++    ASSERT_EQ(r, PR_CAPACITY_FULL);
++}
++
++static void test_smart_without_view_is_not_ready(void)
++{
++    struct mds_ds_info ds[1];
++    reset_smart();
++    mk_ds(&ds[0], 0, DS_ONLINE, "h");
++    add_row(0, "h", 1000, 500, 1, 1000000);
++    struct placement_ctx c = smart_ctx();
++    c.assess = NULL;
++    struct placement_candidate out[1]; struct placement_reject_counts why;
++    ASSERT_EQ(placement_candidates(&c, ds, 1, out, &why), 0u);
++    ASSERT_EQ(why.by_reason[PR_MODE_NOT_READY], 1u);
++}
++
++static void test_smart_degraded_ppm_is_picked_less(void)
++{
++    struct mds_ds_info ds[2];
++    reset_smart();
++    mk_ds(&ds[0], 0, DS_ONLINE, "a"); mk_ds(&ds[1], 1, DS_ONLINE, "b");
++    add_row(0, "a", 1000, 500, 1, 1000000); add_row(1, "b", 1000, 500, 2, 1000000);
++    add_assess(0, true, true, 1000000, 15000, NULL);
++    add_assess(1, true, true, 250000, 15000, NULL);
++    struct placement_ctx c = smart_ctx();
++    mds_wrr_test_seed(777);
++    uint32_t hits1 = 0;
++    for (int i = 0; i < 100000; i++) {
++        struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
++        ASSERT_EQ(placement_admit(&c, ds, 2, &sc, 1, 0, &e, &why), MDS_OK);
++        if (e.ds_id == 1) hits1++;
++    }
++    ASSERT_TRUE(hits1 > 18000 && hits1 < 22000);   /* 1 : 4 */
++}
++
++static void test_smart_connector_domain_and_map_mismatch(void)
++{
++    struct mds_ds_info ds[3];
++    reset_smart();
++    for (uint32_t i = 0; i < 3; i++) { mk_ds(&ds[i], i, DS_ONLINE, "xi"); add_row(i, "xi", 1000, 800, 7 + (i == 2), 1000000); }
++    /* the connector says ds0 and ds1 share filesystem fs-1 */
++    add_assess(0, true, true, 1000000, 15000, "ctrl/fs-1");
++    add_assess(1, true, true, 1000000, 15000, "ctrl/fs-1");
++    add_assess(2, true, true, 1000000, 15000, "ctrl/fs-2");
++    struct placement_ctx c = smart_ctx();
++    struct placement_candidate out[3]; struct placement_reject_counts why;
++    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 3u);
++    ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 2, NULL));
++    ASSERT_TRUE(out[2].weight == placement_weight(80, 1000000, 1, NULL));
++    ASSERT_EQ(strcmp(out[0].domain, "ctrl/fs-1"), 0);
++    /* an operator map that agrees is fine; one that disagrees excludes the DS */
++    snprintf(DOM[0], PM_DOMAIN_ID_MAX, "ctrl/fs-1");
++    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "ctrl/fs-1");
++    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 3u);
++    snprintf(DOM[1], PM_DOMAIN_ID_MAX, "somewhere-else");
++    ASSERT_EQ(placement_candidates(&c, ds, 3, out, &why), 2u);
++    ASSERT_EQ(why.by_reason[PR_DOMAIN_MAP_MISMATCH], 1u);
++    ASSERT_TRUE(out[0].weight == placement_weight(80, 1000000, 2, NULL));   /* N still counts the alias */
++}
++
++static void test_smart_manual_base_weight(void)
++{
++    struct mds_ds_info ds[2];
++    reset_smart();
++    mk_ds(&ds[0], 0, DS_ONLINE, "a"); mk_ds(&ds[1], 1, DS_ONLINE, "b");
++    add_row(0, "a", 1000, 500, 1, 1000000); add_row(1, "b", 1000, 500, 2, 1000000);
++    add_assess(0, true, true, 1000000, 15000, "d-a");
++    add_assess(1, true, true, 1000000, 15000, "d-b");
++    snprintf(DWID[0], PM_DOMAIN_ID_MAX, "d-a"); DW[0] = 300;
++    struct placement_ctx c = smart_ctx();
++    struct placement_candidate out[2];
++    ASSERT_EQ(placement_candidates(&c, ds, 2, out, NULL), 2u);
++    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));   /* no manual weights in the ctx */
++    c.domain_weight_id = (const char (*)[PM_DOMAIN_ID_MAX])DWID;
++    c.domain_weight = DW;
++    c.domain_weight_count = 1;
++    ASSERT_EQ(placement_candidates(&c, ds, 2, out, NULL), 2u);
++    ASSERT_TRUE(out[0].weight == placement_weight(300, 1000000, 1, NULL));
++    ASSERT_TRUE(out[1].weight == placement_weight(50, 1000000, 1, NULL));
++    /* fill ignores manual weights (config forbids them anyway) */
++    c.mode = PM_FILL;
++    ASSERT_EQ(placement_candidates(&c, ds, 2, out, NULL), 2u);
++    ASSERT_TRUE(out[0].weight == placement_weight(50, 1000000, 1, NULL));
++}
++
+ static void test_reason_names_are_bounded(void)
+ {
+     for (int r = 0; r < PR_COUNT; r++) {
+@@ -871,6 +1039,12 @@ int main(void)
+     RUN_TEST(test_registry_view_drives_n_and_aliases_with_a_filtered_list);
+     RUN_TEST(test_ds_admitted_reason_uses_domain_level_verdict);
+     RUN_TEST(test_admit_counts_per_ds_reasons);
++    RUN_TEST(test_smart_healthy_row_is_a_candidate);
++    RUN_TEST(test_smart_reasons);
++    RUN_TEST(test_smart_without_view_is_not_ready);
++    RUN_TEST(test_smart_degraded_ppm_is_picked_less);
++    RUN_TEST(test_smart_connector_domain_and_map_mismatch);
++    RUN_TEST(test_smart_manual_base_weight);
+     RUN_TEST(test_select_gated_fill_path_uses_the_gate);
+     RUN_TEST(test_rr_is_cyclic_over_the_gated_list);
+     RUN_TEST(test_rr_ignores_capacity);

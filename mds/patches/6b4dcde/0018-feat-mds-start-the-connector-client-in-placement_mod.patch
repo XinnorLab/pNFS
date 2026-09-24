@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 11:40:52 +0300
+Subject: [PATCH 18/19] feat(mds): start the connector client in placement_mode
+ = smart; smart readiness in the startup line and config show
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/fsal_obj/placement_gate.c       |  6 ++--
+ src/mds/main.c                      | 14 ++++++++
+ tests/unit/test_cluster_transport.c | 19 +++++++++++
+ tests/unit/test_placement_gate.c    | 52 +++++++++++++++++++++++++++++
+ 4 files changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/src/fsal_obj/placement_gate.c b/src/fsal_obj/placement_gate.c
+index 851c7ba..9f3cc01 100644
+--- a/src/fsal_obj/placement_gate.c
++++ b/src/fsal_obj/placement_gate.c
+@@ -966,10 +966,12 @@ int placement_gate_init(const struct mds_config *cfg, struct ds_cache *cache)
+     placement_gate_publish_capacity();
+     MDS_LOG_INFO(LOG_COMP_FSAL,
+         "placement_mode=%s generation=%.12s kernel=%08x shrink=%s "
+-        "max_age_ms=%u min_free=%llu",
++        "max_age_ms=%u min_free=%llu connector=%s poll_ms=%u",
+         placement_mode_name(g.mode), g.generation,
+         (unsigned)mds_wrr_kernel_id(), placement_shrink_name(g.shrink),
+-        (unsigned)g.max_age_ms, (unsigned long long)g.min_free);
++        (unsigned)g.max_age_ms, (unsigned long long)g.min_free,
++        (g.mode == PM_SMART) ? cfg->ds_connector_socket : "off",
++        (g.mode == PM_SMART) ? (unsigned)g.poll_ms : 0u);
+     return 0;
+ }
+ 
+diff --git a/src/mds/main.c b/src/mds/main.c
+index 8182bee..adb5f1e 100644
+--- a/src/mds/main.c
++++ b/src/mds/main.c
+@@ -48,6 +48,7 @@
+ #include "ds_cache.h"
+ #include "ds_capacity.h"
+ #include "placement_gate.h"
++#include "ds_connector.h"
+ #include "ds_io_limits.h"
+ #include "inode_cache.h"
+ #include "parent_touch.h"
+@@ -1069,6 +1070,17 @@ if (s_pt != NULL) {
+ 			exit_code = EXIT_FAILURE;
+ 			goto cleanup;
+ 		}
++		/* smart: the per-MDS connector client feeds the gate.  Every
++		 * DS is UNKNOWN until its first fresh assessment; a missing
++		 * socket is a readiness fact, never a fallback (MODE-10). */
++		if (cfg.placement_mode == PM_SMART &&
++		    ds_connector_start(&cfg, ds_cache) != 0) {
++			MDS_LOG_ERROR(LOG_COMP_MDS,
++				"ds_connector_start failed (socket %s); refusing to start",
++				cfg.ds_connector_socket);
++			exit_code = EXIT_FAILURE;
++			goto cleanup;
++		}
+ 	}
+ 
+ 	/*
+@@ -2231,6 +2243,8 @@ cleanup:
+ 	 * writes into.  ds_capacity_stop joins the worker thread. */
+ 	ds_capacity_stop(ds_cap);
+ 	ds_cap = NULL;
++	/* Stop the connector poller before the gate it publishes into. */
++	ds_connector_stop();
+ 	placement_gate_destroy();
+ 	session_table_destroy(session_tbl);
+ 	open_state_table_destroy(ot);
+diff --git a/tests/unit/test_cluster_transport.c b/tests/unit/test_cluster_transport.c
+index 24ccaf4..89b57b4 100644
+--- a/tests/unit/test_cluster_transport.c
++++ b/tests/unit/test_cluster_transport.c
+@@ -1919,6 +1919,25 @@ static void test_config_show_placement_rows(void)
+     ASSERT_TRUE(text != NULL && strncmp(text, "placement_ds.1 = ", 17) == 0);
+     free(text);
+ 
++    /* smart: the readiness facts and the assessment columns appear */
++    placement_gate_destroy();
++    cfg.placement_mode = PM_SMART;
++    cfg.ds_connector_poll_ms = 1000;
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    {
++        struct ds_capacity_obs half = { 1000, 500, 9, ds_cache_mono_ms(), 0 };
++        ASSERT_EQ(ds_cache_set_capacity_obs(cache, 1, &half), 0);
++    }
++    placement_gate_publish_capacity();
++    text = NULL;
++    st = cluster_transport_request_config_show("127.0.0.1", port, NULL, &text);
++    ASSERT_EQ(st, MDS_OK);
++    ASSERT_TRUE(text != NULL);
++    ASSERT_TRUE(strstr(text, "placement_readiness = mode_active=1 connector_config_valid=0 connector_reachable=0 last_batch_valid=0 coverage=none registered_ds=1 covered_ds=0 eligible_ds=0\n") != NULL);
++    ASSERT_TRUE(strstr(text, "placement_ds.1 = domain=xi/fs-1 state=ONLINE capacity_age_ms=") != NULL);
++    ASSERT_TRUE(strstr(text, "assessment_age_ms=none quality=NONE allowed=0 ppm=0 ttl_ms=0 weight=0 reason=MODE_NOT_READY\n") != NULL);
++    free(text);
++
+     cluster_transport_server_stop(srv);
+     placement_gate_destroy();
+     ds_cache_destroy(cache);
+diff --git a/tests/unit/test_placement_gate.c b/tests/unit/test_placement_gate.c
+index cefe13b..73756c0 100644
+--- a/tests/unit/test_placement_gate.c
++++ b/tests/unit/test_placement_gate.c
+@@ -923,6 +923,57 @@ static void test_singleton_publishes_capacity_from_cache(void)
+     mds_catalogue_close(cat);
+ }
+ 
++static void test_singleton_smart_init_and_readiness(void)
++{
++    struct mds_config cfg = fill_cfg();
++    cfg.placement_mode = PM_SMART;
++    cfg.ds_connector_poll_ms = 1000;
++    ASSERT_EQ(placement_gate_init(&cfg, NULL), -1);          /* smart needs the cache */
++    struct mds_catalogue *cat = NULL;
++    struct ds_cache *cache = cache_with_ds(&cat, 0);
++    ASSERT_TRUE(cache != NULL);
++    ASSERT_EQ(placement_gate_init(&cfg, cache), 0);
++    ASSERT_EQ(placement_gate_mode(), PM_SMART);
++    struct placement_readiness r;
++    placement_gate_readiness(&r);
++    ASSERT_EQ(r.mode_active, true);
++    ASSERT_EQ(r.connector_config_valid, false);
++    ASSERT_EQ(r.connector_reachable, false);
++    ASSERT_EQ(r.registered_ds, 1u);
++    ASSERT_EQ(r.covered_ds, 0u);
++    ASSERT_EQ(strcmp(r.coverage, "none"), 0);
++    /* no assessments published: every candidate check is NOT_READY */
++    struct mds_ds_info ds[1]; mk_ds(&ds[0], 0, DS_ONLINE, "ds-host");
++    struct ds_capacity_obs half = { 1000, 500, 1, ds_cache_mono_ms(), 0 };
++    ASSERT_EQ(ds_cache_set_capacity_obs(cache, 0, &half), 0);
++    placement_gate_publish_capacity();
++    struct mds_ds_map_entry e; uint32_t sc = 1; enum placement_reason why;
++    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_ERR_NOSPC);
++    ASSERT_EQ(why, PR_MODE_NOT_READY);
++    /* a published view with a fresh VALID row makes the DS eligible */
++    struct placement_assessment_view v; memset(&v, 0, sizeof(v));
++    v.count = 1; v.batch_valid = true;
++    v.rows[0].ds_id = 0; v.rows[0].present = true; v.rows[0].valid = true; v.rows[0].allowed = true;
++    v.rows[0].multiplier_ppm = 1000000; v.rows[0].received_mono_ms = ds_cache_mono_ms();
++    v.rows[0].expires_mono_ms = ds_cache_mono_ms() + 15000;
++    placement_gate_publish_assessments(&v);
++    placement_gate_readiness(&r);
++    ASSERT_EQ(r.covered_ds, 1u);
++    ASSERT_EQ(r.eligible_ds, 1u);
++    ASSERT_EQ(strcmp(r.coverage, "full"), 0);
++    ASSERT_EQ(placement_select_gated(true, PLACEMENT_WEIGHTED_RR, ds, 1, &sc, 1, 65536, 0, &e, &why), MDS_OK);
++    ASSERT_EQ(e.ds_id, 0u);
++    struct placement_ds_status st;
++    ASSERT_EQ(placement_gate_ds_status(0, &st), true);
++    ASSERT_EQ(st.assessed, true);
++    ASSERT_EQ(st.assessment_valid, true);
++    ASSERT_EQ(st.assessment_ppm, 1000000u);
++    ASSERT_TRUE(st.assessment_ttl_ms > 10000);
++    placement_gate_destroy();
++    ds_cache_destroy(cache);
++    mds_catalogue_close(cat);
++}
++
+ static void test_select_gated_legacy_path(void)
+ {
+     struct mds_ds_info ds[2];
+@@ -1034,6 +1085,7 @@ int main(void)
+     RUN_TEST(test_singleton_fill_needs_cache_and_kernel);
+     RUN_TEST(test_singleton_rr_needs_no_cache);
+     RUN_TEST(test_singleton_publishes_capacity_from_cache);
++    RUN_TEST(test_singleton_smart_init_and_readiness);
+     RUN_TEST(test_select_gated_legacy_path);
+     RUN_TEST(test_select_gated_legacy_rr_at2_branch);
+     RUN_TEST(test_registry_view_drives_n_and_aliases_with_a_filtered_list);

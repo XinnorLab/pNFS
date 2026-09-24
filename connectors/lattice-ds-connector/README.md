@@ -11,8 +11,12 @@ Status: **first prototype** of the MVP requirements package
 (*Lattice–xiNAS Connector MVP*, 2026-09-22). P0 (contracts, fixtures,
 profile) and P2 (connector runtime + xinas module) are implemented here; P1
 (the xiNAS source) lives in the xiNAS repository on `release/3.15`
-(`docs/control-path/s20-placement-observations-spec.md`); P3 (the MDS
-allocation gate, `LAT-*`) is **not** part of this prototype.
+(`docs/control-path/s20-placement-observations-spec.md`). P3, the MDS
+allocation gate, lives in the fork `XinnorLab/pnfs-lattice`
+(`xinnor/placement-modes`, `placement_mode = smart`): the MDS polls this
+daemon's socket, validates every batch and binding, and admits a DS only
+with a fresh `VALID`/`allowed`/`ppm > 0` assessment. `preflight` shows the
+same facts from this side before the switch.
 
 Python 3.9+, standard library only at runtime (Oracle/RHEL 9 ships 3.9).
 `jsonschema` and `pytest` are used by the tests only.
@@ -69,6 +73,7 @@ python3 -m lattice_ds_connector discover --config /etc/lattice-ds-connector/conf
 python3 -m lattice_ds_connector run --config /etc/lattice-ds-connector/config.json
 python3 -m lattice_ds_connector show          # human view of the batch
 python3 -m lattice_ds_connector show --json   # the raw batch
+python3 -m lattice_ds_connector preflight --expect-ds 0,1   # READY / NOT_READY for an MDS about to run smart
 ```
 
 Configuration is the JSON of Appendix А (`examples/connector-config.json`).

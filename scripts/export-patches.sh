@@ -27,7 +27,7 @@ manifest = {
     "fork_sha": fork_sha,
     "patches_dir": os.path.relpath(out, os.path.dirname(dest)),
     "patches": patches,
-    "cmake_flags": ["-DENABLE_WRR=ON", "-DENABLE_DS_PREALLOC=OFF", "-DENABLE_TESTS=ON", "-DENABLE_EBPF=OFF"],
+    "cmake_flags": ["-DENABLE_WRR=ON", "-DENABLE_DS_CONNECTOR=ON", "-DENABLE_DS_PREALLOC=OFF", "-DENABLE_TESTS=ON", "-DENABLE_EBPF=OFF"],
     "connector_profile": profile,
     "contract_manifest": "docs/placement-modes/contract-manifest.json",
 }

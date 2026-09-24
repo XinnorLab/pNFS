@@ -1,0 +1,1512 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 11:22:25 +0300
+Subject: [PATCH 15/19] feat(ds_connector): batch parser with envelope,
+ sequence, digest and per-DS binding validation (pure)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/ds_connector.h         | 128 +++++
+ include/placement_gate.h       |  27 +-
+ src/mds/CMakeLists.txt         |   1 +
+ src/mds/ds_connector.c         | 905 +++++++++++++++++++++++++++++++++
+ tests/CMakeLists.txt           |   2 +
+ tests/unit/test_ds_connector.c | 372 ++++++++++++++
+ 6 files changed, 1433 insertions(+), 2 deletions(-)
+ create mode 100644 include/ds_connector.h
+ create mode 100644 src/mds/ds_connector.c
+ create mode 100644 tests/unit/test_ds_connector.c
+
+diff --git a/include/ds_connector.h b/include/ds_connector.h
+new file mode 100644
+index 0000000..658cc85
+--- /dev/null
++++ b/include/ds_connector.h
+@@ -0,0 +1,128 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * ds_connector.h -- the placement DS connector client (placement_mode =
++ * smart), design section 7.
++ *
++ * Pure half: ds_connector_apply_batch() parses one batch of the
++ * lattice-ds-connector contract (connector-batch.schema.json, contract
++ * 1.0), validates the envelope, every instance's sequence line and every
++ * assessment's binding against the DS registry, and builds an immutable
++ * placement_assessment_view with TTLs on the MDS monotonic clock.  I/O
++ * half (Task B3): the Unix-socket HTTP client and the poll thread that
++ * publishes the view into the placement gate.
++ */
++
++#ifndef DS_CONNECTOR_H
++#define DS_CONNECTOR_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++#include "pnfs_mds.h"
++#include "placement_modes.h"
++#include "placement_gate.h"
++
++#define DC_NAME_MAX      128
++#define DC_INSTANCES_MAX 64
++#define DC_BATCH_MAX     (4u * 1024u * 1024u)
++#define DC_TTL_MAX_MS    3600000u
++
++struct ds_connector_registry_ds {
++    uint32_t ds_id;
++    char     host[MDS_DS_HOST_MAX];
++    char     export_path[MDS_DS_EXPORT_MAX];
++    uint16_t tcp_port;
++};
++
++struct ds_connector_registry {
++    uint32_t count;
++    struct ds_connector_registry_ds ds[MDS_MAX_DS_NODES];
++};
++
++struct ds_connector_cfg {
++    uint32_t contract_major;
++    uint32_t max_ds;
++    char     access_scope[PM_SCOPE_MAX];
++    char     expected_profile_digest[PM_DIGEST_MAX];   /* "" = not pinned */
++    char     expected_config_digest[PM_DIGEST_MAX];    /* "" = not pinned */
++};
++
++/* First accepted binding tuple per ds_id (design section 7, review finding 2). */
++struct ds_connector_pin {
++    bool     pinned;
++    char     instance[DC_NAME_MAX];
++    uint32_t binding_generation;
++    char     datastore_id[DC_NAME_MAX];
++    char     target_id[DC_NAME_MAX];
++    char     target_incarnation[DC_NAME_MAX];
++    char     profile_digest[PM_DIGEST_MAX];
++    char     access_scope[PM_SCOPE_MAX];
++};
++
++struct ds_connector_instance_seq {
++    bool     used;
++    char     id[DC_NAME_MAX];
++    char     epoch[DC_NAME_MAX];
++    uint64_t sequence;
++};
++
++struct ds_connector_state {
++    struct ds_connector_cfg cfg;
++    char     runtime_epoch[DC_NAME_MAX];
++    struct ds_connector_instance_seq inst[DC_INSTANCES_MAX];
++    struct ds_connector_pin pins[MDS_MAX_DS_NODES];
++    uint64_t last_generated_at_ms;   /* 0 = none yet */
++};
++
++enum ds_connector_drop {
++    DC_OK = 0,
++    DC_JSON,              /* not parseable */
++    DC_SCHEMA,            /* envelope/instance shape */
++    DC_CONTRACT_MAJOR,
++    DC_REPLAY,            /* an instance's sequence did not advance */
++    DC_OLD_GENERATED_AT,
++    DC_CONFIG_DIGEST,
++    DC_TOO_LARGE,
++    DC_COUNT
++};
++
++struct ds_connector_report {
++    enum ds_connector_drop drop;
++    uint32_t accepted;
++    uint32_t rejected_binding;
++    uint32_t rejected_shape;
++    uint32_t unknown_ds;
++    uint32_t rebound;
++    char     detail[160];
++};
++
++void ds_connector_state_init(struct ds_connector_state *st,
++                             const struct ds_connector_cfg *cfg);
++
++/*
++ * Parse and validate one batch.  DC_OK: `out` holds one row per registry
++ * DS (present=false where no record was accepted) and the state advanced
++ * (sequence lines, pins, generated_at).  Any other drop leaves the state
++ * untouched and `out` empty with batch_valid=false.
++ */
++enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
++                                                const char *text, size_t len,
++                                                const struct ds_connector_registry *reg,
++                                                uint64_t now_mono_ms,
++                                                struct placement_assessment_view *out,
++                                                struct ds_connector_report *rep);
++
++const char *ds_connector_drop_name(enum ds_connector_drop d);
++
++/* "YYYY-MM-DDTHH:MM:SS[.fff]Z" -> milliseconds since the epoch; 0 on error. */
++uint64_t ds_connector_iso8601_ms(const char *s, size_t len);
++
++/* Endpoint rule: server == host, port == tcp_port (when both set) and the
++ * registry export path equals the endpoint path or lies under it. */
++bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
++                                   const char *server, const char *export_path,
++                                   uint32_t port);
++
++#endif /* DS_CONNECTOR_H */
+diff --git a/include/placement_gate.h b/include/placement_gate.h
+index 50a68c9..8a4c5cb 100644
+--- a/include/placement_gate.h
++++ b/include/placement_gate.h
+@@ -37,8 +37,31 @@ struct placement_capacity_view {
+     struct ds_capacity_view_row rows[MDS_MAX_DS_NODES];
+ };
+ 
+-/* Stage B: connector assessments.  Opaque here; NULL in Stage A. */
+-struct placement_assessment_view;
++/* Connector assessments (placement_mode = smart), design section 7.
++ * Built by ds_connector.c from a validated batch; published into the gate
++ * with placement_gate_publish_assessments(); one row per registered DS. */
++#define PA_REASONS_MAX  4
++#define PA_REASON_LEN   32
++struct placement_assessment_row {
++    uint32_t ds_id;
++    bool     present;            /* an accepted record exists for this ds */
++    bool     valid;              /* quality == VALID and the instance snapshot was not FAILED */
++    bool     allowed;
++    uint32_t multiplier_ppm;
++    uint64_t expires_mono_ms;    /* received + remaining_ttl_ms (MDS clock) */
++    uint64_t received_mono_ms;
++    char     domain[PM_DOMAIN_ID_MAX];   /* resources.capacity_domain_id, "" when null */
++    char     reasons[PA_REASONS_MAX][PA_REASON_LEN];
++    uint32_t reason_count;
++};
++struct placement_assessment_view {
++    uint32_t count;
++    struct placement_assessment_row rows[MDS_MAX_DS_NODES];
++    bool     batch_valid;
++    uint64_t batch_received_mono_ms;
++    char     config_digest[PM_DIGEST_MAX];
++    char     profile_digest[PM_DIGEST_MAX];
++};
+ 
+ struct placement_ctx {
+     enum placement_mode   mode;
+diff --git a/src/mds/CMakeLists.txt b/src/mds/CMakeLists.txt
+index 1726565..6aa1b5f 100644
+--- a/src/mds/CMakeLists.txt
++++ b/src/mds/CMakeLists.txt
+@@ -40,6 +40,7 @@ add_library(pnfs_mds_core STATIC
+     mountd_compat.c
+     ds_cache.c
+     ds_capacity.c
++    ds_connector.c
+     ds_io_limits.c
+     # ds_gc.c moved to src/modules/ds_gc/ (gated by ENABLE_DS_GC)
+     layout_recall.c
+diff --git a/src/mds/ds_connector.c b/src/mds/ds_connector.c
+new file mode 100644
+index 0000000..2598566
+--- /dev/null
++++ b/src/mds/ds_connector.c
+@@ -0,0 +1,905 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * ds_connector.c -- placement DS connector client (placement_mode = smart).
++ * See ds_connector.h and the design (XinnorLab/pNFS
++ * docs/superpowers/specs/2026-09-23-placement-modes-design.md, section 7).
++ *
++ * Pure half: batch parsing and validation over jsmn tokens.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include <time.h>
++#include <ctype.h>
++#include <stdarg.h>
++
++#define JSMN_STATIC
++#define JSMN_PARENT_LINKS
++#define JSMN_STRICT
++#include "jsmn/jsmn.h"
++
++#include "ds_connector.h"
++#include "mds_log.h"
++
++/* -----------------------------------------------------------------------
++ * Small helpers over jsmn tokens
++ * ----------------------------------------------------------------------- */
++
++struct jdoc {
++    const char *js;
++    const jsmntok_t *t;
++    int n;
++};
++
++/* Index just past the subtree rooted at i. */
++static int tok_skip(const struct jdoc *d, int i)
++{
++    int j = i + 1;
++    int k;
++
++    if (i < 0 || i >= d->n) {
++        return d->n;
++    }
++    switch (d->t[i].type) {
++    case JSMN_OBJECT:
++        for (k = 0; k < d->t[i].size; k++) {
++            j = j + 1;            /* key -> its value */
++            j = tok_skip(d, j);   /* skip the value subtree */
++        }
++        return j;
++    case JSMN_ARRAY:
++        for (k = 0; k < d->t[i].size; k++) {
++            j = tok_skip(d, j);
++        }
++        return j;
++    default:
++        return i + 1;
++    }
++}
++
++static bool tok_is(const struct jdoc *d, int i, jsmntype_t type)
++{
++    return i >= 0 && i < d->n && d->t[i].type == type;
++}
++
++static size_t tok_len(const struct jdoc *d, int i)
++{
++    return (size_t)(d->t[i].end - d->t[i].start);
++}
++
++static const char *tok_ptr(const struct jdoc *d, int i)
++{
++    return d->js + d->t[i].start;
++}
++
++/* Value index of `key` in object `obj`, or -1. */
++static int tok_get(const struct jdoc *d, int obj, const char *key)
++{
++    int j;
++    int k;
++    size_t klen = strlen(key);
++
++    if (!tok_is(d, obj, JSMN_OBJECT)) {
++        return -1;
++    }
++    j = obj + 1;
++    for (k = 0; k < d->t[obj].size; k++) {
++        if (j >= d->n) {
++            return -1;
++        }
++        if (tok_is(d, j, JSMN_STRING) && tok_len(d, j) == klen &&
++            memcmp(tok_ptr(d, j), key, klen) == 0) {
++            return j + 1;
++        }
++        j = tok_skip(d, j + 1);
++    }
++    return -1;
++}
++
++static bool tok_str_eq(const struct jdoc *d, int i, const char *s)
++{
++    size_t l = strlen(s);
++
++    return tok_is(d, i, JSMN_STRING) && tok_len(d, i) == l &&
++           memcmp(tok_ptr(d, i), s, l) == 0;
++}
++
++/* Copy a plain string (no escapes accepted) into buf; false when absent,
++ * not a string, empty, escaped or too long. */
++static bool tok_copy(const struct jdoc *d, int i, char *buf, size_t cap)
++{
++    size_t l;
++
++    if (!tok_is(d, i, JSMN_STRING)) {
++        return false;
++    }
++    l = tok_len(d, i);
++    if (l == 0 || l >= cap || memchr(tok_ptr(d, i), '\\', l) != NULL) {
++        return false;
++    }
++    memcpy(buf, tok_ptr(d, i), l);
++    buf[l] = '\0';
++    return true;
++}
++
++static bool tok_u64(const struct jdoc *d, int i, uint64_t *out)
++{
++    size_t l;
++    size_t k;
++    uint64_t v = 0;
++
++    if (!tok_is(d, i, JSMN_PRIMITIVE)) {
++        return false;
++    }
++    l = tok_len(d, i);
++    if (l == 0 || l > 19) {
++        return false;
++    }
++    for (k = 0; k < l; k++) {
++        char c = tok_ptr(d, i)[k];
++
++        if (c < '0' || c > '9') {
++            return false;
++        }
++        v = v * 10 + (uint64_t)(c - '0');
++    }
++    *out = v;
++    return true;
++}
++
++static bool tok_bool(const struct jdoc *d, int i, bool *out)
++{
++    if (!tok_is(d, i, JSMN_PRIMITIVE)) {
++        return false;
++    }
++    if (tok_len(d, i) == 4 && memcmp(tok_ptr(d, i), "true", 4) == 0) {
++        *out = true;
++        return true;
++    }
++    if (tok_len(d, i) == 5 && memcmp(tok_ptr(d, i), "false", 5) == 0) {
++        *out = false;
++        return true;
++    }
++    return false;
++}
++
++static bool tok_is_null(const struct jdoc *d, int i)
++{
++    return tok_is(d, i, JSMN_PRIMITIVE) && tok_len(d, i) == 4 &&
++           memcmp(tok_ptr(d, i), "null", 4) == 0;
++}
++
++/* -----------------------------------------------------------------------
++ * Public helpers
++ * ----------------------------------------------------------------------- */
++
++static const char *const drop_names[DC_COUNT] = {
++    [DC_OK] = "OK",
++    [DC_JSON] = "JSON",
++    [DC_SCHEMA] = "SCHEMA",
++    [DC_CONTRACT_MAJOR] = "CONTRACT_MAJOR",
++    [DC_REPLAY] = "REPLAY",
++    [DC_OLD_GENERATED_AT] = "OLD_GENERATED_AT",
++    [DC_CONFIG_DIGEST] = "CONFIG_DIGEST",
++    [DC_TOO_LARGE] = "TOO_LARGE",
++};
++
++const char *ds_connector_drop_name(enum ds_connector_drop d)
++{
++    if ((unsigned)d >= DC_COUNT || drop_names[d] == NULL) {
++        return "UNKNOWN";
++    }
++    return drop_names[d];
++}
++
++uint64_t ds_connector_iso8601_ms(const char *s, size_t len)
++{
++    struct tm tm;
++    uint64_t ms = 0;
++    size_t i;
++    time_t secs;
++
++    /* YYYY-MM-DDTHH:MM:SS(.f+)?Z */
++    if (len < 20 || s[4] != '-' || s[7] != '-' || s[10] != 'T' ||
++        s[13] != ':' || s[16] != ':' || s[len - 1] != 'Z') {
++        return 0;
++    }
++    for (i = 0; i < 19; i++) {
++        if (i == 4 || i == 7 || i == 10 || i == 13 || i == 16) {
++            continue;
++        }
++        if (!isdigit((unsigned char)s[i])) {
++            return 0;
++        }
++    }
++    memset(&tm, 0, sizeof(tm));
++    tm.tm_year = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0') - 1900;
++    tm.tm_mon = (s[5] - '0') * 10 + (s[6] - '0') - 1;
++    tm.tm_mday = (s[8] - '0') * 10 + (s[9] - '0');
++    tm.tm_hour = (s[11] - '0') * 10 + (s[12] - '0');
++    tm.tm_min = (s[14] - '0') * 10 + (s[15] - '0');
++    tm.tm_sec = (s[17] - '0') * 10 + (s[18] - '0');
++    if (tm.tm_mon < 0 || tm.tm_mon > 11 || tm.tm_mday < 1 || tm.tm_mday > 31 ||
++        tm.tm_hour > 23 || tm.tm_min > 59 || tm.tm_sec > 60) {
++        return 0;
++    }
++    if (len > 20) {
++        size_t digits = 0;
++        uint64_t frac = 0;
++
++        if (s[19] != '.') {
++            return 0;
++        }
++        for (i = 20; i + 1 < len; i++) {
++            if (!isdigit((unsigned char)s[i])) {
++                return 0;
++            }
++            if (digits < 3) {
++                frac = frac * 10 + (uint64_t)(s[i] - '0');
++                digits++;
++            }
++        }
++        if (digits == 0) {
++            return 0;
++        }
++        while (digits < 3) {
++            frac *= 10;
++            digits++;
++        }
++        ms = frac;
++    }
++    secs = timegm(&tm);
++    if (secs < 0) {
++        return 0;
++    }
++    return (uint64_t)secs * 1000ULL + ms;
++}
++
++bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
++                                   const char *server, const char *export_path,
++                                   uint32_t port)
++{
++    size_t el;
++
++    if (ds == NULL || server == NULL || export_path == NULL) {
++        return false;
++    }
++    if (strncmp(ds->host, server, MDS_DS_HOST_MAX) != 0) {
++        return false;
++    }
++    if (port != 0 && ds->tcp_port != 0 && port != ds->tcp_port) {
++        return false;
++    }
++    el = strlen(export_path);
++    if (el == 0 || export_path[0] != '/') {
++        return false;
++    }
++    if (strcmp(ds->export_path, export_path) == 0) {
++        return true;
++    }
++    /* the registered directory lies under the exported share */
++    if (el > 1 && strncmp(ds->export_path, export_path, el) == 0 &&
++        ds->export_path[el] == '/') {
++        return true;
++    }
++    if (el == 1) {
++        return ds->export_path[0] == '/';
++    }
++    return false;
++}
++
++void ds_connector_state_init(struct ds_connector_state *st,
++                             const struct ds_connector_cfg *cfg)
++{
++    memset(st, 0, sizeof(*st));
++    if (cfg != NULL) {
++        st->cfg = *cfg;
++    }
++}
++
++/* -----------------------------------------------------------------------
++ * Batch application
++ * ----------------------------------------------------------------------- */
++
++static void set_detail(struct ds_connector_report *rep, const char *fmt, ...)
++    __attribute__((format(printf, 2, 3)));
++
++static void set_detail(struct ds_connector_report *rep, const char *fmt, ...)
++{
++    va_list ap;
++
++    if (rep == NULL || rep->detail[0] != '\0') {
++        return;   /* keep the first detail */
++    }
++    va_start(ap, fmt);
++    (void)vsnprintf(rep->detail, sizeof(rep->detail), fmt, ap);
++    va_end(ap);
++}
++
++static const struct ds_connector_registry_ds *
++registry_find(const struct ds_connector_registry *reg, uint32_t ds_id)
++{
++    uint32_t i;
++
++    for (i = 0; i < reg->count; i++) {
++        if (reg->ds[i].ds_id == ds_id) {
++            return &reg->ds[i];
++        }
++    }
++    return NULL;
++}
++
++/* One parsed assessment, before the binding decision. */
++struct rec {
++    uint32_t ds_id;
++    uint64_t binding_generation;
++    char     datastore_id[DC_NAME_MAX];
++    char     target_id[DC_NAME_MAX];
++    char     target_incarnation[DC_NAME_MAX];   /* "" when null */
++    char     server[MDS_DS_HOST_MAX];
++    char     export_path[MDS_DS_EXPORT_MAX];
++    uint64_t port;
++    char     access_scope[PM_SCOPE_MAX];
++    bool     valid;
++    uint64_t remaining_ttl_ms;
++    char     profile_digest[PM_DIGEST_MAX];
++    bool     allowed;
++    uint64_t ppm;
++    char     domain[PM_DOMAIN_ID_MAX];
++    char     reasons[PA_REASONS_MAX][PA_REASON_LEN];
++    uint32_t reason_count;
++};
++
++/* Parse one assessment object; false = shape rejection (detail set). */
++static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
++                         struct ds_connector_report *rep)
++{
++    int v;
++    int ep;
++    int pl;
++    int pr;
++    int rs;
++    uint64_t u;
++
++    memset(r, 0, sizeof(*r));
++    if (!tok_is(d, obj, JSMN_OBJECT)) {
++        set_detail(rep, "assessment is not an object");
++        return false;
++    }
++    if (!tok_u64(d, tok_get(d, obj, "ds_id"), &u) || u >= MDS_MAX_DS_NODES) {
++        set_detail(rep, "assessment: ds_id missing or out of range");
++        return false;
++    }
++    r->ds_id = (uint32_t)u;
++    if (!tok_u64(d, tok_get(d, obj, "binding_generation"), &r->binding_generation) ||
++        r->binding_generation == 0 || r->binding_generation > UINT32_MAX) {
++        set_detail(rep, "ds %u: binding_generation invalid", r->ds_id);
++        return false;
++    }
++    if (!tok_copy(d, tok_get(d, obj, "datastore_id"), r->datastore_id, sizeof(r->datastore_id)) ||
++        !tok_copy(d, tok_get(d, obj, "target_id"), r->target_id, sizeof(r->target_id))) {
++        set_detail(rep, "ds %u: datastore_id/target_id invalid", r->ds_id);
++        return false;
++    }
++    v = tok_get(d, obj, "target_incarnation");
++    if (v < 0 || (!tok_is_null(d, v) &&
++                  !tok_copy(d, v, r->target_incarnation, sizeof(r->target_incarnation)))) {
++        set_detail(rep, "ds %u: target_incarnation invalid", r->ds_id);
++        return false;
++    }
++    ep = tok_get(d, obj, "endpoint");
++    if (!tok_is(d, ep, JSMN_OBJECT) ||
++        !tok_copy(d, tok_get(d, ep, "server"), r->server, sizeof(r->server)) ||
++        !tok_copy(d, tok_get(d, ep, "export_path"), r->export_path, sizeof(r->export_path)) ||
++        !tok_str_eq(d, tok_get(d, ep, "protocol"), "NFS") ||
++        !tok_u64(d, tok_get(d, ep, "port"), &r->port) || r->port == 0 || r->port > 65535) {
++        set_detail(rep, "ds %u: endpoint invalid", r->ds_id);
++        return false;
++    }
++    v = tok_get(d, ep, "transport");
++    if (!(tok_str_eq(d, v, "TCP") || tok_str_eq(d, v, "RDMA"))) {
++        set_detail(rep, "ds %u: endpoint.transport invalid", r->ds_id);
++        return false;
++    }
++    if (!tok_str_eq(d, tok_get(d, obj, "scope"), PM_CONN_SCOPE)) {
++        set_detail(rep, "ds %u: scope is not %s", r->ds_id, PM_CONN_SCOPE);
++        return false;
++    }
++    if (!tok_copy(d, tok_get(d, obj, "access_scope_id"), r->access_scope, sizeof(r->access_scope))) {
++        set_detail(rep, "ds %u: access_scope_id invalid", r->ds_id);
++        return false;
++    }
++    v = tok_get(d, obj, "quality");
++    if (tok_str_eq(d, v, "VALID")) {
++        r->valid = true;
++    } else if (tok_str_eq(d, v, "UNKNOWN")) {
++        r->valid = false;
++    } else {
++        set_detail(rep, "ds %u: quality invalid", r->ds_id);
++        return false;
++    }
++    if (!tok_u64(d, tok_get(d, obj, "remaining_ttl_ms"), &r->remaining_ttl_ms) ||
++        r->remaining_ttl_ms > DC_TTL_MAX_MS) {
++        set_detail(rep, "ds %u: remaining_ttl_ms invalid", r->ds_id);
++        return false;
++    }
++    pr = tok_get(d, obj, "profile");
++    if (!tok_is(d, pr, JSMN_OBJECT) ||
++        !tok_copy(d, tok_get(d, pr, "digest"), r->profile_digest, sizeof(r->profile_digest))) {
++        set_detail(rep, "ds %u: profile.digest invalid", r->ds_id);
++        return false;
++    }
++    pl = tok_get(d, obj, "placement");
++    if (!tok_is(d, pl, JSMN_OBJECT) ||
++        !tok_bool(d, tok_get(d, pl, "allowed"), &r->allowed) ||
++        !tok_u64(d, tok_get(d, pl, "multiplier_ppm"), &r->ppm) || r->ppm > 1000000ULL) {
++        set_detail(rep, "ds %u: placement invalid", r->ds_id);
++        return false;
++    }
++    rs = tok_get(d, pl, "reason_codes");
++    if (!tok_is(d, rs, JSMN_ARRAY)) {
++        set_detail(rep, "ds %u: reason_codes missing", r->ds_id);
++        return false;
++    }
++    {
++        int j = rs + 1;
++        int k;
++
++        for (k = 0; k < d->t[rs].size; k++) {
++            if (!tok_is(d, j, JSMN_STRING)) {
++                set_detail(rep, "ds %u: reason_codes entry not a string", r->ds_id);
++                return false;
++            }
++            if (r->reason_count < PA_REASONS_MAX) {
++                size_t l = tok_len(d, j);
++
++                if (l >= PA_REASON_LEN) {
++                    l = PA_REASON_LEN - 1;
++                }
++                memcpy(r->reasons[r->reason_count], tok_ptr(d, j), l);
++                r->reasons[r->reason_count][l] = '\0';
++                r->reason_count++;
++            }
++            j = tok_skip(d, j);
++        }
++    }
++    v = tok_get(d, obj, "resources");
++    if (!tok_is(d, v, JSMN_OBJECT)) {
++        set_detail(rep, "ds %u: resources missing", r->ds_id);
++        return false;
++    }
++    v = tok_get(d, v, "capacity_domain_id");
++    if (v < 0) {
++        set_detail(rep, "ds %u: capacity_domain_id missing", r->ds_id);
++        return false;
++    }
++    if (!tok_is_null(d, v) && !tok_copy(d, v, r->domain, sizeof(r->domain))) {
++        set_detail(rep, "ds %u: capacity_domain_id invalid", r->ds_id);
++        return false;
++    }
++    return true;
++}
++
++static bool pin_matches(const struct ds_connector_pin *p, const struct rec *r,
++                        const char *instance)
++{
++    return strcmp(p->instance, instance) == 0 &&
++           p->binding_generation == (uint32_t)r->binding_generation &&
++           strcmp(p->datastore_id, r->datastore_id) == 0 &&
++           strcmp(p->target_id, r->target_id) == 0 &&
++           strcmp(p->target_incarnation, r->target_incarnation) == 0 &&
++           strcmp(p->profile_digest, r->profile_digest) == 0 &&
++           strcmp(p->access_scope, r->access_scope) == 0;
++}
++
++static void pin_set(struct ds_connector_pin *p, const struct rec *r, const char *instance)
++{
++    p->pinned = true;
++    (void)snprintf(p->instance, sizeof(p->instance), "%s", instance);
++    p->binding_generation = (uint32_t)r->binding_generation;
++    (void)snprintf(p->datastore_id, sizeof(p->datastore_id), "%s", r->datastore_id);
++    (void)snprintf(p->target_id, sizeof(p->target_id), "%s", r->target_id);
++    (void)snprintf(p->target_incarnation, sizeof(p->target_incarnation), "%s", r->target_incarnation);
++    (void)snprintf(p->profile_digest, sizeof(p->profile_digest), "%s", r->profile_digest);
++    (void)snprintf(p->access_scope, sizeof(p->access_scope), "%s", r->access_scope);
++}
++
++/* Proposed per-instance sequence updates, committed only on DC_OK. */
++struct inst_update {
++    char     id[DC_NAME_MAX];
++    char     epoch[DC_NAME_MAX];
++    uint64_t sequence;
++    bool     failed_snapshot;
++    int      assessments_tok;
++};
++
++/* NOLINTNEXTLINE(readability-function-cognitive-complexity) */
++enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
++                                                const char *text, size_t len,
++                                                const struct ds_connector_registry *reg,
++                                                uint64_t now_mono_ms,
++                                                struct placement_assessment_view *out,
++                                                struct ds_connector_report *rep)
++{
++    struct ds_connector_report local_rep;
++    jsmn_parser parser;
++    jsmntok_t *toks = NULL;
++    int ntok;
++    struct jdoc d;
++    int v;
++    int insts;
++    int n_inst;
++    struct inst_update *upd = NULL;
++    struct ds_connector_pin *new_pins = NULL;
++    bool *seen = NULL;
++    bool epoch_reset = false;
++    char runtime_epoch[DC_NAME_MAX];
++    char config_digest[PM_DIGEST_MAX];
++    char batch_profile[PM_DIGEST_MAX];
++    uint64_t generated_ms;
++    enum ds_connector_drop drop = DC_SCHEMA;
++    int i;
++
++    if (rep == NULL) {
++        rep = &local_rep;
++    }
++    memset(rep, 0, sizeof(*rep));
++    if (out != NULL) {
++        memset(out, 0, sizeof(*out));
++    }
++    if (st == NULL || text == NULL || reg == NULL || out == NULL) {
++        rep->drop = DC_SCHEMA;
++        set_detail(rep, "null argument");
++        return DC_SCHEMA;
++    }
++    if (len > DC_BATCH_MAX) {
++        rep->drop = DC_TOO_LARGE;
++        set_detail(rep, "batch is %zu bytes (limit %u)", len, DC_BATCH_MAX);
++        return DC_TOO_LARGE;
++    }
++
++    /* --- tokenize ------------------------------------------------------- */
++    jsmn_init(&parser);
++    ntok = jsmn_parse(&parser, text, len, NULL, 0);
++    if (ntok <= 0 || ntok > 2000000) {
++        rep->drop = DC_JSON;
++        set_detail(rep, "jsmn: %d", ntok);
++        return DC_JSON;
++    }
++    toks = calloc((size_t)ntok, sizeof(*toks));
++    if (toks == NULL) {
++        rep->drop = DC_JSON;
++        return DC_JSON;
++    }
++    jsmn_init(&parser);
++    if (jsmn_parse(&parser, text, len, toks, (unsigned)ntok) != ntok) {
++        free(toks);
++        rep->drop = DC_JSON;
++        set_detail(rep, "jsmn: second pass");
++        return DC_JSON;
++    }
++    d.js = text;
++    d.t = toks;
++    d.n = ntok;
++
++    /* --- envelope ------------------------------------------------------- */
++    if (!tok_is(&d, 0, JSMN_OBJECT)) {
++        set_detail(rep, "batch is not an object");
++        goto out_drop;
++    }
++    v = tok_get(&d, 0, "contract_version");
++    if (!tok_is(&d, v, JSMN_STRING)) {
++        set_detail(rep, "contract_version missing");
++        goto out_drop;
++    }
++    {
++        uint64_t major = 0;
++        size_t k;
++        size_t l = tok_len(&d, v);
++        const char *p = tok_ptr(&d, v);
++
++        for (k = 0; k < l && p[k] != '.'; k++) {
++            if (!isdigit((unsigned char)p[k])) {
++                break;
++            }
++            major = major * 10 + (uint64_t)(p[k] - '0');
++        }
++        if (k == 0 || major != st->cfg.contract_major) {
++            drop = DC_CONTRACT_MAJOR;
++            set_detail(rep, "contract_version %.*s, expected major %u",
++                       (int)l, p, (unsigned)st->cfg.contract_major);
++            goto out_drop;
++        }
++    }
++    if (!tok_copy(&d, tok_get(&d, 0, "runtime_epoch"), runtime_epoch, sizeof(runtime_epoch))) {
++        set_detail(rep, "runtime_epoch missing");
++        goto out_drop;
++    }
++    if (!tok_copy(&d, tok_get(&d, 0, "config_digest"), config_digest, sizeof(config_digest))) {
++        set_detail(rep, "config_digest missing");
++        goto out_drop;
++    }
++    if (st->cfg.expected_config_digest[0] != '\0' &&
++        strcmp(st->cfg.expected_config_digest, config_digest) != 0) {
++        drop = DC_CONFIG_DIGEST;
++        set_detail(rep, "config_digest %s != expected %s", config_digest,
++                   st->cfg.expected_config_digest);
++        goto out_drop;
++    }
++    v = tok_get(&d, 0, "generated_at");
++    if (!tok_is(&d, v, JSMN_STRING)) {
++        set_detail(rep, "generated_at missing");
++        goto out_drop;
++    }
++    generated_ms = ds_connector_iso8601_ms(tok_ptr(&d, v), tok_len(&d, v));
++    if (generated_ms == 0) {
++        set_detail(rep, "generated_at unparsable");
++        goto out_drop;
++    }
++    epoch_reset = (st->runtime_epoch[0] != '\0' &&
++                   strcmp(st->runtime_epoch, runtime_epoch) != 0);
++    if (!epoch_reset && generated_ms < st->last_generated_at_ms) {
++        drop = DC_OLD_GENERATED_AT;
++        set_detail(rep, "generated_at older than the last accepted batch");
++        goto out_drop;
++    }
++    insts = tok_get(&d, 0, "instances");
++    if (!tok_is(&d, insts, JSMN_ARRAY)) {
++        set_detail(rep, "instances missing");
++        goto out_drop;
++    }
++    n_inst = toks[insts].size;
++    if (n_inst > DC_INSTANCES_MAX) {
++        set_detail(rep, "%d instances (limit %d)", n_inst, DC_INSTANCES_MAX);
++        goto out_drop;
++    }
++
++    /* --- instances: sequence lines (validated before any state change) --- */
++    upd = calloc((size_t)(n_inst > 0 ? n_inst : 1), sizeof(*upd));
++    if (upd == NULL) {
++        goto out_drop;
++    }
++    {
++        int j = insts + 1;
++
++        for (i = 0; i < n_inst; i++) {
++            int io = j;
++            uint64_t seq;
++            int st_tok;
++            int k;
++
++            if (!tok_is(&d, io, JSMN_OBJECT)) {
++                set_detail(rep, "instance %d is not an object", i);
++                goto out_drop;
++            }
++            if (!tok_copy(&d, tok_get(&d, io, "connector_instance_id"), upd[i].id, sizeof(upd[i].id)) ||
++                !tok_copy(&d, tok_get(&d, io, "epoch"), upd[i].epoch, sizeof(upd[i].epoch)) ||
++                !tok_u64(&d, tok_get(&d, io, "sequence"), &seq)) {
++                set_detail(rep, "instance %d: id/epoch/sequence invalid", i);
++                goto out_drop;
++            }
++            upd[i].sequence = seq;
++            for (k = 0; k < i; k++) {
++                if (strcmp(upd[k].id, upd[i].id) == 0) {
++                    set_detail(rep, "duplicate instance %s", upd[i].id);
++                    goto out_drop;
++                }
++            }
++            st_tok = tok_get(&d, io, "snapshot_status");
++            if (tok_str_eq(&d, st_tok, "FAILED")) {
++                upd[i].failed_snapshot = true;
++            } else if (!(tok_str_eq(&d, st_tok, "COMPLETE") || tok_str_eq(&d, st_tok, "PARTIAL"))) {
++                set_detail(rep, "instance %s: snapshot_status invalid", upd[i].id);
++                goto out_drop;
++            }
++            upd[i].assessments_tok = tok_get(&d, io, "assessments");
++            if (!tok_is(&d, upd[i].assessments_tok, JSMN_ARRAY)) {
++                set_detail(rep, "instance %s: assessments missing", upd[i].id);
++                goto out_drop;
++            }
++            if (!epoch_reset) {
++                for (k = 0; k < DC_INSTANCES_MAX; k++) {
++                    const struct ds_connector_instance_seq *line = &st->inst[k];
++
++                    if (line->used && strcmp(line->id, upd[i].id) == 0 &&
++                        strcmp(line->epoch, upd[i].epoch) == 0 &&
++                        seq <= line->sequence) {
++                        drop = DC_REPLAY;
++                        set_detail(rep, "instance %s: sequence %llu <= %llu",
++                                   upd[i].id, (unsigned long long)seq,
++                                   (unsigned long long)line->sequence);
++                        goto out_drop;
++                    }
++                }
++            }
++            j = tok_skip(&d, io);
++        }
++    }
++
++    /* --- records -------------------------------------------------------- */
++    new_pins = calloc(MDS_MAX_DS_NODES, sizeof(*new_pins));
++    seen = calloc(MDS_MAX_DS_NODES, sizeof(*seen));
++    if (new_pins == NULL || seen == NULL) {
++        goto out_drop;
++    }
++    if (!epoch_reset) {
++        memcpy(new_pins, st->pins, MDS_MAX_DS_NODES * sizeof(*new_pins));
++    }
++    batch_profile[0] = '\0';
++    out->count = reg->count;
++    for (i = 0; i < (int)reg->count; i++) {
++        out->rows[i].ds_id = reg->ds[i].ds_id;
++    }
++    for (i = 0; i < n_inst; i++) {
++        int arr = upd[i].assessments_tok;
++        int j = arr + 1;
++        int k;
++
++        for (k = 0; k < toks[arr].size; k++) {
++            int obj = j;
++            struct rec r;
++            const struct ds_connector_registry_ds *rd;
++            struct placement_assessment_row *row = NULL;
++            uint32_t ri;
++            bool rebound = false;
++
++            j = tok_skip(&d, obj);
++            if (!parse_record(&d, obj, &r, rep)) {
++                rep->rejected_shape++;
++                continue;
++            }
++            if (r.ds_id >= st->cfg.max_ds) {
++                rep->unknown_ds++;
++                continue;
++            }
++            rd = registry_find(reg, r.ds_id);
++            if (rd == NULL) {
++                rep->unknown_ds++;
++                continue;
++            }
++            for (ri = 0; ri < reg->count; ri++) {
++                if (reg->ds[ri].ds_id == r.ds_id) {
++                    row = &out->rows[ri];
++                    break;
++                }
++            }
++            if (seen[r.ds_id]) {
++                /* duplicate ds inside one batch: neither record is trusted */
++                if (row != NULL) {
++                    memset(row, 0, sizeof(*row));
++                    row->ds_id = r.ds_id;
++                }
++                rep->rejected_shape++;
++                set_detail(rep, "ds %u appears twice in the batch", r.ds_id);
++                continue;
++            }
++            seen[r.ds_id] = true;
++            /* binding checks */
++            if (strcmp(r.access_scope, st->cfg.access_scope) != 0) {
++                rep->rejected_binding++;
++                set_detail(rep, "ds %u: access_scope_id %s != %s", r.ds_id,
++                           r.access_scope, st->cfg.access_scope);
++                continue;
++            }
++            if (!ds_connector_endpoint_matches(rd, r.server, r.export_path, (uint32_t)r.port)) {
++                rep->rejected_binding++;
++                set_detail(rep, "ds %u: endpoint %s:%s:%llu does not match the registry %s:%s:%u",
++                           r.ds_id, r.server, r.export_path, (unsigned long long)r.port,
++                           rd->host, rd->export_path, (unsigned)rd->tcp_port);
++                continue;
++            }
++            if (st->cfg.expected_profile_digest[0] != '\0' &&
++                strcmp(st->cfg.expected_profile_digest, r.profile_digest) != 0) {
++                rep->rejected_binding++;
++                set_detail(rep, "ds %u: profile digest %s != expected", r.ds_id, r.profile_digest);
++                continue;
++            }
++            if (batch_profile[0] == '\0') {
++                (void)snprintf(batch_profile, sizeof(batch_profile), "%s", r.profile_digest);
++            } else if (strcmp(batch_profile, r.profile_digest) != 0) {
++                rep->rejected_binding++;
++                set_detail(rep, "ds %u: profile digest differs inside the batch", r.ds_id);
++                continue;
++            }
++            if (new_pins[r.ds_id].pinned) {
++                const struct ds_connector_pin *p = &new_pins[r.ds_id];
++
++                if (r.binding_generation > p->binding_generation) {
++                    rebound = true;
++                    pin_set(&new_pins[r.ds_id], &r, upd[i].id);
++                } else if (!pin_matches(p, &r, upd[i].id)) {
++                    rep->rejected_binding++;
++                    set_detail(rep, "ds %u: BINDING_MISMATCH (gen %llu vs pinned %u, %s/%s/%s)",
++                               r.ds_id, (unsigned long long)r.binding_generation,
++                               (unsigned)p->binding_generation, r.datastore_id,
++                               r.target_id, r.target_incarnation);
++                    continue;
++                }
++            } else {
++                pin_set(&new_pins[r.ds_id], &r, upd[i].id);
++            }
++            /* accepted */
++            rep->accepted++;
++            if (row == NULL) {
++                continue;
++            }
++            row->present = true;
++            row->received_mono_ms = now_mono_ms;
++            row->expires_mono_ms = now_mono_ms + r.remaining_ttl_ms;
++            row->allowed = r.allowed;
++            row->multiplier_ppm = (uint32_t)r.ppm;
++            memcpy(row->domain, r.domain, sizeof(row->domain));
++            memcpy(row->reasons, r.reasons, sizeof(row->reasons));
++            row->reason_count = r.reason_count;
++            if (rebound) {
++                rep->rebound++;
++                row->valid = false;
++                if (row->reason_count < PA_REASONS_MAX) {
++                    (void)snprintf(row->reasons[row->reason_count], PA_REASON_LEN, "REBOUND");
++                    row->reason_count++;
++                }
++            } else {
++                row->valid = r.valid && !upd[i].failed_snapshot;
++            }
++        }
++    }
++
++    /* --- commit --------------------------------------------------------- */
++    if (epoch_reset) {
++        memset(st->inst, 0, sizeof(st->inst));
++        MDS_LOG_INFO(LOG_COMP_MDS,
++            "ds_connector: runtime_epoch changed (%s -> %s): sequence lines and "
++            "binding pins reset", st->runtime_epoch, runtime_epoch);
++    }
++    (void)snprintf(st->runtime_epoch, sizeof(st->runtime_epoch), "%s", runtime_epoch);
++    for (i = 0; i < n_inst; i++) {
++        int k;
++        int slot = -1;
++
++        for (k = 0; k < DC_INSTANCES_MAX; k++) {
++            if (st->inst[k].used && strcmp(st->inst[k].id, upd[i].id) == 0) {
++                slot = k;
++                break;
++            }
++        }
++        if (slot < 0) {
++            for (k = 0; k < DC_INSTANCES_MAX; k++) {
++                if (!st->inst[k].used) {
++                    slot = k;
++                    break;
++                }
++            }
++        }
++        if (slot >= 0) {
++            st->inst[slot].used = true;
++            (void)snprintf(st->inst[slot].id, DC_NAME_MAX, "%s", upd[i].id);
++            (void)snprintf(st->inst[slot].epoch, DC_NAME_MAX, "%s", upd[i].epoch);
++            st->inst[slot].sequence = upd[i].sequence;
++        }
++    }
++    memcpy(st->pins, new_pins, MDS_MAX_DS_NODES * sizeof(*new_pins));
++    st->last_generated_at_ms = generated_ms;
++    out->batch_valid = true;
++    out->batch_received_mono_ms = now_mono_ms;
++    (void)snprintf(out->config_digest, sizeof(out->config_digest), "%s", config_digest);
++    (void)snprintf(out->profile_digest, sizeof(out->profile_digest), "%s", batch_profile);
++    rep->drop = DC_OK;
++    free(seen);
++    free(new_pins);
++    free(upd);
++    free(toks);
++    return DC_OK;
++
++out_drop:
++    free(seen);
++    free(new_pins);
++    free(upd);
++    free(toks);
++    if (out != NULL) {
++        memset(out, 0, sizeof(*out));
++    }
++    rep->drop = drop;
++    return drop;
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 46adf06..45785da 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -65,6 +65,7 @@ add_executable(test_placement_policy unit/test_placement_policy.c)
+ add_executable(test_wrr_kernel      unit/test_wrr_kernel.c)
+ add_executable(test_placement_gate  unit/test_placement_gate.c)
+ add_executable(test_placement_create_boundary unit/test_placement_create_boundary.c)
++add_executable(test_ds_connector    unit/test_ds_connector.c)
+ add_executable(test_mds_tls        unit/test_mds_tls.c)
+ add_executable(test_mds_gss        unit/test_mds_gss.c)
+ add_executable(test_config          unit/test_config.c)
+@@ -153,6 +154,7 @@ foreach(test_target
+     test_wrr_kernel
+     test_placement_gate
+     test_placement_create_boundary
++    test_ds_connector
+     test_mds_tls
+     test_mds_gss
+     test_catalogue
+diff --git a/tests/unit/test_ds_connector.c b/tests/unit/test_ds_connector.c
+new file mode 100644
+index 0000000..ca0a62d
+--- /dev/null
++++ b/tests/unit/test_ds_connector.c
+@@ -0,0 +1,372 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * test_ds_connector.c -- the connector batch parser: envelope, sequence
++ * lines, binding pins, per-record shape (design section 7, LAT-06).
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "pnfs_mds.h"
++#include "ds_connector.h"
++
++static int tests_run;
++static int tests_passed;
++static int test_failed;
++
++#define ASSERT_EQ(a, b) do { \
++    if ((long long)(a) != (long long)(b)) { \
++        fprintf(stderr, "  FAIL %s:%d: %s (%lld) != %s (%lld)\n", \
++                __FILE__, __LINE__, #a, (long long)(a), #b, (long long)(b)); \
++        test_failed = 1; \
++        return; \
++    } \
++} while (0)
++
++#define ASSERT_TRUE(cond) do { \
++    if (!(cond)) { \
++        fprintf(stderr, "  FAIL %s:%d: !(%s)\n", __FILE__, __LINE__, #cond); \
++        test_failed = 1; \
++        return; \
++    } \
++} while (0)
++
++#define RUN_TEST(fn) do { \
++    tests_run++; \
++    test_failed = 0; \
++    fprintf(stdout, "  %-58s", #fn); \
++    fflush(stdout); \
++    fn(); \
++    if (test_failed == 0) { tests_passed++; fprintf(stdout, "PASS\n"); } \
++    else { fprintf(stdout, "FAILED\n"); } \
++} while (0)
++
++/* -----------------------------------------------------------------------
++ * Fixtures
++ * ----------------------------------------------------------------------- */
++
++static struct ds_connector_registry REG;
++static struct ds_connector_state ST;
++static char BUF[65536];
++
++static void reg_init(void)
++{
++    memset(&REG, 0, sizeof(REG));
++    REG.count = 2;
++    REG.ds[0].ds_id = 0;
++    snprintf(REG.ds[0].host, sizeof(REG.ds[0].host), "192.168.64.51");
++    snprintf(REG.ds[0].export_path, sizeof(REG.ds[0].export_path), "/mnt/data/pnfs-ds");
++    REG.ds[0].tcp_port = 2049;
++    REG.ds[1].ds_id = 1;
++    snprintf(REG.ds[1].host, sizeof(REG.ds[1].host), "192.168.64.71");
++    snprintf(REG.ds[1].export_path, sizeof(REG.ds[1].export_path), "/mnt/data/pnfs-ds");
++    REG.ds[1].tcp_port = 2049;
++}
++
++static void st_init(const char *profile_pin, const char *config_pin)
++{
++    struct ds_connector_cfg cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.contract_major = 1;
++    cfg.max_ds = 256;
++    snprintf(cfg.access_scope, sizeof(cfg.access_scope), "cluster-default");
++    if (profile_pin) snprintf(cfg.expected_profile_digest, sizeof(cfg.expected_profile_digest), "%s", profile_pin);
++    if (config_pin) snprintf(cfg.expected_config_digest, sizeof(cfg.expected_config_digest), "%s", config_pin);
++    ds_connector_state_init(&ST, &cfg);
++}
++
++/* One assessment record with overridable fields. */
++static const char *rec(uint32_t ds, unsigned gen, const char *target, const char *inc,
++                       const char *server, const char *path, unsigned port,
++                       const char *scope, const char *access, const char *quality,
++                       unsigned ttl, const char *profile, const char *allowed,
++                       unsigned ppm, const char *domain_json)
++{
++    static char r[4][4096];
++    static int slot;
++    char *b = r[slot++ & 3];
++    snprintf(b, 4096,
++        "{\"ds_id\":%u,\"binding_generation\":%u,\"datastore_id\":\"ctrl-1\","
++        "\"target_id\":\"%s\",\"target_incarnation\":%s,"
++        "\"endpoint\":{\"server\":\"%s\",\"export_path\":\"%s\",\"protocol\":\"NFS\",\"transport\":\"TCP\",\"port\":%u},"
++        "\"scope\":\"%s\",\"access_scope_id\":\"%s\",\"quality\":\"%s\","
++        "\"observed_at\":\"2026-09-24T10:00:00Z\",\"evidence_age_ms\":1000,\"remaining_ttl_ms\":%u,"
++        "\"profile\":{\"id\":\"xinas-mvp\",\"version\":\"1\",\"digest\":\"%s\"},"
++        "\"placement\":{\"allowed\":%s,\"multiplier_ppm\":%u,\"reason_codes\":[\"NORMAL\",\"X\"]},"
++        "\"resources\":{\"capacity_domain_id\":%s,\"shared_resource_ids\":[]},\"coverage\":[]}",
++        ds, gen, target, inc, server, path, port, scope, access, quality, ttl, profile, allowed, ppm, domain_json);
++    return b;
++}
++
++static const char *rec_ok(uint32_t ds)
++{
++    return rec(ds, 2, "mnt/data", "\"mnt/data:0:u\"", ds == 0 ? "192.168.64.51" : "192.168.64.71",
++               "/mnt/data", 2049, "NEW_ALLOCATION", "cluster-default", "VALID", 15000,
++               "sha256:p", "true", 1000000, "\"ctrl-1/fs-1/inc\"");
++}
++
++static const char *batch(const char *runtime_epoch, const char *inst_epoch, unsigned seq,
++                         const char *generated_at, const char *config_digest,
++                         const char *snapshot, const char *records)
++{
++    snprintf(BUF, sizeof(BUF),
++        "{\"contract_version\":\"1.0\",\"runtime_epoch\":\"%s\",\"config_digest\":\"%s\","
++        "\"generated_at\":\"%s\",\"instances\":[{\"connector_instance_id\":\"xi-01\","
++        "\"module_type\":\"xinas\",\"epoch\":\"%s\",\"sequence\":%u,\"snapshot_status\":\"%s\","
++        "\"assessments\":[%s]}]}",
++        runtime_epoch, config_digest, generated_at, inst_epoch, seq, snapshot, records);
++    return BUF;
++}
++
++static enum ds_connector_drop apply(const char *text, struct placement_assessment_view *v,
++                                    struct ds_connector_report *rep)
++{
++    return ds_connector_apply_batch(&ST, text, strlen(text), &REG, 1000000, v, rep);
++}
++
++/* -----------------------------------------------------------------------
++ * Tests
++ * ----------------------------------------------------------------------- */
++
++static void test_healthy_batch_is_accepted(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg-d", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
++    ASSERT_EQ(v.batch_valid, true);
++    ASSERT_EQ(v.count, 2u);
++    ASSERT_EQ(v.rows[0].ds_id, 0u);
++    ASSERT_EQ(v.rows[0].present, true);
++    ASSERT_EQ(v.rows[0].valid, true);
++    ASSERT_EQ(v.rows[0].allowed, true);
++    ASSERT_EQ(v.rows[0].multiplier_ppm, 1000000u);
++    ASSERT_EQ(v.rows[0].expires_mono_ms, 1015000u);
++    ASSERT_EQ(v.rows[0].received_mono_ms, 1000000u);
++    ASSERT_EQ(strcmp(v.rows[0].domain, "ctrl-1/fs-1/inc"), 0);
++    ASSERT_EQ(v.rows[0].reason_count, 2u);
++    ASSERT_EQ(strcmp(v.rows[0].reasons[0], "NORMAL"), 0);
++    ASSERT_EQ(v.rows[1].present, false);            /* ds 1 has no record */
++    ASSERT_EQ(strcmp(v.config_digest, "cfg-d"), 0);
++    ASSERT_EQ(strcmp(v.profile_digest, "sha256:p"), 0);
++    ASSERT_EQ(ST.pins[0].pinned, true);
++    ASSERT_EQ(ST.pins[0].binding_generation, 2u);
++    ASSERT_EQ(strcmp(ST.runtime_epoch, "rt-1"), 0);
++    ASSERT_TRUE(ST.last_generated_at_ms > 0);
++}
++
++static void test_contract_major_mismatch(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    const char *b = batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg", "COMPLETE", rec_ok(0));
++    char *m = strdup(b); char *p = strstr(m, "\"1.0\""); p[1] = '2';
++    ASSERT_EQ(apply(m, &v, &rep), DC_CONTRACT_MAJOR);
++    ASSERT_EQ(v.batch_valid, false);
++    ASSERT_EQ(ST.pins[0].pinned, false);           /* state untouched */
++    free(m);
++}
++
++static void test_replay_drops_the_batch_and_keeps_state(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:06Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_REPLAY);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 4, "2026-09-24T10:00:07Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_REPLAY);
++    ASSERT_EQ(v.batch_valid, false);
++    ASSERT_EQ(ST.inst[0].sequence, 5u);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 6, "2026-09-24T10:00:08Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    /* a new instance epoch starts a fresh line */
++    ASSERT_EQ(apply(batch("rt-1", "e2", 1, "2026-09-24T10:00:09Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(ST.inst[0].sequence, 1u);
++}
++
++static void test_runtime_epoch_change_resets_pins(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    /* same generation, different target: a mismatch while rt-1 lives */
++    const char *changed = rec(0, 2, "other-share", "\"o:1\"", "192.168.64.51", "/mnt/data", 2049,
++                              "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", changed), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++    ASSERT_EQ(v.rows[0].present, false);
++    ASSERT_TRUE(strstr(rep.detail, "BINDING_MISMATCH") != NULL);
++    /* after a connector restart (new runtime_epoch) the tuple is re-pinned; an
++     * older generated_at is fine across the epoch boundary */
++    ASSERT_EQ(apply(batch("rt-2", "e1", 1, "2026-09-24T09:00:00Z", "c", "COMPLETE", changed), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
++    ASSERT_EQ(strcmp(ST.pins[0].target_id, "other-share"), 0);
++    ASSERT_EQ(v.rows[0].domain[0], '\0');          /* null domain */
++}
++
++static void test_old_generated_at_is_dropped(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:05Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:04.999Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OLD_GENERATED_AT);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:05Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);   /* equal is fine */
++}
++
++static void test_config_digest_pin(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, "cfg-expected");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg-other", "COMPLETE", rec_ok(0)), &v, &rep), DC_CONFIG_DIGEST);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "cfg-expected", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++}
++
++static void test_profile_digest_pin_and_consistency(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init("sha256:p", NULL);
++    const char *other = rec(1, 1, "s", "null", "192.168.64.71", "/mnt/data", 2049, "NEW_ALLOCATION",
++                            "cluster-default", "VALID", 15000, "sha256:q", "true", 1000000, "null");
++    char recs[8192]; snprintf(recs, sizeof(recs), "%s,%s", rec_ok(0), other);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++    ASSERT_EQ(v.rows[1].present, false);
++    /* without a pin two digests inside one batch still reject the second */
++    st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++}
++
++static void test_endpoint_rule(void)
++{
++    struct ds_connector_registry_ds ds;
++    memset(&ds, 0, sizeof(ds));
++    snprintf(ds.host, sizeof(ds.host), "192.168.64.51");
++    snprintf(ds.export_path, sizeof(ds.export_path), "/mnt/data/pnfs-ds");
++    ds.tcp_port = 2049;
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds", 2049), true);   /* exact */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", 2049), true);           /* under */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/", 2049), true);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/dat", 2049), false);           /* prefix, not a component */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds/sub", 2049), false);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.52", "/mnt/data", 2049), false);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", 2050), false);
++    ds.tcp_port = 0;
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", 2050), true);           /* unknown registry port */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "relative", 2049), false);
++}
++
++static void test_binding_rules_in_a_batch(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    const char *wrong_server = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "10.0.0.9", "/mnt/data", 2049,
++                                   "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", wrong_server), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++    ASSERT_EQ(ST.pins[0].pinned, false);
++    const char *wrong_scope = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
++                                  "NEW_ALLOCATION", "other-scope", "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", wrong_scope), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++    const char *wrong_kind = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
++                                 "SOMETHING", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "c", "COMPLETE", wrong_kind), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_shape, 1u);
++    /* pin, then: same generation + changed incarnation -> mismatch; higher generation -> rebound */
++    ASSERT_EQ(apply(batch("rt-1", "e1", 4, "2026-09-24T10:00:04Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
++    const char *new_inc = rec(0, 2, "mnt/data", "\"mnt/data:0:NEW\"", "192.168.64.51", "/mnt/data", 2049,
++                              "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "c", "COMPLETE", new_inc), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++    ASSERT_EQ(v.rows[0].present, false);
++    const char *rebound = rec(0, 3, "mnt/data", "\"mnt/data:0:NEW\"", "192.168.64.51", "/mnt/data", 2049,
++                              "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 6, "2026-09-24T10:00:06Z", "c", "COMPLETE", rebound), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rebound, 1u);
++    ASSERT_EQ(v.rows[0].present, true);
++    ASSERT_EQ(v.rows[0].valid, false);              /* UNKNOWN until the next fresh record */
++    ASSERT_EQ(ST.pins[0].binding_generation, 3u);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 7, "2026-09-24T10:00:07Z", "c", "COMPLETE", rebound), &v, &rep), DC_OK);
++    ASSERT_EQ(v.rows[0].valid, true);
++    /* lower generation after the re-pin is rejected */
++    ASSERT_EQ(apply(batch("rt-1", "e1", 8, "2026-09-24T10:00:08Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++}
++
++static void test_unknown_duplicate_failed_and_shape(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    const char *unknown = rec(7, 1, "s", "null", "h", "/x", 2049, "NEW_ALLOCATION", "cluster-default",
++                              "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", unknown), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.unknown_ds, 1u);
++    char recs[8192]; snprintf(recs, sizeof(recs), "%s,%s", rec_ok(0), rec_ok(0));
++    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
++    ASSERT_EQ(v.rows[0].present, false);            /* duplicate: neither trusted */
++    ASSERT_TRUE(rep.rejected_shape >= 1u);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "c", "FAILED", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(v.rows[0].present, true);
++    ASSERT_EQ(v.rows[0].valid, false);              /* FAILED snapshot -> UNKNOWN */
++    const char *bad_ttl = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
++                              "NEW_ALLOCATION", "cluster-default", "VALID", 4000000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 4, "2026-09-24T10:00:04Z", "c", "COMPLETE", bad_ttl), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_shape, 1u);
++    const char *bad_ppm = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
++                              "NEW_ALLOCATION", "cluster-default", "VALID", 1000, "sha256:p", "true", 1000001, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "c", "COMPLETE", bad_ppm), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_shape, 1u);
++    const char *denied = rec(0, 2, "mnt/data", "\"mnt/data:0:u\"", "192.168.64.51", "/mnt/data", 2049,
++                             "NEW_ALLOCATION", "cluster-default", "VALID", 1000, "sha256:p", "false", 0, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 6, "2026-09-24T10:00:06Z", "c", "COMPLETE", denied), &v, &rep), DC_OK);
++    ASSERT_EQ(v.rows[0].allowed, false);
++    ASSERT_EQ(v.rows[0].multiplier_ppm, 0u);
++}
++
++static void test_json_and_size_and_schema(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply("{not json", &v, &rep), DC_JSON);
++    ASSERT_EQ(apply("[1,2]", &v, &rep), DC_SCHEMA);
++    ASSERT_EQ(apply("{\"contract_version\":\"1.0\"}", &v, &rep), DC_SCHEMA);
++    ASSERT_EQ(apply("{\"contract_version\":\"1.0\",\"runtime_epoch\":\"r\",\"config_digest\":\"c\",\"generated_at\":\"yesterday\",\"instances\":[]}", &v, &rep), DC_SCHEMA);
++    ASSERT_EQ(apply("{\"contract_version\":\"1.0\",\"runtime_epoch\":\"r\",\"config_digest\":\"c\",\"generated_at\":\"2026-09-24T10:00:00Z\",\"instances\":[]}", &v, &rep), DC_OK);
++    ASSERT_EQ(v.count, 2u);
++    ASSERT_EQ(v.rows[0].present, false);
++    ASSERT_EQ(ds_connector_apply_batch(&ST, "x", DC_BATCH_MAX + 1, &REG, 1, &v, &rep), DC_TOO_LARGE);
++    ASSERT_EQ(strcmp(ds_connector_drop_name(DC_REPLAY), "REPLAY"), 0);
++}
++
++static void test_iso8601(void)
++{
++    ASSERT_EQ(ds_connector_iso8601_ms("2026-09-24T10:00:00Z", 20), 1790244000000ull);
++    ASSERT_EQ(ds_connector_iso8601_ms("2026-09-24T10:00:00.5Z", 22), 1790244000500ull);
++    ASSERT_EQ(ds_connector_iso8601_ms("2026-09-24T10:00:00.123456Z", 27), 1790244000123ull);
++    ASSERT_EQ(ds_connector_iso8601_ms("2026-09-24 10:00:00Z", 20), 0u);
++    ASSERT_EQ(ds_connector_iso8601_ms("2026-09-24T10:00:00", 19), 0u);
++    ASSERT_EQ(ds_connector_iso8601_ms("2026-13-24T10:00:00Z", 20), 0u);
++}
++
++int main(void)
++{
++    printf("test_ds_connector\n");
++    RUN_TEST(test_iso8601);
++    RUN_TEST(test_endpoint_rule);
++    RUN_TEST(test_healthy_batch_is_accepted);
++    RUN_TEST(test_contract_major_mismatch);
++    RUN_TEST(test_replay_drops_the_batch_and_keeps_state);
++    RUN_TEST(test_runtime_epoch_change_resets_pins);
++    RUN_TEST(test_old_generated_at_is_dropped);
++    RUN_TEST(test_config_digest_pin);
++    RUN_TEST(test_profile_digest_pin_and_consistency);
++    RUN_TEST(test_binding_rules_in_a_batch);
++    RUN_TEST(test_unknown_duplicate_failed_and_shape);
++    RUN_TEST(test_json_and_size_and_schema);
++    printf("%d/%d passed\n", tests_passed, tests_run);
++    return tests_passed == tests_run ? 0 : 1;
++}

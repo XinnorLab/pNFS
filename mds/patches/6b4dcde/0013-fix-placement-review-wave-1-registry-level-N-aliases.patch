@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 22:25:52 +0300
-Subject: [PATCH 13/13] =?UTF-8?q?fix(placement):=20review=20wave=201=20?=
+Subject: [PATCH 13/19] =?UTF-8?q?fix(placement):=20review=20wave=201=20?=
  =?UTF-8?q?=E2=80=94=20registry-level=20N/aliases=20from=20the=20view,=20l?=
  =?UTF-8?q?ive=20admin=20state=20at=20the=20create=20boundary,=20per-DS=20?=
  =?UTF-8?q?reason=20metrics,=20observations=20survive=20registry=20reloads?=

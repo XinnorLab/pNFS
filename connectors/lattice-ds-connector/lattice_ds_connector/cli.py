@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Command line: ``run``, ``validate-config``, ``show``, ``describe``, ``discover``."""
+"""Command line: ``run``, ``validate-config``, ``show``, ``describe``, ``discover``, ``preflight``."""
 
 from __future__ import annotations
 
@@ -120,6 +120,19 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """Read-only readiness report for an MDS about to run smart placement."""
+    from .preflight import run as preflight_run
+
+    expect = []
+    if args.expect_ds:
+        for part in args.expect_ds.split(","):
+            part = part.strip()
+            if part:
+                expect.append(int(part))
+    return preflight_run(args.socket, expect, args.json)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     logger = Logger()
     try:
@@ -181,6 +194,11 @@ def build_parser() -> argparse.ArgumentParser:
     show.set_defaults(func=cmd_show)
     desc = sub.add_parser("describe", help="list the registered module types")
     desc.set_defaults(func=cmd_describe)
+    pre = sub.add_parser("preflight", help="read-only readiness report for an MDS about to run smart placement")
+    pre.add_argument("--socket", default="/run/lattice-ds-connector/connector.sock")
+    pre.add_argument("--expect-ds", default="", help="comma-separated DS ids that must be bound")
+    pre.add_argument("--json", action="store_true")
+    pre.set_defaults(func=cmd_preflight)
     disc = sub.add_parser("discover", help="fetch each xinas source once and print the share incarnations to pin")
     disc.add_argument("--config", default=DEFAULT_CONFIG)
     disc.add_argument("--instance", default=None)
