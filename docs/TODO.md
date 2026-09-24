@@ -43,6 +43,18 @@ entry when it lands.
   failed once on ubuntu-latest and passed on re-run and on node225. Done =
   either an upstream fix for the memdb race or a retry/exclusion of that
   integration bench in `placement-modes.yml`; watch the next runs first.
+- **Adversarial review 2026-09-24 (Stage B, wave 2), carried over.** All
+  17 findings are fixed on the fork (96d02b8) except two that are
+  behaviour, not bugs: (1) a backwards wall-clock step on the connector
+  host drops batches as `OLD_GENERATED_AT` until the clock passes the
+  last accepted `generated_at` or the connector restarts (new
+  `runtime_epoch`) — `smart` fails closed, the detail names it; done =
+  the connector CLI/runbook tells the operator to restart the unit on a
+  clock step, or the connector bumps `runtime_epoch` itself when it sees
+  its own clock go backwards. (2) The connector-side profile reload is
+  accepted without a rebind now (digest checked per batch, not pinned);
+  done = an acceptance row that reloads the profile on the stand and
+  shows no `BINDING_MISMATCH`.
 - **Cross-repo manifest check.** `docs/placement-modes/contract-manifest.json`
   is pinned by a fork unit test (`test_manifest_constants`) by hand; a CI
   job that diffs the two is Stage C.

@@ -119,7 +119,8 @@
       "applies_to": [
         "smart"
       ],
-      "implemented": "B"
+      "implemented": "B",
+      "note": "`true` without placement_mode is PLACEMENT_MODE_CONFLICT"
     },
     {
       "key": "ds_connector_socket",
@@ -128,7 +129,8 @@
       "applies_to": [
         "smart"
       ],
-      "implemented": "B"
+      "implemented": "B",
+      "constraint": "absolute path, strlen < 108 (sun_path); RANGE otherwise"
     },
     {
       "key": "ds_connector_poll_ms",
@@ -287,14 +289,13 @@
   "connector_client": {
     "contract_version_major": 1,
     "scope": "NEW_ALLOCATION",
-    "endpoint_rule": "endpoint.server == registry.host; endpoint.port == registry.tcp_port when both set; registry.export_path == endpoint.export_path or lies under it",
+    "endpoint_rule": "endpoint.server == registry.host; endpoint.port == registry.tcp_port when both set; registry.export_path == endpoint.export_path or lies under it; a trailing '/' on endpoint.export_path is ignored",
     "binding_pin": [
       "connector_instance_id",
       "binding_generation",
       "datastore_id",
       "target_id",
       "target_incarnation",
-      "profile.digest",
       "access_scope_id"
     ],
     "rebind_rule": "a strictly higher binding_generation re-pins and leaves the DS UNKNOWN for that batch; any other change is BINDING_MISMATCH",
@@ -324,9 +325,16 @@
       "covered_ds",
       "eligible_ds"
     ],
-    "reachable_rule": "a successful poll within 3 x ds_connector_poll_ms",
+    "reachable_rule": "an accepted batch within 3 x ds_connector_poll_ms; recomputed on every failure kind (CONNECT, TIMEOUT, HTTP, UNAVAILABLE, DROP) and mirrored by pnfs_mds_connector_reachable",
     "ttl_max_ms": 3600000,
-    "batch_max_bytes": 4194304
+    "batch_max_bytes": 4194304,
+    "contract_version_rule": "<major>.<rest>: digits, no leading zero, a '.' must follow the major; the major equals ds_connector_expected_contract_major",
+    "sequence_rule": "per (instance, epoch): equal = the same snapshot re-served (accepted, rows re-timed); lower = REPLAY (batch dropped); a new runtime_epoch resets every line and pin; at most 64 instance lines, a batch needing more is refused",
+    "profile_digest_rule": "identical across the batch and equal to ds_connector_expected_profile_digest when set; checked on every batch, not pinned (a connector profile reload is not a rebind)",
+    "duplicate_rule": "a ds_id present more than once in a batch has no trusted record and pins nothing",
+    "string_rule": "standard JSON escapes decoded, \\uXXXX with surrogate pairs; lone surrogates and \\u0000 are shape errors",
+    "json_depth_max": 64,
+    "http_client": "Unix socket, Content-Length framing only (Transfer-Encoding is refused), body <= 4 MiB, EOF before Content-Length = TIMEOUT-class failure, MSG_NOSIGNAL"
   },
   "cmake_flags": [
     "-DENABLE_WRR=ON",
