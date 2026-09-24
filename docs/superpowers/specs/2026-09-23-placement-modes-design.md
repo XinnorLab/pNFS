@@ -346,6 +346,23 @@ our build; the module is a no-op when the mode is not `smart`):
      is `BINDING_MISMATCH`: the record is rejected, the DS is UNKNOWN,
      the mismatch is counted and logged with both tuples. A record that
      fails any check excludes only that DS.
+
+     **Unobserved incarnation (stand finding 2026-09-24).** The batch
+     schema allows `target_incarnation: null` on a `quality = UNKNOWN`
+     record and forbids it on a `VALID` one: when the connector cannot
+     read its source at all (`SOURCE_UNAVAILABLE`, `SOURCE_FAILED`) it
+     knows the binding it was configured with but not the share's
+     incarnation. Such a record is compared on the rest of the tuple
+     (instance, generation, datastore_id, target_id, access scope) and
+     the incarnation is *not* compared; the record is accepted as UNKNOWN
+     with the connector's reason codes (`ASSESSMENT_UNKNOWN` in the
+     gate), the pin is left as it was, and no pin is created from it — the
+     first VALID record pins. A higher generation on an unobserved record
+     clears the pin (rebind) without pinning. A VALID record with a null
+     incarnation is a shape error. Before this rule the MDS read the null
+     as a changed incarnation and reported `BINDING_MISMATCH` — the same
+     refusal, but it sent the operator to rebind a DS whose only problem
+     was a stopped source.
 - **Cache:** an immutable array indexed by `ds_id`, published by pointer
   swap; each entry carries `allowed`, `ppm`, `quality`, `domain`,
   `reason[0..3]`, `expires_mono_ms = receive_mono + remaining_ttl_ms`. The

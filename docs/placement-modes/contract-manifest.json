@@ -334,7 +334,8 @@
     "duplicate_rule": "a ds_id present more than once in a batch has no trusted record and pins nothing",
     "string_rule": "standard JSON escapes decoded, \\uXXXX with surrogate pairs; lone surrogates and \\u0000 are shape errors",
     "json_depth_max": 64,
-    "http_client": "Unix socket, Content-Length framing only (Transfer-Encoding is refused), body <= 4 MiB, EOF before Content-Length = TIMEOUT-class failure, MSG_NOSIGNAL"
+    "http_client": "Unix socket, Content-Length framing only (Transfer-Encoding is refused), body <= 4 MiB, EOF before Content-Length = TIMEOUT-class failure, MSG_NOSIGNAL",
+    "unobserved_incarnation_rule": "target_incarnation null is legal only with quality UNKNOWN: the tuple is compared without the incarnation, the record is accepted as UNKNOWN, the pin is neither created nor changed (a higher generation clears it); VALID with null incarnation is a shape error"
   },
   "cmake_flags": [
     "-DENABLE_WRR=ON",

@@ -3,88 +3,92 @@
   "upstream_sha": "6b4dcde3cd6a8b02e8a012695ff0c29e93a0caf4",
   "fork": "XinnorLab/pnfs-lattice",
   "fork_branch": "xinnor/placement-modes",
-  "fork_sha": "96d02b897e3ce7dbbd1ddc7063916ce7eb9817c1",
+  "fork_sha": "3a76e6c2ac9b5f61b31f49b5de43611f413715d2",
   "patches_dir": "patches/6b4dcde",
   "patches": [
     {
       "file": "0001-feat-wrr-vendor-the-XinnorLab-kernel-kernel-id-refus.patch",
-      "sha256": "6c25f30759324472b777ba03db865f7d45414f2dd7cddf529c2f5050f3b107a5"
+      "sha256": "acc923a4babf59d596507681e80ca056ac96f6fd0d2a4155b789be119ee82400"
     },
     {
       "file": "0002-feat-config-placement_mode-rr-fill-smart-with-confli.patch",
-      "sha256": "969a3b8d559fd17a310501fbe196c0291a131f5b76de3a24bd9e0db66a31ef12"
+      "sha256": "8cfbf44f3895938c106cb10dec9c2adbe5fb00bb983efb05ac35b25fd45a5991"
     },
     {
       "file": "0003-feat-ds_capacity-per-DS-observation-record-avail-fsi.patch",
-      "sha256": "d1ce9afb70f44a628ec54be0463727aa1e931c482b6b950d950d2207ab6fdfa7"
+      "sha256": "7dbe71329af4fe21c7ae9949018f759aba6aa0b6f39b355858d58f6b7e91f3a3"
     },
     {
       "file": "0004-feat-placement-candidate-gate-and-admit-for-rr-fill-.patch",
-      "sha256": "9d79c4d55f9e2726aaf72c7b03d7534af57332ba585c9bc31852ec25736d7e53"
+      "sha256": "1b87fe71f6f41ed2ae48916bbacac11eae7853809a2966639ffaf4cd16a43127"
     },
     {
       "file": "0005-feat-placement-gate-singleton-with-a-published-capac.patch",
-      "sha256": "7da51e20ccb39f5f135f7f878357a21b24e7ceccb81463fcfce59b4d3874fa1d"
+      "sha256": "ca179561f698f1c395bd25ad52ab54ccfb86657a38c2a1aee5c0760c4671f340"
     },
     {
       "file": "0006-feat-placement-every-selection-site-goes-through-pla.patch",
-      "sha256": "b2c7e09bfccb2f48318eec5602af4ab806eeec21c0f1669f0649de7e80f244a2"
+      "sha256": "405e29464b6067d1918eb082688729c9353aa1940d17b4f228510d8e663a3d29"
     },
     {
       "file": "0007-feat-proxy_io-split-lookup-from-create-every-DS-file.patch",
-      "sha256": "815037eee19932062900949959a9c17775da818ffa88aaa5be386f13ceb88dc3"
+      "sha256": "7d3df86baa9f96b530c6974c12e44c13da89091d13d35ae15aa240338c775eb0"
     },
     {
       "file": "0008-feat-admin-config-show-reports-placement-mode-genera.patch",
-      "sha256": "b0176a5f5c75660e361ec38c37043f084cb6f74ba1c09db269dd84577e03882f"
+      "sha256": "0480d6205c51f5d659d447917403b20d1df188582dc5eeca08768075e2ea4a43"
     },
     {
       "file": "0009-docs-placement-operator-guide-rr-fill-examples-and-a.patch",
-      "sha256": "e944d5001bcec395a20dcd44e8c11225308589c53029db9b95d606897f138e80"
+      "sha256": "f7c00a2d3789a639bbc7b96c4d8c3a79670acdfba28897896c269f16fcb30096"
     },
     {
       "file": "0010-fix-build-declare-rondb_boot_epoch-in-builds-without.patch",
-      "sha256": "ad96c999d8b519ab919d233807364e870b509f57b1ec738890327e2e8e58f406"
+      "sha256": "2929921c51f4fcd417ef7ea6b5e6680d4390eeb6b8518dd23f7169dfbf195eb9"
     },
     {
       "file": "0011-fix-placement-a-future-dated-capacity-observation-is.patch",
-      "sha256": "1b8f4e5d7e90d8816a565301031df3ab4f91e49108abbbbd064d3daedf5d0171"
+      "sha256": "10c925f50a93c9686eed0cb335d3e2b4085331d1ab0efeee30fb6a00f93c78f4"
     },
     {
       "file": "0012-ci-placement-the-selector-proof-greps-C-sources-only.patch",
-      "sha256": "08a1aa662bc3c05919bf32ae7b165ffb705ea2e88b02f8c15a5f591df0b03932"
+      "sha256": "5349f0d77ecaa946f537e768dfe54844c5f942f41e1d07a3bdb7dc5bbd99e44a"
     },
     {
       "file": "0013-fix-placement-review-wave-1-registry-level-N-aliases.patch",
-      "sha256": "9caed3df5d044190048efd890a33590ab7a61fea8d6433d2ce8301afabfc6995"
+      "sha256": "cff267efef209a3596ea62dfdfdb0a7e4207784b4c2b57ad7fdfa41facb8ef86"
     },
     {
       "file": "0014-feat-config-ds_connector_-keys-for-placement_mode-sm.patch",
-      "sha256": "84a8a256ceca90edcf799ee0904629c90cb15fc198ecc06c7eb1887ab224ca5e"
+      "sha256": "94086d40b0067d4cbbbe24a4a19763ea1b848f639792fc1d653100823db666ed"
     },
     {
       "file": "0015-feat-ds_connector-batch-parser-with-envelope-sequenc.patch",
-      "sha256": "099345f74f403824e14b09a32744aac7014d1dc48447cee0f5c5cdbb5a7b6d07"
+      "sha256": "03108f0c426c5ae7ef4ef18471cf985762a153ae716705404320d977541d85a8"
     },
     {
       "file": "0016-feat-ds_connector-Unix-socket-HTTP-client-poll-threa.patch",
-      "sha256": "3118086f9e91b128b7343b0c9198e2cd8c26e2eb5f6f280ac8ac38a620eaf2c3"
+      "sha256": "e9a4e315c0cbb2acd70d4573fc69ef4c908b745dd347567f720b76d99874e2de"
     },
     {
       "file": "0017-feat-placement-smart-candidate-rule-connector-domain.patch",
-      "sha256": "0ad51920b7cd94b3db049a06514974a19fada0d8795ecf0d748ca418de7dd268"
+      "sha256": "cd22c4ececd24bdc289c30c993fa7d5c21fd3b9a7dd866e4c5e6ea5e5c957177"
     },
     {
       "file": "0018-feat-mds-start-the-connector-client-in-placement_mod.patch",
-      "sha256": "22075d3ced597e5172e395a640a9073c0c961d09fe39fddea9093e0c46f9e473"
+      "sha256": "aefe3fe8c83110ac3cb164224c18534791479d70882da4cbf3c488cfbde5f91f"
     },
     {
       "file": "0019-docs-placement-smart-connector-client-binding-rules-.patch",
-      "sha256": "be15e3f0bf13976897b06dc7910102d777e4b5241399969fea68f3c18d491913"
+      "sha256": "f974ba93658c08e856cfcc085101cea7a4d986f9f87acfc6de14bcd159976350"
     },
     {
       "file": "0020-fix-placement-Stage-B-review-wave-2-steady-state-seq.patch",
-      "sha256": "cc0f3d6d3a20a332d47e5adc9bf709fe35cba345d3c1e30f2c446017516ef8ef"
+      "sha256": "7f6e5bf8c05929787bfe05e041fe8185fe6c665e659bf0a3366a11be7c624440"
+    },
+    {
+      "file": "0021-fix-ds_connector-an-unobserved-incarnation-on-an-UNK.patch",
+      "sha256": "c0c8c40e51616f553768e2ce74d7b789d29ed90c4fb29a16dc661a3d190172ad"
     }
   ],
   "cmake_flags": [

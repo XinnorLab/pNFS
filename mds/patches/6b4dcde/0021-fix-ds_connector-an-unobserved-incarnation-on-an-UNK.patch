@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:06:08 +0300
+Subject: [PATCH 21/21] fix(ds_connector): an unobserved incarnation on an
+ UNKNOWN record is not a binding mismatch
+
+Stand finding (2026-09-24, smart on the lab MDS): with xinas-agent stopped
+the connector publishes its binding as UNKNOWN / SOURCE_UNAVAILABLE with
+`target_incarnation: null` -- it knows the configured binding but cannot
+observe the share.  The MDS compared the null against the pinned
+incarnation, rejected the record as BINDING_MISMATCH and showed the DS as
+NO_BINDING: the same refusal, but it sent the operator to rebind a DS
+whose only problem was a stopped source.
+
+The batch schema allows a null incarnation only on an UNKNOWN record.
+Now: the tuple is compared without the incarnation, the record is
+accepted as UNKNOWN (ASSESSMENT_UNKNOWN with the connector's reason
+codes), no pin is created from it and an existing pin is kept; a higher
+generation on such a record clears the pin and the next VALID record
+pins; a VALID record with a null incarnation is a shape error.  Design
+spec section 7 and the contract manifest carry the rule.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ docs/placement-modes.md        | 11 ++++--
+ src/mds/ds_connector.c         | 24 ++++++++++---
+ tests/unit/test_ds_connector.c | 66 +++++++++++++++++++++++++++++++---
+ 3 files changed, 90 insertions(+), 11 deletions(-)
+
+diff --git a/docs/placement-modes.md b/docs/placement-modes.md
+index 813138b..d97f4aa 100644
+--- a/docs/placement-modes.md
++++ b/docs/placement-modes.md
+@@ -151,8 +151,15 @@ endpoint path names the same share).  The first accepted tuple
+ target_incarnation, access scope)` is pinned per DS; a later record must
+ repeat it or carry a higher `binding_generation` (rebind: the DS is
+ UNKNOWN for that batch); anything else is `BINDING_MISMATCH` and that DS
+-has no record.  The profile digest is deliberately **not** part of the
+-pin: it is checked on every batch (pin key and batch-wide consistency),
++has no record.  A `quality = UNKNOWN` record may carry
++`target_incarnation: null` — the connector could not read its source and
++knows the configured binding but not the share's incarnation; it is
++compared on the rest of the tuple, accepted as UNKNOWN
++(`ASSESSMENT_UNKNOWN` with the connector's reason codes, e.g.
++`SOURCE_UNAVAILABLE`), and it neither creates nor changes a pin (a higher
++generation clears the pin; the next VALID record pins).  A VALID record
++with a null incarnation is a shape error.  The profile digest is
++deliberately **not** part of the pin: it is checked on every batch (pin key and batch-wide consistency),
+ and a connector profile reload must not strand every DS in
+ `BINDING_MISMATCH` until a process restart.  Records for unknown DS ids
+ are ignored; a DS id that appears more than once in a batch has no
+diff --git a/src/mds/ds_connector.c b/src/mds/ds_connector.c
+index 65a2d24..a427d90 100644
+--- a/src/mds/ds_connector.c
++++ b/src/mds/ds_connector.c
+@@ -542,6 +542,12 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
+         set_detail(rep, "ds %u: quality invalid", r->ds_id);
+         return false;
+     }
++    /* the schema allows a null incarnation only on an UNKNOWN record:
++     * the connector knows its binding but could not observe the share */
++    if (r->valid && r->target_incarnation[0] == '\0') {
++        set_detail(rep, "ds %u: VALID record without target_incarnation", r->ds_id);
++        return false;
++    }
+     if (!tok_u64(d, tok_get(d, obj, "remaining_ttl_ms"), &r->remaining_ttl_ms) ||
+         r->remaining_ttl_ms > DC_TTL_MAX_MS) {
+         set_detail(rep, "ds %u: remaining_ttl_ms invalid", r->ds_id);
+@@ -611,11 +617,15 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
+ static bool pin_matches(const struct ds_connector_pin *p, const struct rec *r,
+                         const char *instance)
+ {
++    /* an unobserved incarnation (null on an UNKNOWN record) is not compared:
++     * the source was unreadable, the binding itself did not change */
++    bool unobserved = (r->target_incarnation[0] == '\0');
++
+     return strcmp(p->instance, instance) == 0 &&
+            p->binding_generation == (uint32_t)r->binding_generation &&
+            strcmp(p->datastore_id, r->datastore_id) == 0 &&
+            strcmp(p->target_id, r->target_id) == 0 &&
+-           strcmp(p->target_incarnation, r->target_incarnation) == 0 &&
++           (unobserved || strcmp(p->target_incarnation, r->target_incarnation) == 0) &&
+            strcmp(p->access_scope, r->access_scope) == 0;
+ }
+ 
+@@ -1004,7 +1014,13 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
+ 
+                 if (r.binding_generation > p->binding_generation) {
+                     rebound = true;
+-                    pin_set(&new_pins[r.ds_id], &r, upd[i].id);
++                    if (r.target_incarnation[0] == '\0') {
++                        /* rebind announced by an unobserved record: drop
++                         * the old pin, the next VALID record pins */
++                        memset(&new_pins[r.ds_id], 0, sizeof(new_pins[r.ds_id]));
++                    } else {
++                        pin_set(&new_pins[r.ds_id], &r, upd[i].id);
++                    }
+                 } else if (!pin_matches(p, &r, upd[i].id)) {
+                     rep->rejected_binding++;
+                     set_detail(rep, "ds %u: BINDING_MISMATCH (gen %llu vs pinned %u, %s/%s/%s)",
+@@ -1013,10 +1029,10 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
+                                r.target_id, r.target_incarnation);
+                     continue;
+                 }
+-            } else {
++            } else if (r.target_incarnation[0] != '\0') {
+                 pin_set(&new_pins[r.ds_id], &r, upd[i].id);
+             }
+-            /* accepted */
++            /* accepted (an unobserved record with no pin yet pins nothing) */
+             rep->accepted++;
+             if (row == NULL) {
+                 continue;
+diff --git a/tests/unit/test_ds_connector.c b/tests/unit/test_ds_connector.c
+index f2bf258..23f1fb4 100644
+--- a/tests/unit/test_ds_connector.c
++++ b/tests/unit/test_ds_connector.c
+@@ -230,7 +230,7 @@ static void test_profile_digest_pin_and_consistency(void)
+ {
+     struct placement_assessment_view v; struct ds_connector_report rep;
+     reg_init(); st_init("sha256:p", NULL);
+-    const char *other = rec(1, 1, "s", "null", "192.168.64.71", "/mnt/data", 2049, "NEW_ALLOCATION",
++    const char *other = rec(1, 1, "s", "\"i\"", "192.168.64.71", "/mnt/data", 2049, "NEW_ALLOCATION",
+                             "cluster-default", "VALID", 15000, "sha256:q", "true", 1000000, "null");
+     char recs[8192]; snprintf(recs, sizeof(recs), "%s,%s", rec_ok(0), other);
+     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", recs), &v, &rep), DC_OK);
+@@ -317,7 +317,7 @@ static void test_unknown_duplicate_failed_and_shape(void)
+ {
+     struct placement_assessment_view v; struct ds_connector_report rep;
+     reg_init(); st_init(NULL, NULL);
+-    const char *unknown = rec(7, 1, "s", "null", "h", "/x", 2049, "NEW_ALLOCATION", "cluster-default",
++    const char *unknown = rec(7, 1, "s", "\"i\"", "h", "/x", 2049, "NEW_ALLOCATION", "cluster-default",
+                               "VALID", 15000, "sha256:p", "true", 1000000, "null");
+     ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", unknown), &v, &rep), DC_OK);
+     ASSERT_EQ(rep.unknown_ds, 1u);
+@@ -870,27 +870,82 @@ static void test_unicode_escapes_in_strings(void)
+      * NUL as a record shape error */
+     const char *bad_json[] = { "\\u12", "\\x41", "tail\\" };
+     for (unsigned i = 0; i < sizeof(bad_json) / sizeof(bad_json[0]); i++) {
+-        const char *r = rec(1, 1, bad_json[i], "null", "192.168.64.71", "/mnt/data", 2049,
++        const char *r = rec(1, 1, bad_json[i], "\"i\"", "192.168.64.71", "/mnt/data", 2049,
+                             "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+         ASSERT_EQ(apply(batch("rt-1", "e1", 3 + i, "2026-09-24T10:00:03Z", "c", "COMPLETE", r), &v, &rep), DC_JSON);
+         ASSERT_EQ(ST.pins[1].pinned, false);
+     }
+     const char *bad_shape[] = { "\\ud83d", "\\ude00", "\\u0000", "\\ud83d\\u0041" };
+     for (unsigned i = 0; i < sizeof(bad_shape) / sizeof(bad_shape[0]); i++) {
+-        const char *r = rec(1, 1, bad_shape[i], "null", "192.168.64.71", "/mnt/data", 2049,
++        const char *r = rec(1, 1, bad_shape[i], "\"i\"", "192.168.64.71", "/mnt/data", 2049,
+                             "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+         ASSERT_EQ(apply(batch("rt-1", "e1", 6 + i, "2026-09-24T10:00:03Z", "c", "COMPLETE", r), &v, &rep), DC_OK);
+         ASSERT_EQ(rep.rejected_shape, 1u);
+         ASSERT_EQ(ST.pins[1].pinned, false);
+     }
+     /* the ordinary escapes decode too */
+-    const char *esc = rec(1, 1, "a\\/b\\\"c\\\\d", "null", "192.168.64.71", "/mnt/data", 2049,
++    const char *esc = rec(1, 1, "a\\/b\\\"c\\\\d", "\"i\"", "192.168.64.71", "/mnt/data", 2049,
+                           "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
+     ASSERT_EQ(apply(batch("rt-1", "e1", 20, "2026-09-24T10:00:20Z", "c", "COMPLETE", esc), &v, &rep), DC_OK);
+     ASSERT_EQ(rep.accepted, 1u);
+     ASSERT_EQ(strcmp(ST.pins[1].target_id, "a/b\"c\\d"), 0);
+ }
+ 
++static void test_unobserved_incarnation_on_unknown_records(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    reg_init(); st_init(NULL, NULL);
++    /* the source is down before the first VALID record: UNKNOWN + null
++     * incarnation is accepted, the row is present and invalid, nothing pins */
++    const char *down = rec(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
++                           "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 15000, "sha256:p", "false", 0, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", down), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
++    ASSERT_EQ(rep.rejected_binding, 0u);
++    ASSERT_EQ(v.rows[0].present, true);
++    ASSERT_EQ(v.rows[0].valid, false);
++    ASSERT_EQ(ST.pins[0].pinned, false);
++    /* the source comes back: the VALID record pins */
++    ASSERT_EQ(apply(batch("rt-1", "e1", 2, "2026-09-24T10:00:02Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(ST.pins[0].pinned, true);
++    ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:u"), 0);
++    /* the source goes down again (the stand: xinas-agent stopped): the
++     * unobserved record matches the pin on the rest of the tuple -- UNKNOWN,
++     * not BINDING_MISMATCH, and the pin keeps its incarnation */
++    ASSERT_EQ(apply(batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "c", "COMPLETE", down), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
++    ASSERT_EQ(rep.rejected_binding, 0u);
++    ASSERT_EQ(v.rows[0].present, true);
++    ASSERT_EQ(v.rows[0].valid, false);
++    ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:u"), 0);
++    /* ... but the rest of the tuple is still checked */
++    const char *other = rec(0, 2, "other-share", "null", "192.168.64.51", "/mnt/data", 2049,
++                            "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 15000, "sha256:p", "false", 0, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 4, "2026-09-24T10:00:04Z", "c", "COMPLETE", other), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++    ASSERT_TRUE(strstr(rep.detail, "BINDING_MISMATCH") != NULL);
++    /* a VALID record must carry the incarnation */
++    const char *valid_null = rec(0, 2, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
++                                 "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 5, "2026-09-24T10:00:05Z", "c", "COMPLETE", valid_null), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_shape, 1u);
++    ASSERT_EQ(v.rows[0].present, false);
++    /* a rebind announced while the source is down clears the pin; the next
++     * VALID record with the new generation pins */
++    const char *rebind_down = rec(0, 3, "mnt/data", "null", "192.168.64.51", "/mnt/data", 2049,
++                                  "NEW_ALLOCATION", "cluster-default", "UNKNOWN", 15000, "sha256:p", "false", 0, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 6, "2026-09-24T10:00:06Z", "c", "COMPLETE", rebind_down), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rebound, 1u);
++    ASSERT_EQ(ST.pins[0].pinned, false);
++    const char *rebound_valid = rec(0, 3, "mnt/data", "\"mnt/data:0:NEW\"", "192.168.64.51", "/mnt/data", 2049,
++                                    "NEW_ALLOCATION", "cluster-default", "VALID", 15000, "sha256:p", "true", 1000000, "null");
++    ASSERT_EQ(apply(batch("rt-1", "e1", 7, "2026-09-24T10:00:07Z", "c", "COMPLETE", rebound_valid), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
++    ASSERT_EQ(ST.pins[0].binding_generation, 3u);
++    ASSERT_EQ(strcmp(ST.pins[0].target_incarnation, "mnt/data:0:NEW"), 0);
++    ASSERT_EQ(v.rows[0].valid, true);
++}
++
+ static void test_contract_version_shapes(void)
+ {
+     struct placement_assessment_view v; struct ds_connector_report rep;
+@@ -968,6 +1023,7 @@ int main(void)
+     RUN_TEST(test_deep_nesting_is_bounded_and_skipped_without_recursion);
+     RUN_TEST(test_unicode_escapes_in_strings);
+     RUN_TEST(test_contract_version_shapes);
++    RUN_TEST(test_unobserved_incarnation_on_unknown_records);
+     RUN_TEST(test_http_get_streamed_oversize_and_short_body);
+     printf("%d/%d passed\n", tests_passed, tests_run);
+     return tests_passed == tests_run ? 0 : 1;

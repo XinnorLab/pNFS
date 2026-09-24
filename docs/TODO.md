@@ -55,6 +55,15 @@ entry when it lands.
   accepted without a rebind now (digest checked per batch, not pinned);
   done = an acceptance row that reloads the profile on the stand and
   shows no `BINDING_MISMATCH`.
+- **Stand 2026-09-24 (smart), carried over.** (1) The capacity domain the
+  xinas profile publishes (`<controller>/<fs uuid>/<fs incarnation>:<device>`)
+  is 123 bytes on the lab; the MDS row holds 127. A longer device path
+  makes the record a shape error. Done = a length rule in
+  `profile-xinas-mvp.md` (or a shorter domain form) and a connector-side
+  check. (2) `pm-run.sh --no-sync` resets the remote tree to the pushed
+  base commit (it does not keep the last synced modifications); a full
+  run after a targeted run must sync again or push first. Done = the
+  script prints which tree it tested (sha + "local mods" / "committed").
 - **Cross-repo manifest check.** `docs/placement-modes/contract-manifest.json`
   is pinned by a fork unit test (`test_manifest_constants`) by hand; a CI
   job that diffs the two is Stage C.
