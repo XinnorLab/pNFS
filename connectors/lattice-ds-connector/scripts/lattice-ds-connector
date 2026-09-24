@@ -1,0 +1,5 @@
+#!/bin/sh
+# lattice-ds-connector -- run the CLI from an unpacked tree (no pip install):
+#   /opt/lattice-ds-connector/scripts/lattice-ds-connector preflight --json …
+here=$(cd "$(dirname "$0")/.." && pwd)
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m lattice_ds_connector "$@"
