@@ -14,12 +14,15 @@ from typing import List, Optional
 
 from . import __version__, manifest as manifest_mod
 from .ini import IniDocument
+from .live import MdsState, read_desired_mode, read_mds
 from .setmode import SetRefused, apply_plan, plan_set
 from .validate import fold_preflight, run_preflight, validate_document
+from .verify import render_show, verdict
 
 EXIT_OK = 0
 EXIT_NOT_READY = 1
 EXIT_ERROR = 2
+EXIT_UNREADABLE = 2
 
 
 def _read_text(path: str) -> str:
@@ -151,6 +154,77 @@ def cmd_set(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# mode show / verify
+# ---------------------------------------------------------------------------
+
+def _hosts(text: str) -> List[str]:
+    return [h.strip() for h in (text or "").split(",") if h.strip()]
+
+
+def _collect_states(args: argparse.Namespace) -> Optional[List[MdsState]]:
+    hosts = _hosts(args.mds)
+    if not hosts:
+        print("ERROR: --mds needs at least one host", file=sys.stderr)
+        return None
+    try:
+        env = _parse_kv(args.env, "--env")
+    except ValueError as exc:
+        print("ERROR: %s" % exc, file=sys.stderr)
+        return None
+    states: List[MdsState] = []
+    for i, host in enumerate(hosts):
+        desired = None
+        if args.ssh:
+            desired = read_desired_mode(args.config_path, ssh_target="%s@%s" % (args.ssh, host))
+        elif args.config and i == 0:
+            desired = read_desired_mode(args.config)
+        states.append(read_mds(host, mds_admin=args.mds_admin, port=args.mds_port, env=env,
+                               metrics_port=None if args.no_metrics else args.metrics_port, desired=desired))
+    return states
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    states = _collect_states(args)
+    if states is None:
+        return EXIT_ERROR
+    if args.json:
+        print(json.dumps({"mds": [s.as_dict() for s in states]}, indent=2, sort_keys=True))
+    else:
+        print(render_show(states))
+    return EXIT_UNREADABLE if any(not s.ok for s in states) else EXIT_OK
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    states = _collect_states(args)
+    if states is None:
+        return EXIT_ERROR
+    v = verdict(states, require_full_coverage=args.require_full_coverage)
+    if args.json:
+        print(json.dumps(v.as_dict(), indent=2, sort_keys=True))
+    else:
+        print("OK" if v.exit_code == EXIT_OK else ("UNREADABLE" if v.exit_code == EXIT_UNREADABLE else "NOT OK"))
+        for e in v.errors:
+            print("  error:   %s" % e)
+        for w in v.warnings:
+            print("  warning: %s" % w)
+        print(render_show(states))
+    return v.exit_code
+
+
+def _add_live_args(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--mds", required=True, help="comma-separated MDS hosts (the address the cluster transport binds)")
+    sp.add_argument("--mds-admin", default="mds-admin", help="path of mds-admin (default: on PATH)")
+    sp.add_argument("--mds-port", type=int, default=50051, help="admin/cluster transport port (default 50051)")
+    sp.add_argument("--env", action="append", metavar="KEY=VALUE", help="environment for mds-admin, e.g. LD_LIBRARY_PATH=…")
+    sp.add_argument("--metrics-port", type=int, default=9090)
+    sp.add_argument("--no-metrics", action="store_true", help="do not scrape /metrics")
+    sp.add_argument("--config", default=None, help="the local mds.conf of the FIRST host (its desired mode)")
+    sp.add_argument("--ssh", default=None, metavar="USER", help="read every host's desired mode with `ssh USER@host cat --config-path`")
+    sp.add_argument("--config-path", default="/etc/pnfs-mds/mds.conf")
+    sp.add_argument("--json", action="store_true")
+
+
+# ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
 
@@ -186,6 +260,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--audit-log", default=manifest_mod.load().cli.get("audit_log", "/var/lib/lattice-placement/audit.log"))
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_set)
+
+    sh = sub.add_parser("show", help="live placement state of each MDS (never inferred from a file)")
+    _add_live_args(sh)
+    sh.set_defaults(func=cmd_show)
+
+    vf = sub.add_parser("verify", help="exit 0 when every MDS runs the same mode/generation/build and is ready")
+    _add_live_args(vf)
+    vf.add_argument("--require-full-coverage", action="store_true",
+                    help="smart: partial coverage is a failure, not a warning")
+    vf.set_defaults(func=cmd_verify)
     return p
 
 

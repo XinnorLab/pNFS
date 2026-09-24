@@ -1,0 +1,61 @@
+# HELP pnfs_mds_placement_mode Effective placement mode (1 on the active series).
+# TYPE pnfs_mds_placement_mode gauge
+pnfs_mds_placement_mode{mode="legacy"} 1
+# HELP pnfs_mds_placement_eligible_ds Candidates at the last placement decision.
+# TYPE pnfs_mds_placement_eligible_ds gauge
+pnfs_mds_placement_eligible_ds 0
+# HELP pnfs_mds_placement_alias_suspected_total Same filesystem id behind two host names.
+# TYPE pnfs_mds_placement_alias_suspected_total counter
+pnfs_mds_placement_alias_suspected_total 0
+# HELP pnfs_mds_placement_rejections_total DS rejected by the placement gate, by reason.
+# TYPE pnfs_mds_placement_rejections_total counter
+pnfs_mds_placement_rejections_total{reason="DS_OFFLINE"} 0
+pnfs_mds_placement_rejections_total{reason="CAPACITY_UNKNOWN"} 0
+pnfs_mds_placement_rejections_total{reason="CAPACITY_STALE"} 0
+pnfs_mds_placement_rejections_total{reason="CAPACITY_FULL"} 0
+pnfs_mds_placement_rejections_total{reason="DOMAIN_MAP_CONTRADICTION"} 0
+pnfs_mds_placement_rejections_total{reason="SHARED_FS_ALIAS_UNMAPPED"} 0
+pnfs_mds_placement_rejections_total{reason="ASSESSMENT_UNKNOWN"} 0
+pnfs_mds_placement_rejections_total{reason="ASSESSMENT_STALE"} 0
+pnfs_mds_placement_rejections_total{reason="CONNECTOR_DENIED"} 0
+pnfs_mds_placement_rejections_total{reason="ZERO_MULTIPLIER"} 0
+pnfs_mds_placement_rejections_total{reason="NO_BINDING"} 0
+pnfs_mds_placement_rejections_total{reason="NO_ELIGIBLE_DS"} 0
+pnfs_mds_placement_rejections_total{reason="INSUFFICIENT_ELIGIBLE_DS"} 0
+pnfs_mds_placement_rejections_total{reason="MODE_NOT_READY"} 0
+pnfs_mds_placement_rejections_total{reason="WEIGHT_OVERFLOW"} 0
+pnfs_mds_placement_rejections_total{reason="DOMAIN_MAP_MISMATCH"} 0
+# HELP pnfs_mds_connector_batches_accepted_total Connector batches accepted.
+# TYPE pnfs_mds_connector_batches_accepted_total counter
+pnfs_mds_connector_batches_accepted_total 0
+# HELP pnfs_mds_connector_covered_ds Registered DS with a fresh VALID assessment.
+# TYPE pnfs_mds_connector_covered_ds gauge
+pnfs_mds_connector_covered_ds 0
+# HELP pnfs_mds_connector_reachable 1 when the last poll within 3 intervals succeeded.
+# TYPE pnfs_mds_connector_reachable gauge
+pnfs_mds_connector_reachable 0
+# HELP pnfs_mds_connector_last_success_mono_ms Monotonic ms of the last accepted batch (0 = never).
+# TYPE pnfs_mds_connector_last_success_mono_ms gauge
+pnfs_mds_connector_last_success_mono_ms 0
+# HELP pnfs_mds_connector_poll_errors_total Connector polls that produced no accepted batch, by code.
+# TYPE pnfs_mds_connector_poll_errors_total counter
+pnfs_mds_connector_poll_errors_total{code="CONNECT"} 0
+pnfs_mds_connector_poll_errors_total{code="TIMEOUT"} 0
+pnfs_mds_connector_poll_errors_total{code="HTTP"} 0
+pnfs_mds_connector_poll_errors_total{code="UNAVAILABLE"} 0
+pnfs_mds_connector_poll_errors_total{code="DROP"} 0
+# HELP pnfs_mds_connector_batches_dropped_total Connector batches dropped whole, by reason.
+# TYPE pnfs_mds_connector_batches_dropped_total counter
+pnfs_mds_connector_batches_dropped_total{reason="JSON"} 0
+pnfs_mds_connector_batches_dropped_total{reason="SCHEMA"} 0
+pnfs_mds_connector_batches_dropped_total{reason="CONTRACT_MAJOR"} 0
+pnfs_mds_connector_batches_dropped_total{reason="REPLAY"} 0
+pnfs_mds_connector_batches_dropped_total{reason="OLD_GENERATED_AT"} 0
+pnfs_mds_connector_batches_dropped_total{reason="CONFIG_DIGEST"} 0
+pnfs_mds_connector_batches_dropped_total{reason="TOO_LARGE"} 0
+# HELP pnfs_mds_placement_heap_fallback_total Placement dispatcher heap-fallback count (ds_count > MDS_PLACEMENT_STACK_MAX).
+# TYPE pnfs_mds_placement_heap_fallback_total counter
+pnfs_mds_placement_heap_fallback_total 0
+# HELP pnfs_mds_placement_degraded_total Placement degraded count (stripe*mirror > ONLINE DSes).
+# TYPE pnfs_mds_placement_degraded_total counter
+pnfs_mds_placement_degraded_total 0
