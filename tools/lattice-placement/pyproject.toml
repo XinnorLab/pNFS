@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lattice-placement"
+version = "0.1.0"
+description = "Operator helper for pnfs-lattice placement modes: mode show | validate | set | verify"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+lattice-placement = "lattice_placement.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lattice_placement*"]
+
+[tool.setuptools.package-data]
+lattice_placement = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
