@@ -282,11 +282,14 @@ def read_mds(host: str, *, mds_admin: str = "mds-admin", port: int = 50051,
     metrics_error: Optional[str] = None
     if metrics_port:
         url = "http://%s:%d/metrics" % (host, metrics_port)
-        try:
-            with urllib.request.urlopen(url, timeout=timeout_s) as resp:
-                metrics = parse_metrics(resp.read().decode("utf-8", "replace"))
-        except Exception as exc:      # noqa: BLE001 -- the metrics are secondary; the row says so
-            metrics_error = "%s: %s" % (url, exc)
+        for attempt in (1, 2):        # the MDS metrics listener resets a connection now and then
+            try:
+                with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+                    metrics = parse_metrics(resp.read().decode("utf-8", "replace"))
+                metrics_error = None
+                break
+            except Exception as exc:      # noqa: BLE001 -- the metrics are secondary; the row says so
+                metrics_error = "%s: %s" % (url, exc)
     st = state_from_show(host, show, metrics, desired)
     st.metrics_error = metrics_error
     return st
