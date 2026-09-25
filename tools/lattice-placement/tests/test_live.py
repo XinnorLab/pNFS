@@ -62,13 +62,13 @@ def test_state_from_show_smart_partial_and_none():
     assert s2.generation.startswith("faf2d6bbd3bf") and s2.kernel_id == "58494e01"
     assert s2.build == {"wrr": 1, "connector": 1, "prealloc": 0}
     assert s2.readiness.coverage == "partial" and s2.readiness.covered_ds == 1 and s2.readiness.eligible_ds == 1
-    assert s2.config_digest.startswith("sha256:30259fc1") and s2.profile_digest.startswith("sha256:c9bee5b2")
+    assert s2.config_digest.startswith("sha256:30259fc1") and s2.profiles["xinas-mvp"].startswith("sha256:c9bee5b2")
     assert s2.last_detail == "accepted 1"
     assert [r.ds_id for r in s2.ds] == [0, 1] and s2.ds[1].reason == "NO_BINDING"
     assert s2.metrics["pnfs_mds_connector_covered_ds"] == 1.0
     s1 = state_from_show("192.168.65.223", parse_config_show(fixture("config-show-smart-mds1-none.json")))
     assert s1.readiness.coverage == "none" and not s1.readiness.connector_reachable
-    assert s1.config_digest is None and s1.profile_digest is None       # "-" means none
+    assert s1.config_digest is None and s1.profiles is None       # "-" means none
     assert s1.last_detail.startswith("socket /run/lattice-ds-connector/connector.sock")
     assert all(r.reason == "MODE_NOT_READY" for r in s1.ds)
     legacy = state_from_show("x", parse_config_show(fixture("config-show-legacy-mds2.json")))

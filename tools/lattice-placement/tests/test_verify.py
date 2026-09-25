@@ -54,8 +54,11 @@ def test_differences_across_mds():
     b.readiness = None
     assert any(e.startswith("MODE_MISMATCH") for e in verdict([a, b]).errors)
     b = smart2("m2")
-    b.profile_digest = "sha256:other"
-    assert any(e.startswith("CONNECTOR_PROFILE_DIGEST_MISMATCH") for e in verdict([a, b]).errors)
+    b.profiles = {"xinas-mvp": "sha256:other"}
+    assert any(e.startswith("CONNECTOR_PROFILES_MISMATCH") for e in verdict([a, b]).errors)
+    b = smart2("m2")
+    b.profiles = dict(a.profiles, **{"zfs-mvp": "sha256:z"})
+    assert any(e.startswith("CONNECTOR_PROFILES_MISMATCH") for e in verdict([a, b]).errors)
 
 
 def test_desired_versus_effective_and_unreadable():

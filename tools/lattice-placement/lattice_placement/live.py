@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from .ini import IniDocument
 from .manifest import MODE_LEGACY
+from .profiles import parse_pins
 
 _KV = re.compile(r"(\S+?)=(\S*)")
 
@@ -71,7 +72,7 @@ class MdsState:
     build: Dict[str, int] = field(default_factory=dict)
     readiness: Optional[Readiness] = None
     config_digest: Optional[str] = None
-    profile_digest: Optional[str] = None
+    profiles: Optional[Dict[str, str]] = None
     last_detail: Optional[str] = None
     ds: List[DsRow] = field(default_factory=list)
     metrics: Dict[str, float] = field(default_factory=dict)
@@ -84,7 +85,7 @@ class MdsState:
             "desired_mode": self.desired_mode, "mode": self.mode, "mode_effective": self.mode_effective,
             "generation": self.generation, "kernel_id": self.kernel_id, "build": dict(self.build),
             "readiness": self.readiness.as_dict() if self.readiness else None,
-            "config_digest": self.config_digest, "profile_digest": self.profile_digest,
+            "config_digest": self.config_digest, "profiles": self.profiles,
             "last_detail": self.last_detail, "ds": [r.as_dict() for r in self.ds],
             "metrics": dict(self.metrics), "metrics_error": self.metrics_error,
         }
@@ -189,10 +190,16 @@ def state_from_show(host: str, show: Dict[str, str], metrics: Optional[Dict[str,
         st.build = parse_build(show["placement_build"])
     if "placement_readiness" in show:
         st.readiness = parse_readiness(show["placement_readiness"])
-    for key in ("placement_connector_config_digest", "placement_connector_profile_digest"):
+    for key in ("placement_connector_config_digest",):
         v = show.get(key)
         if v is not None and v != "-":
             setattr(st, key.replace("placement_connector_", ""), v)
+    raw_profiles = show.get("placement_connector_profiles")
+    if raw_profiles not in (None, "", "-"):
+        try:
+            st.profiles = parse_pins(raw_profiles)
+        except ValueError:
+            st.profiles = {"<unparsable>": raw_profiles}
     st.last_detail = show.get("placement_connector_last_detail")
     rows: List[DsRow] = []
     for key, value in show.items():
