@@ -316,7 +316,9 @@
       "REPLAY",
       "OLD_GENERATED_AT",
       "CONFIG_DIGEST",
-      "TOO_LARGE"
+      "TOO_LARGE",
+      "PROFILE_INCONSISTENT",
+      "PROFILE_LIMIT"
     ],
     "poll_errors": [
       "CONNECT",
