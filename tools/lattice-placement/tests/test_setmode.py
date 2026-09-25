@@ -28,6 +28,18 @@ ds_weight.1 = 45
 """
 
 
+def test_plan_set_migrates_the_removed_profile_digest_key_outside_the_managed_block():
+    # ds_connector_expected_profile_digest lives outside the managed block
+    # (a hand-edited file, or one from before this change); mode set must
+    # migrate it away rather than have the re-validation refuse the plan.
+    text = LAB_LEGACY + "ds_connector_expected_profile_digest = sha256:a\n"
+    p = plan_set(text, "smart", {"ds_connector_poll_ms": "1000",
+                                 "ds_connector_request_deadline_ms": "500"}, M)
+    assert "ds_connector_expected_profile_digest" in p.removed_keys
+    assert "ds_connector_expected_profile_digest" not in p.after
+    assert any("ds_connector_expected_profiles" in n for n in p.notes)
+
+
 def test_plan_smart_from_legacy_removes_legacy_keys_and_appends_the_block():
     p = plan_set(LAB_LEGACY, "smart", {"ds_connector_poll_ms": "1000",
                                        "ds_connector_request_deadline_ms": "500"}, M)

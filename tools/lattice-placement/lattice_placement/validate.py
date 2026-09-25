@@ -77,8 +77,13 @@ def validate_document(doc: IniDocument, mode: str, manifest: Manifest,
 
     for removed in manifest.raw.get("removed_keys", []):
         if removed["key"] in eff:
-            err.append("LEGACY_KEY: %s was removed; use %s = <profile-id>=<digest>[,...]"
-                       % (removed["key"], removed["replaced_by"]))
+            hint = removed.get("hint")
+            if hint:
+                err.append("LEGACY_KEY: %s was removed; use %s = %s"
+                           % (removed["key"], removed["replaced_by"], hint))
+            else:
+                err.append("LEGACY_KEY: %s was removed; use %s"
+                           % (removed["key"], removed["replaced_by"]))
 
     if mode not in manifest.modes and mode != MODE_LEGACY:
         err.append("RANGE: unknown placement mode %r (rr, fill, smart, legacy)" % mode)

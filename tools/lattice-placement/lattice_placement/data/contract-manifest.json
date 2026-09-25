@@ -224,7 +224,8 @@
   "removed_keys": [
     {
       "key": "ds_connector_expected_profile_digest",
-      "replaced_by": "ds_connector_expected_profiles"
+      "replaced_by": "ds_connector_expected_profiles",
+      "hint": "<profile-id>=<digest>[,...]"
     }
   ],
   "weight": {

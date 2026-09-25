@@ -148,6 +148,17 @@ def test_legacy_profile_digest_key_is_an_error_in_every_mode():
         r = rep("placement_mode = %s\nds_connector_expected_profile_digest = sha256:a\n" % mode, mode)
         assert "LEGACY_KEY" in codes(r)
         assert any("ds_connector_expected_profiles" in e for e in r.errors)
+        assert any("ds_connector_expected_profiles = <profile-id>=<digest>[,...]" in e for e in r.errors)
+
+
+def test_legacy_key_message_falls_back_without_a_hint(monkeypatch):
+    m2 = manifest_mod.Manifest(dict(M.raw))
+    m2.raw["removed_keys"] = [{"key": "ds_connector_expected_profile_digest",
+                               "replaced_by": "ds_connector_expected_profiles"}]
+    r = validate_document(IniDocument.parse("placement_mode = smart\nds_connector_expected_profile_digest = sha256:a\n"),
+                          "smart", m2, assume_set=False)
+    assert any(e == "LEGACY_KEY: ds_connector_expected_profile_digest was removed; use ds_connector_expected_profiles"
+              for e in r.errors)
 
 
 @pytest.mark.parametrize("value,ok", [
@@ -167,6 +178,7 @@ def test_manifest_lists_the_new_key_and_the_removed_one():
     assert "ds_connector_expected_profiles" in M.keys
     assert "ds_connector_expected_profile_digest" not in M.keys
     assert M.raw["removed_keys"] == [{"key": "ds_connector_expected_profile_digest",
-                                      "replaced_by": "ds_connector_expected_profiles"}]
+                                      "replaced_by": "ds_connector_expected_profiles",
+                                      "hint": "<profile-id>=<digest>[,...]"}]
     assert "placement_connector_profiles" in M.config_show_keys
     assert "placement_connector_profile_digest" not in M.config_show_keys
