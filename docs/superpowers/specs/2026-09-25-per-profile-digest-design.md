@@ -80,10 +80,10 @@ After the existing per-assessment binding checks (§7, layer 2 of the placement-
 While walking the records the client builds the batch's
 `id → digest` map. A second digest for an id already in the map drops
 the whole batch (`DC_PROFILE_INCONSISTENT`,
-`pnfs_mds_connector_batches_dropped_total{reason="profile_inconsistent"}`,
+`pnfs_mds_connector_batches_dropped_total{reason="PROFILE_INCONSISTENT"}`,
 detail `profile <id>: digests <a> and <b> in one batch`); no DS of that
 batch is accepted, as for an envelope failure. More than 8 distinct ids
-in a batch drops it too (`reason="profile_limit"`).
+in a batch drops it too (`DC_PROFILE_LIMIT`, `reason="PROFILE_LIMIT"`).
 
 The map is built from every syntactically valid record, including
 records later rejected for binding reasons, so a pin mismatch on one DS
