@@ -110,6 +110,28 @@ then `verify` again — the cluster is either fully on the new mode or fully
 on the old one, never half-switched (a half-switched cluster is what
 `MODE_MISMATCH` / `GENERATION_MISMATCH` report).
 
+## Upgrading to per-profile digest pins
+
+This build replaces the single `ds_connector_expected_profile_digest` pin
+with a per-profile map, `ds_connector_expected_profiles`. Three things to
+know before rolling it out:
+
+- **Upgrade the connector before `lattice-placement`.** `mode validate`
+  now passes `--expect-profiles` to `lattice-ds-connector preflight`; an
+  older connector does not know that flag and will refuse it.
+- **The MDS config generation of every `smart` MDS changes with this
+  build** (the hashed config line that feeds `generation` now includes
+  `conn_profiles=…` instead of the old single-digest line). During a
+  rolling upgrade, `mode verify` reports `GENERATION_MISMATCH` between
+  hosts already on the new build and hosts still on the old one — expected
+  until every MDS runs the new build, not a sign the switch went wrong.
+- **Replace `ds_connector_expected_profile_digest` with
+  `ds_connector_expected_profiles` before restarting any MDS.** The MDS
+  refuses the old key as a config error; `mode set` migrates it away
+  automatically wherever it sits in the file, so running `mode set
+  <mode>` (or re-running it with no mode change) before the restart is
+  enough.
+
 ## `smart` prerequisites
 
 - A `lattice-ds-connector` unit on **every** MDS host (each MDS reads only
