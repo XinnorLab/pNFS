@@ -11,6 +11,9 @@ from typing import Dict
 
 PROFILE_ID_PATTERN = r"^[A-Za-z0-9._-]{1,63}$"
 MAX_PROFILES = 8
+#: PM_DIGEST_MAX in the MDS is 128 bytes including the NUL terminator, so
+#: 127 is the longest digest string the MDS will accept.
+MAX_DIGEST_LEN = 127
 
 
 def parse_pins(text: str) -> Dict[str, str]:
@@ -25,6 +28,8 @@ def parse_pins(text: str) -> Dict[str, str]:
             raise ValueError("profile id %r must match [A-Za-z0-9._-]{1,63}" % pid)
         if not dig:
             raise ValueError("profile %s: empty digest" % pid)
+        if len(dig) > MAX_DIGEST_LEN:
+            raise ValueError("profile %s: digest must be 1..%d bytes" % (pid, MAX_DIGEST_LEN))
         if pid in out:
             raise ValueError("profile %s pinned twice" % pid)
         out[pid] = dig

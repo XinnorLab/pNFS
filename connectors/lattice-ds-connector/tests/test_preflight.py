@@ -112,9 +112,11 @@ def test_parse_and_format_profile_pins():
     assert parse_profile_pins(" zfs-mvp=sha256:z, xinas-mvp=sha256:p ") == {"xinas-mvp": "sha256:p", "zfs-mvp": "sha256:z"}
     assert format_profiles({"zfs-mvp": "z", "xinas-mvp": "p"}) == "xinas-mvp=p,zfs-mvp=z"
     assert format_profiles({}) == "-"
-    for bad in ("", "x", "a b=d", "a=d,a=e", "a=", ",".join("p%d=d" % i for i in range(9)), "a\nb=d"):
+    for bad in ("", "x", "a b=d", "a=d,a=e", "a=", ",".join("p%d=d" % i for i in range(9)), "a\nb=d",
+               "a=" + "d" * 128):
         with pytest.raises(ValueError):
             parse_profile_pins(bad)
+    assert parse_profile_pins("a=" + "d" * 127) == {"a": "d" * 127}
 
 
 def test_preflight_cli_over_the_socket(tmp_path, capsys):

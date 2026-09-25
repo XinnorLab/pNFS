@@ -16,3 +16,13 @@ def test_parse_and_format():
 def test_parse_rejects(bad):
     with pytest.raises(ValueError):
         parse_pins(bad)
+
+
+def test_parse_rejects_a_digest_over_127_bytes():
+    with pytest.raises(ValueError):
+        parse_pins("a=" + "d" * 128)
+
+
+def test_parse_accepts_a_127_byte_digest():
+    pins = parse_pins("a=" + "d" * 127)
+    assert pins["a"] == "d" * 127

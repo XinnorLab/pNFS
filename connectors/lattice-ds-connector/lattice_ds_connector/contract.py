@@ -186,3 +186,6 @@ LEVELS_WITHOUT_INITIALIZATION = frozenset({"0"})
 PROFILE_ID_PATTERN = r"^[A-Za-z0-9._-]{1,63}$"
 #: PM_PROFILES_MAX in the MDS.
 MAX_PROFILES = 8
+#: PM_DIGEST_MAX in the MDS is 128 bytes including the NUL terminator, so
+#: 127 is the longest digest string the MDS will accept.
+MAX_DIGEST_LEN = 127

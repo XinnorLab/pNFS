@@ -41,6 +41,8 @@ def parse_profile_pins(text: str) -> Dict[str, str]:
             raise ValueError("profile id %r must match [A-Za-z0-9._-]{1,63}" % pid)
         if not dig:
             raise ValueError("profile %s: empty digest" % pid)
+        if len(dig) > contract.MAX_DIGEST_LEN:
+            raise ValueError("profile %s: digest must be 1..%d bytes" % (pid, contract.MAX_DIGEST_LEN))
         if pid in out:
             raise ValueError("profile %s pinned twice" % pid)
         out[pid] = dig
