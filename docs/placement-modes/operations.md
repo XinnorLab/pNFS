@@ -118,7 +118,7 @@ on the old one, never half-switched (a half-switched cluster is what
 - The same connector configuration on every host (same
   `config_digest`); `verify` compares the digests the MDS report. After
   the first successful switch, pin them:
-  `--set ds_connector_expected_config_digest=sha256:… --set ds_connector_expected_profile_digest=sha256:…`.
+  `--set ds_connector_expected_config_digest=sha256:… --set ds_connector_expected_profiles=xinas-mvp=sha256:…`.
 - `lattice-ds-connector preflight --expect-ds <every registered id>` READY
   on every host.
 
@@ -127,7 +127,7 @@ on the old one, never half-switched (a half-switched cluster is what
 ```
 192.168.65.225: desired=smart effective=smart generation=faf2d6bbd3bf kernel=58494e01 build=connector=1 prealloc=0 wrr=1
   readiness: mode_active=1 connector_config_valid=1 connector_reachable=1 last_batch_valid=1 coverage=partial registered=2 covered=1 eligible=1
-  connector: config_digest=sha256:30259fc1… profile_digest=sha256:c9bee5b2… last=accepted 1
+  connector: config_digest=sha256:30259fc1… profiles=xinas-mvp=sha256:c9bee5b2… last=accepted 1
   ds 0   ONLINE   domain=e4e9…:/dev/xi_data cap_age=1.4s avail=41.4TB/42.2TB assess=VALID allowed=1 ppm=1000000 ttl=14.9s age=0.4s weight=6422528000000 reason=NONE
   ds 1   ONLINE   domain=ds:1 cap_age=1.4s avail=33.9TB/34.6TB assess=NONE allowed=0 ppm=0 ttl=0.0s age=- weight=0 reason=NO_BINDING
   metrics: eligible_ds=1 rejections=NO_BINDING=20
