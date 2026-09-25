@@ -15,6 +15,7 @@ from typing import List, Optional
 from . import __version__, manifest as manifest_mod
 from .ini import IniDocument
 from .live import MdsState, read_desired_mode, read_mds
+from .profiles import parse_pins
 from .setmode import SetRefused, apply_plan, plan_set
 from .validate import fold_preflight, run_preflight, validate_document
 from .verify import render_show, verdict
@@ -55,8 +56,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if args.mode == "smart":
         pre = None
         if rep.ready or args.connector_socket:
+            raw_profiles = doc.effective().get("ds_connector_expected_profiles")
+            expect_profiles = None
+            if raw_profiles is not None:
+                try:
+                    parse_pins(raw_profiles)
+                except ValueError:
+                    expect_profiles = None  # already a RANGE error above; do not also confuse the connector
+                else:
+                    expect_profiles = raw_profiles
             pre = run_preflight(args.connector_cli, args.connector_socket, _parse_ds_list(args.expect_ds),
-                                expect_profiles=doc.effective().get("ds_connector_expected_profiles"))
+                                expect_profiles=expect_profiles)
         rep = fold_preflight(rep, pre)
     if args.json:
         print(json.dumps(rep.as_dict(), indent=2, sort_keys=True))

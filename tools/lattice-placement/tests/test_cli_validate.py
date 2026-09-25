@@ -20,6 +20,15 @@ def fake_connector(tmp_path, ready, reasons=()):
     return write(tmp_path, "fake-connector", script, 0o755)
 
 
+def recording_connector(tmp_path, ready=True):
+    """A fake connector that logs its argv (one invocation per line) so a
+    test can check what --expect-profiles it was, or was not, given."""
+    log = tmp_path / "argv.log"
+    body = json.dumps({"ready": ready, "reasons": [], "ds": []})
+    script = "#!/bin/sh\necho \"$*\" >> %s\necho '%s'\n" % (log, body)
+    return write(tmp_path, "recording-connector", script, 0o755), log
+
+
 def test_validate_exit_codes(tmp_path, capsys):
     cfg = write(tmp_path, "mds.conf", "placement_mode = fill\nds_capacity_poll_ms = 10000\n")
     assert main(["mode", "validate", "fill", "--config", cfg]) == 0
@@ -57,3 +66,18 @@ def test_validate_smart_uses_the_connector(tmp_path, capsys):
     # no connector CLI at all: NOT_READY, never a crash
     assert main(["mode", "validate", "smart", "--config", cfg, "--connector-cli", str(tmp_path / "nope")]) == 1
     assert "CONNECTOR:UNAVAILABLE" in capsys.readouterr().out
+
+
+def test_validate_does_not_forward_a_malformed_expect_profiles_to_the_connector(tmp_path, capsys):
+    """A malformed ds_connector_expected_profiles is already a RANGE error;
+    forwarding it raw as --expect-profiles just makes the connector CLI
+    exit 2 and adds a redundant CONNECTOR:UNAVAILABLE on top."""
+    cfg = write(tmp_path, "mds.conf",
+               "placement_mode = smart\nds_connector_expected_profiles = bad id=sha256:a\n")
+    conn, log = recording_connector(tmp_path)
+    main(["mode", "validate", "smart", "--config", cfg, "--connector-cli", conn,
+          "--connector-socket", "/tmp/x.sock"])
+    out = capsys.readouterr().out
+    assert "error:   RANGE: ds_connector_expected_profiles" in out
+    assert "CONNECTOR:UNAVAILABLE" not in out
+    assert "--expect-profiles" not in log.read_text()
