@@ -179,3 +179,10 @@ XIRAID_MEMBER_WORDS = frozenset({"online", "offline", "reconstructing", "need_re
 
 #: RAID levels that carry an initialization phase (XMOD-07): everything but 0.
 LEVELS_WITHOUT_INITIALIZATION = frozenset({"0"})
+
+#: A profile id is used verbatim as a key of the MDS pin map
+#: (ds_connector_expected_profiles = id=digest,...), so it cannot carry
+#: '=', ',' or whitespace. Shared with the batch schema and the MDS parser.
+PROFILE_ID_PATTERN = r"^[A-Za-z0-9._-]{1,63}$"
+#: PM_PROFILES_MAX in the MDS.
+MAX_PROFILES = 8

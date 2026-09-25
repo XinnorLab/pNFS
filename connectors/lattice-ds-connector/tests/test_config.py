@@ -142,3 +142,36 @@ def test_load_config_bad_json(tmp_path):
     with pytest.raises(ConfigError) as ei:
         load_config(str(p))
     assert ei.value.issues[0].code == "JSON"
+
+
+def test_profile_id_must_be_a_pin_key(token_file, tmp_path):
+    for bad in ("bad id", "a=b", "x" * 64, "a,b"):
+        doc = example(token_file, tmp_path)
+        doc["profiles"][0]["id"] = bad
+        doc["instances"][0]["profile"] = bad
+        assert ("PROFILE_ID_INVALID", "profiles[0].id") in errors_of(doc)
+
+
+def test_at_most_eight_profiles(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    for i in range(8):
+        p = copy.deepcopy(doc["profiles"][0])
+        p["id"] = "extra-%d" % i
+        doc["profiles"].append(p)
+    assert ("LIMIT", "profiles") in errors_of(doc)
+
+
+def test_two_xinas_instances_on_two_profiles_validate(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    other = copy.deepcopy(doc["profiles"][0])
+    other["id"] = "xinas-strict"
+    other["degraded_multiplier_ppm"] = 0
+    doc["profiles"].append(other)
+    inst = copy.deepcopy(doc["instances"][0])
+    inst["id"] = "xi-02"
+    inst["profile"] = "xinas-strict"
+    inst["bindings"] = [dict(inst["bindings"][0], ds_id=7)]
+    doc["instances"].append(inst)
+    config, issues = validate_config_dict(doc)
+    assert config is not None, [(i.code, i.path, i.message) for i in issues]
+    assert config.profiles["xinas-mvp"].digest != config.profiles["xinas-strict"].digest

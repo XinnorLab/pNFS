@@ -572,3 +572,12 @@ def test_metrics_text_has_bounded_labels():
     text = rt.metrics_text()
     assert 'connector_collect_total{instance="xi-01",result="ok"} 1' in text
     assert 'connector_assessment_allowed{instance="xi-01",ds_id="0"} 0' in text
+
+
+def test_batch_schema_rejects_a_profile_id_that_cannot_be_pinned(schemas):
+    jsonschema = pytest.importorskip("jsonschema")
+    prof = (schemas["batch"]["properties"]["instances"]["items"]["properties"]["assessments"]
+            ["items"]["properties"]["profile"])
+    assert prof["properties"]["id"]["pattern"] == "^[A-Za-z0-9._-]{1,63}$"
+    assert prof["properties"]["id"]["maxLength"] == 63
+    assert not jsonschema.Draft7Validator(prof).is_valid({"id": "bad id", "version": "1", "digest": "d"})

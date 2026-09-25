@@ -46,7 +46,7 @@
                 "profile": {
                   "type": "object",
                   "properties": {
-                    "id": { "type": "string", "minLength": 1 },
+                    "id": { "type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[A-Za-z0-9._-]{1,63}$" },
                     "version": { "type": "string", "minLength": 1 },
                     "digest": { "type": "string", "minLength": 1 }
                   },
