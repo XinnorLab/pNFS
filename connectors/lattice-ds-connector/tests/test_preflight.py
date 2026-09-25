@@ -29,7 +29,7 @@ def batch(*records, contract="1.0"):
     }
 
 
-def record(ds_id, quality="VALID", allowed=True, ppm=1000000, ttl=15000, domain="ctrl/fs-1", datastore="ctrl", profile="sha256:p"):
+def record(ds_id, quality="VALID", allowed=True, ppm=1000000, ttl=15000, domain="ctrl/fs-1", datastore="ctrl", profile="sha256:p", pid="xinas-mvp"):
     return {
         "ds_id": ds_id,
         "binding_generation": 2,
@@ -38,7 +38,7 @@ def record(ds_id, quality="VALID", allowed=True, ppm=1000000, ttl=15000, domain=
         "target_incarnation": "share:%d:u" % ds_id,
         "quality": quality,
         "remaining_ttl_ms": ttl,
-        "profile": {"id": "xinas-mvp", "version": "1", "digest": profile},
+        "profile": {"id": pid, "version": "1", "digest": profile},
         "placement": {"allowed": allowed, "multiplier_ppm": ppm, "reason_codes": ["NORMAL"]},
         "resources": {"capacity_domain_id": domain, "shared_resource_ids": []},
     }
@@ -50,10 +50,11 @@ HEALTH_OK = {"ready": True, "running": True}
 def test_ready_on_a_healthy_batch():
     r = evaluate(HEALTH_OK, batch(record(0), record(1, domain="ctrl/fs-2")), expect_ds=[0, 1])
     assert r["ready"] and r["reasons"] == []
-    assert r["profile_digest"] == "sha256:p" and r["config_digest"] == "sha256:cfg"
+    assert r["profiles"] == {"xinas-mvp": "sha256:p"} and r["config_digest"] == "sha256:cfg"
     assert [d["ds_id"] for d in r["ds"]] == [0, 1]
     text = render(r)
     assert text.startswith("READY") and "ds   0 VALID" in text
+    assert "profiles=xinas-mvp=sha256:p" in text
 
 
 @pytest.mark.parametrize(
@@ -65,7 +66,7 @@ def test_ready_on_a_healthy_batch():
         (lambda b: b["instances"][0].__setitem__("snapshot_status", "FAILED"), [0], "UNKNOWN:ds0"),
         (lambda b: b.__setitem__("contract_version", "2.0"), [0], "CONTRACT_MAJOR:2.0"),
         (lambda b: b["instances"][0]["assessments"].append(record(1, datastore="other")), [0, 1], "DOMAIN_INCONSISTENT:ctrl/fs-1"),
-        (lambda b: b["instances"][0]["assessments"].append(record(1, profile="sha256:q", domain="d2")), [0, 1], "PROFILE_DIGESTS:2"),
+        (lambda b: b["instances"][0]["assessments"].append(record(1, profile="sha256:q", domain="d2")), [0, 1], "PROFILE_INCONSISTENT:xinas-mvp"),
         (lambda b: b["instances"][0]["assessments"].append(record(0)), [0], "DUPLICATE_DS:0"),
     ],
 )
@@ -88,6 +89,32 @@ def test_connector_health_and_unavailable_batch():
 def test_two_aliases_on_one_domain_are_consistent():
     r = evaluate(HEALTH_OK, batch(record(0), record(1)), expect_ds=[0, 1])
     assert r["ready"]
+
+
+def test_two_profiles_in_one_batch_are_ready():
+    b = batch(record(0), record(1, pid="zfs-mvp", profile="sha256:z", domain="d2"))
+    r = evaluate(HEALTH_OK, b, expect_ds=[0, 1])
+    assert r["ready"], r["reasons"]
+    assert r["profiles"] == {"xinas-mvp": "sha256:p", "zfs-mvp": "sha256:z"}
+
+
+def test_expect_profiles():
+    b = batch(record(0), record(1, pid="zfs-mvp", profile="sha256:z", domain="d2"))
+    ok = evaluate(HEALTH_OK, b, expect_profiles={"xinas-mvp": "sha256:p", "zfs-mvp": "sha256:z"})
+    assert ok["ready"], ok["reasons"]
+    r = evaluate(HEALTH_OK, b, expect_profiles={"xinas-mvp": "sha256:OTHER"})
+    assert "PROFILE_PIN_MISMATCH:xinas-mvp" in r["reasons"]
+    assert "PROFILE_NOT_PINNED:zfs-mvp" in r["reasons"]
+
+
+def test_parse_and_format_profile_pins():
+    from lattice_ds_connector.preflight import format_profiles, parse_profile_pins
+    assert parse_profile_pins(" zfs-mvp=sha256:z, xinas-mvp=sha256:p ") == {"xinas-mvp": "sha256:p", "zfs-mvp": "sha256:z"}
+    assert format_profiles({"zfs-mvp": "z", "xinas-mvp": "p"}) == "xinas-mvp=p,zfs-mvp=z"
+    assert format_profiles({}) == "-"
+    for bad in ("", "x", "a b=d", "a=d,a=e", "a=", ",".join("p%d=d" % i for i in range(9)), "a\nb=d"):
+        with pytest.raises(ValueError):
+            parse_profile_pins(bad)
 
 
 def test_preflight_cli_over_the_socket(tmp_path, capsys):

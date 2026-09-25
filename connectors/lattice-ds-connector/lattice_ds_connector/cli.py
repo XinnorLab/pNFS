@@ -122,6 +122,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 def cmd_preflight(args: argparse.Namespace) -> int:
     """Read-only readiness report for an MDS about to run smart placement."""
+    from .preflight import parse_profile_pins
     from .preflight import run as preflight_run
 
     expect = []
@@ -130,7 +131,14 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             part = part.strip()
             if part:
                 expect.append(int(part))
-    return preflight_run(args.socket, expect, args.json)
+    pins = None
+    if args.expect_profiles:
+        try:
+            pins = parse_profile_pins(args.expect_profiles)
+        except ValueError as exc:
+            print("error: --expect-profiles: %s" % exc)
+            return 2
+    return preflight_run(args.socket, expect, args.json, expect_profiles=pins)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -197,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     pre = sub.add_parser("preflight", help="read-only readiness report for an MDS about to run smart placement")
     pre.add_argument("--socket", default="/run/lattice-ds-connector/connector.sock")
     pre.add_argument("--expect-ds", default="", help="comma-separated DS ids that must be bound")
+    pre.add_argument("--expect-profiles", default="", help="id=digest,... the MDS will pin (ds_connector_expected_profiles)")
     pre.add_argument("--json", action="store_true")
     pre.set_defaults(func=cmd_preflight)
     disc = sub.add_parser("discover", help="fetch each xinas source once and print the share incarnations to pin")
