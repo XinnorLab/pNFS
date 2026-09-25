@@ -1,6 +1,6 @@
 {
   "name": "lattice-placement-modes",
-  "version": "1.0",
+  "version": "1.1",
   "design": "docs/superpowers/specs/2026-09-23-placement-modes-design.md",
   "mds": {
     "fork": "XinnorLab/pnfs-lattice",
@@ -192,14 +192,15 @@
       "note": "required access_scope_id of every assessment"
     },
     {
-      "key": "ds_connector_expected_profile_digest",
-      "type": "string",
+      "key": "ds_connector_expected_profiles",
+      "type": "profile_map",
       "default": null,
       "applies_to": [
         "smart"
       ],
+      "max_items": 8,
       "implemented": "B",
-      "note": "optional pin"
+      "note": "<profile-id>=<digest>[,...]; id [A-Za-z0-9._-]{1,63}; a record whose profile id is not pinned or whose digest differs from its pin is rejected"
     },
     {
       "key": "ds_connector_expected_config_digest",
@@ -217,7 +218,14 @@
     "PLACEMENT_MODE_UNSUPPORTED_BUILD",
     "RANGE",
     "DOMAIN_WEIGHT_FORBIDDEN",
-    "MIRROR_COUNT_UNSUPPORTED"
+    "MIRROR_COUNT_UNSUPPORTED",
+    "LEGACY_KEY"
+  ],
+  "removed_keys": [
+    {
+      "key": "ds_connector_expected_profile_digest",
+      "replaced_by": "ds_connector_expected_profiles"
+    }
   ],
   "weight": {
     "formula": "domain_weight * ppm * scale / n_aliases",
@@ -271,7 +279,7 @@
     "placement_ds.<id>",
     "placement_readiness",
     "placement_connector_config_digest",
-    "placement_connector_profile_digest",
+    "placement_connector_profiles",
     "placement_connector_last_detail",
     "placement_build"
   ],
@@ -332,7 +340,7 @@
     "batch_max_bytes": 4194304,
     "contract_version_rule": "<major>.<rest>: digits, no leading zero, a '.' must follow the major; the major equals ds_connector_expected_contract_major",
     "sequence_rule": "per (instance, epoch): equal = the same snapshot re-served (accepted, rows re-timed); lower = REPLAY (batch dropped); a new runtime_epoch resets every line and pin; at most 64 instance lines, a batch needing more is refused",
-    "profile_digest_rule": "identical across the batch and equal to ds_connector_expected_profile_digest when set; checked on every batch, not pinned (a connector profile reload is not a rebind)",
+    "profile_rule": "per record: with pins set, profile.id must be pinned and its digest equal the pin; one id with two digests, or more than 8 ids, drops the batch; checked on every batch, not part of the per-DS pin (a connector profile reload is not a rebind)",
     "duplicate_rule": "a ds_id present more than once in a batch has no trusted record and pins nothing",
     "string_rule": "standard JSON escapes decoded, \\uXXXX with surrogate pairs; lone surrogates and \\u0000 are shape errors",
     "json_depth_max": 64,

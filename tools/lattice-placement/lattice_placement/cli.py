@@ -55,7 +55,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if args.mode == "smart":
         pre = None
         if rep.ready or args.connector_socket:
-            pre = run_preflight(args.connector_cli, args.connector_socket, _parse_ds_list(args.expect_ds))
+            pre = run_preflight(args.connector_cli, args.connector_socket, _parse_ds_list(args.expect_ds),
+                                expect_profiles=doc.effective().get("ds_connector_expected_profiles"))
         rep = fold_preflight(rep, pre)
     if args.json:
         print(json.dumps(rep.as_dict(), indent=2, sort_keys=True))

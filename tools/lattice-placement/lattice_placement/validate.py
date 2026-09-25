@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .ini import IniDocument
 from .manifest import MODE_LEGACY, Manifest
+from .profiles import parse_pins
 
 MAX_DS = 256
 DOMAIN_ID_MAX = 127
@@ -73,6 +74,11 @@ def validate_document(doc: IniDocument, mode: str, manifest: Manifest,
     eff = doc.effective()
     err = rep.errors
     warn = rep.warnings
+
+    for removed in manifest.raw.get("removed_keys", []):
+        if removed["key"] in eff:
+            err.append("LEGACY_KEY: %s was removed; use %s = <profile-id>=<digest>[,...]"
+                       % (removed["key"], removed["replaced_by"]))
 
     if mode not in manifest.modes and mode != MODE_LEGACY:
         err.append("RANGE: unknown placement mode %r (rr, fill, smart, legacy)" % mode)
@@ -231,9 +237,13 @@ def validate_document(doc: IniDocument, mode: str, manifest: Manifest,
         scope = eff.get("ds_connector_access_scope", str(manifest.keys["ds_connector_access_scope"].default))
         if scope == "":
             err.append("RANGE: ds_connector_access_scope is empty")
-        for pin in ("ds_connector_expected_profile_digest", "ds_connector_expected_config_digest"):
-            if pin in eff and eff[pin] == "":
-                err.append("RANGE: %s is empty (remove the key to leave it unpinned)" % pin)
+        if "ds_connector_expected_config_digest" in eff and eff["ds_connector_expected_config_digest"] == "":
+            err.append("RANGE: ds_connector_expected_config_digest is empty (remove the key to leave it unpinned)")
+        if "ds_connector_expected_profiles" in eff:
+            try:
+                parse_pins(eff["ds_connector_expected_profiles"])
+            except ValueError as exc:
+                err.append("RANGE: ds_connector_expected_profiles: %s (remove the key to leave profiles unpinned)" % exc)
         if "ds_connector_expected_config_digest" not in eff:
             warn.append("ds_connector_expected_config_digest is not pinned: `mode verify` prints the digest "
                         "every MDS sees; pin it after the first switch")
@@ -255,14 +265,16 @@ def validate_document(doc: IniDocument, mode: str, manifest: Manifest,
 
 
 def run_preflight(connector_cli: str, socket: Optional[str], expect_ds: Sequence[int],
-                  timeout_s: float = 10.0) -> Optional[Dict[str, Any]]:
-    """`lattice-ds-connector preflight --json [--socket S] [--expect-ds …]`;
+                  timeout_s: float = 10.0, expect_profiles: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """`lattice-ds-connector preflight --json [--socket S] [--expect-ds …] [--expect-profiles …]`;
     None when the command cannot run or prints no JSON."""
     cmd = [connector_cli, "preflight", "--json"]
     if socket:
         cmd += ["--socket", socket]
     if expect_ds:
         cmd += ["--expect-ds", ",".join(str(d) for d in expect_ds)]
+    if expect_profiles:
+        cmd += ["--expect-profiles", expect_profiles]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)
     except (OSError, subprocess.SubprocessError):

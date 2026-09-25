@@ -141,3 +141,32 @@ def test_fold_preflight():
     r = fold_preflight(rep("placement_mode = fill\n", "fill"), None)
     assert r.ready and r.connector is None
     assert base.ready
+
+
+def test_legacy_profile_digest_key_is_an_error_in_every_mode():
+    for mode in ("smart", "fill"):
+        r = rep("placement_mode = %s\nds_connector_expected_profile_digest = sha256:a\n" % mode, mode)
+        assert "LEGACY_KEY" in codes(r)
+        assert any("ds_connector_expected_profiles" in e for e in r.errors)
+
+
+@pytest.mark.parametrize("value,ok", [
+    ("xinas-mvp=sha256:a", True),
+    ("xinas-mvp=sha256:a,zfs-mvp=sha256:z", True),
+    ("bad id=sha256:a", False),
+    ("a=x,a=y", False),
+    ("", False),
+])
+def test_expected_profiles_syntax(value, ok):
+    r = rep("placement_mode = smart\nds_connector_expected_profiles = %s\n" % value, "smart")
+    bad = [e for e in r.errors if e.startswith("RANGE: ds_connector_expected_profiles")]
+    assert (not bad) == ok, r.errors
+
+
+def test_manifest_lists_the_new_key_and_the_removed_one():
+    assert "ds_connector_expected_profiles" in M.keys
+    assert "ds_connector_expected_profile_digest" not in M.keys
+    assert M.raw["removed_keys"] == [{"key": "ds_connector_expected_profile_digest",
+                                      "replaced_by": "ds_connector_expected_profiles"}]
+    assert "placement_connector_profiles" in M.config_show_keys
+    assert "placement_connector_profile_digest" not in M.config_show_keys
