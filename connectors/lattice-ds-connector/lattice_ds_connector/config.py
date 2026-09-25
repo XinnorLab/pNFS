@@ -304,7 +304,7 @@ def _parse_runtime(c: _Collector, raw: Dict[str, Any]) -> RuntimeConfig:
 def _parse_profile(c: _Collector, raw: Dict[str, Any], idx: int, runtime: RuntimeConfig) -> Optional[Profile]:
     path = f"profiles[{idx}]"
     pid = _str(c, raw, "id", path)
-    if pid is not None and not re.match(contract.PROFILE_ID_PATTERN, pid):
+    if pid is not None and not re.fullmatch(contract.PROFILE_ID_PATTERN, pid):
         c.error("PROFILE_ID_INVALID", f"{path}.id", "must match [A-Za-z0-9._-]{1,63} (it is a key of the MDS pin map)")
     version = _str(c, raw, "version", path)
     if version is not None and version != SUPPORTED_PROFILE_VERSION:

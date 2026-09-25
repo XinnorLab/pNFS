@@ -145,7 +145,7 @@ def test_load_config_bad_json(tmp_path):
 
 
 def test_profile_id_must_be_a_pin_key(token_file, tmp_path):
-    for bad in ("bad id", "a=b", "x" * 64, "a,b"):
+    for bad in ("bad id", "a=b", "x" * 64, "a,b", "abc\n"):
         doc = example(token_file, tmp_path)
         doc["profiles"][0]["id"] = bad
         doc["instances"][0]["profile"] = bad
@@ -159,6 +159,16 @@ def test_at_most_eight_profiles(token_file, tmp_path):
         p["id"] = "extra-%d" % i
         doc["profiles"].append(p)
     assert ("LIMIT", "profiles") in errors_of(doc)
+
+
+def test_exactly_eight_profiles_validates(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    for i in range(7):
+        p = copy.deepcopy(doc["profiles"][0])
+        p["id"] = "extra-%d" % i
+        doc["profiles"].append(p)
+    assert len(doc["profiles"]) == 8
+    assert ("LIMIT", "profiles") not in errors_of(doc)
 
 
 def test_two_xinas_instances_on_two_profiles_validate(token_file, tmp_path):
