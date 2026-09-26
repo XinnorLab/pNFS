@@ -100,6 +100,7 @@ def evaluate(health: Optional[Dict[str, Any]], batch: Optional[Dict[str, Any]],
                 "target_incarnation": a.get("target_incarnation"),
                 "binding_generation": a.get("binding_generation"),
                 "reason_codes": list(placement.get("reason_codes") or []),
+                "ds_path": (a.get("endpoint") or {}).get("ds_path"),
             }
             rows.append(row)
             if isinstance(ds, int):
@@ -164,10 +165,10 @@ def render(report: Dict[str, Any]) -> str:
         lines.append("instance %s (%s) epoch=%s seq=%s snapshot=%s" % (i["id"], i["module"], i["epoch"], i["sequence"], i["snapshot_status"]))
     for r in report.get("ds", []):
         lines.append(
-            "  ds %3s %-8s allowed=%-5s ppm=%-7s ttl_ms=%-6s domain=%s datastore=%s target=%s gen=%s reasons=%s"
+            "  ds %3s %-8s allowed=%-5s ppm=%-7s ttl_ms=%-6s domain=%s datastore=%s target=%s gen=%s ds_path=%s reasons=%s"
             % (r["ds_id"], r["quality"], r["allowed"], r["multiplier_ppm"], r["remaining_ttl_ms"],
                r["capacity_domain_id"], r["datastore_id"], r["target_id"], r["binding_generation"],
-               ",".join(r["reason_codes"]))
+               r["ds_path"] or "-", ",".join(r["reason_codes"]))
         )
     for want in report.get("expected_ds", []):
         if not any(r["ds_id"] == want for r in report.get("ds", [])):

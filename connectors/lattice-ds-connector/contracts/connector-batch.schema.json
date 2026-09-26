@@ -32,7 +32,8 @@
                     "export_path": { "type": "string", "pattern": "^/" },
                     "protocol": { "const": "NFS" },
                     "transport": { "type": "string", "enum": ["TCP", "RDMA"] },
-                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                    "ds_path": { "type": "string", "pattern": "^/" }
                   },
                   "required": ["server", "export_path", "protocol", "transport", "port"],
                   "additionalProperties": true

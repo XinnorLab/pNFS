@@ -29,8 +29,8 @@ def batch(*records, contract="1.0"):
     }
 
 
-def record(ds_id, quality="VALID", allowed=True, ppm=1000000, ttl=15000, domain="ctrl/fs-1", datastore="ctrl", profile="sha256:p", pid="xinas-mvp"):
-    return {
+def record(ds_id, quality="VALID", allowed=True, ppm=1000000, ttl=15000, domain="ctrl/fs-1", datastore="ctrl", profile="sha256:p", pid="xinas-mvp", endpoint=None):
+    d = {
         "ds_id": ds_id,
         "binding_generation": 2,
         "datastore_id": datastore,
@@ -42,6 +42,9 @@ def record(ds_id, quality="VALID", allowed=True, ppm=1000000, ttl=15000, domain=
         "placement": {"allowed": allowed, "multiplier_ppm": ppm, "reason_codes": ["NORMAL"]},
         "resources": {"capacity_domain_id": domain, "shared_resource_ids": []},
     }
+    if endpoint is not None:
+        d["endpoint"] = endpoint
+    return d
 
 
 HEALTH_OK = {"ready": True, "running": True}
@@ -158,3 +161,13 @@ def test_preflight_cli_over_the_socket(tmp_path, capsys):
             rt.stop(1.0)
     finally:
         shutil.rmtree(short, ignore_errors=True)
+
+
+def test_rows_show_ds_path():
+    b = batch(record(0, endpoint={"server": "s", "export_path": "/mnt/data", "ds_path": "/mnt/data/pnfs-ds"}),
+              record(1, domain="d2"))
+    r = evaluate(HEALTH_OK, b)
+    rows = {d["ds_id"]: d for d in r["ds"]}
+    assert rows[0]["ds_path"] == "/mnt/data/pnfs-ds" and rows[1]["ds_path"] is None
+    text = render(r)
+    assert "ds_path=/mnt/data/pnfs-ds" in text and "ds_path=-" in text

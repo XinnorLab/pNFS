@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 21:23:33 +0300
-Subject: [PATCH 02/29] feat(config): placement_mode rr|fill|smart with
+Subject: [PATCH 02/31] feat(config): placement_mode rr|fill|smart with
  conflict rules, thresholds, domain map and config generation
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

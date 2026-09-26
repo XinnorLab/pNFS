@@ -180,8 +180,65 @@ def test_two_xinas_instances_on_two_profiles_validate(token_file, tmp_path):
     inst = copy.deepcopy(doc["instances"][0])
     inst["id"] = "xi-02"
     inst["profile"] = "xinas-strict"
-    inst["bindings"] = [dict(inst["bindings"][0], ds_id=7)]
+    b = dict(inst["bindings"][0], ds_id=7)
+    # Same share, second connector instance: needs its own ds_path so this
+    # doesn't collide with instance 0's binding under DUPLICATE_DS_PATH.
+    b["endpoint"] = dict(b["endpoint"], ds_path=b["endpoint"]["export_path"].rstrip("/") + "/xi-02")
+    inst["bindings"] = [b]
     doc["instances"].append(inst)
     config, issues = validate_config_dict(doc)
     assert config is not None, [(i.code, i.path, i.message) for i in issues]
     assert config.profiles["xinas-mvp"].digest != config.profiles["xinas-strict"].digest
+
+
+def _ep(doc, i=0):
+    return doc["instances"][0]["bindings"][i]["endpoint"]
+
+
+def test_ds_path_is_normalized_and_published(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    base = _ep(doc)["export_path"].rstrip("/")
+    _ep(doc)["ds_path"] = base + "/pnfs-ds/"
+    config, issues = validate_config_dict(doc)
+    assert config is not None, [(i.code, i.path) for i in issues]
+    ep = config.instances[0].bindings[0].endpoint
+    assert ep.ds_path == base + "/pnfs-ds"
+    assert ep.as_dict()["ds_path"] == base + "/pnfs-ds"
+    plain, _ = validate_config_dict(example(token_file, tmp_path))
+    assert "ds_path" not in plain.instances[0].bindings[0].endpoint.as_dict()
+
+
+@pytest.mark.parametrize("ds_path, code", [
+    ("/somewhere/else", "DS_PATH_OUTSIDE_EXPORT"),
+    ("relative/path", "FORMAT"),
+])
+def test_ds_path_must_be_the_share_or_under_it(token_file, tmp_path, ds_path, code):
+    doc = example(token_file, tmp_path)
+    _ep(doc)["ds_path"] = ds_path
+    assert code in {c for c, _ in errors_of(doc)}
+
+
+def test_ds_path_prefix_is_not_a_component(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    base = _ep(doc)["export_path"].rstrip("/")
+    _ep(doc)["ds_path"] = base + "x/pnfs-ds"          # e.g. /mnt/data/training-ax/pnfs-ds
+    assert "DS_PATH_OUTSIDE_EXPORT" in {c for c, _ in errors_of(doc)}
+
+
+def test_root_share_cannot_parent_a_ds_path(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    _ep(doc)["export_path"] = "/"
+    _ep(doc)["ds_path"] = "/mnt/pnfs-ds"
+    assert "ROOT_EXPORT_PARENT" in {c for c, _ in errors_of(doc)}
+
+
+def test_two_bindings_on_one_ds_path(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    first, second = _ep(doc, 0), _ep(doc, 1)
+    second["server"] = first["server"]
+    second["export_path"] = first["export_path"]
+    assert "DUPLICATE_DS_PATH" in {c for c, _ in errors_of(doc)}
+    # distinct ds_path under the same share is fine
+    first["ds_path"] = first["export_path"].rstrip("/") + "/ds-a"
+    second["ds_path"] = first["export_path"].rstrip("/") + "/ds-b"
+    assert "DUPLICATE_DS_PATH" not in {c for c, _ in errors_of(doc)}

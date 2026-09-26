@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sergey Platonov <135218967+XinnorLab@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 17:39:57 +0300
-Subject: [PATCH 26/29] feat(ds_connector): pin connector profiles by id;
+Subject: [PATCH 26/31] feat(ds_connector): pin connector profiles by id;
  publish the batch's profile map
 
 A batch may carry several profiles. Each record is checked against the

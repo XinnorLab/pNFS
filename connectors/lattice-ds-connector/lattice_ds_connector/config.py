@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from . import contract
+from .paths import normalize, path_contains
 
 CONFIG_VERSION = "1.0"
 SUPPORTED_MODULES = ("xinas", "fixture")
@@ -116,15 +117,21 @@ class Endpoint:
     protocol: str = "NFS"
     transport: str = "TCP"
     port: int = 2049
+    #: The path the MDS registers as ds[N] when the DS lives below the share
+    #: (endpoint ds_path design §5); None = the share path itself.
+    ds_path: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "server": self.server,
             "export_path": self.export_path,
             "protocol": self.protocol,
             "transport": self.transport,
             "port": self.port,
         }
+        if self.ds_path is not None:
+            out["ds_path"] = self.ds_path
+        return out
 
 
 @dataclass(frozen=True)
@@ -361,9 +368,23 @@ def _parse_endpoint(c: _Collector, raw: Any, path: str) -> Optional[Endpoint]:
     if transport not in ("TCP", "RDMA"):
         c.error("ENUM", f"{path}.transport", "must be TCP or RDMA")
     port = _int(c, raw, "port", path, 2049, 1, 65535)
+    ds_path = _str(c, raw, "ds_path", path, required=False)
+    if ds_path is not None and not ds_path.startswith("/"):
+        c.error("FORMAT", f"{path}.ds_path", "must be an absolute path")
+        ds_path = None
     if server is None or export_path is None or port is None:
         return None
-    return Endpoint(server=server, export_path=export_path.rstrip("/") or "/", protocol="NFS", transport=transport, port=port)
+    export_n = normalize(export_path)
+    if ds_path is not None:
+        ds_path = normalize(ds_path)
+        if export_n == "/" and ds_path != "/":
+            c.error("ROOT_EXPORT_PARENT", f"{path}.ds_path",
+                    "'/' cannot be the share of a DS path; bind the share that contains it")
+        elif not path_contains(export_n, ds_path):
+            c.error("DS_PATH_OUTSIDE_EXPORT", f"{path}.ds_path",
+                    f"{ds_path} is neither {export_n} nor under it")
+    return Endpoint(server=server, export_path=export_n, protocol="NFS",
+                    transport=transport, port=port, ds_path=ds_path)
 
 
 def _parse_binding(c: _Collector, raw: Any, path: str, module: str) -> Optional[Binding]:
@@ -541,6 +562,7 @@ def validate_config_dict(raw: Any) -> Tuple[Optional[Config], List[ConfigIssue]]
         c.error("LIMIT", "instances", f"more than max_instances ({runtime.max_instances})")
     seen_ids: Dict[str, int] = {}
     seen_ds: Dict[int, str] = {}
+    seen_paths: Dict[Tuple[str, str], Tuple[int, bool]] = {}
     total_ds = 0
     for i, inst_raw in enumerate(raw_instances):
         inst = _parse_instance(c, inst_raw, i, test_mode, profiles)
@@ -554,6 +576,16 @@ def validate_config_dict(raw: Any) -> Tuple[Optional[Config], List[ConfigIssue]]
             if b.ds_id in seen_ds:
                 c.error("DUPLICATE_DS", f"instances[{i}].bindings", f"ds_id {b.ds_id} is already bound by instance '{seen_ds[b.ds_id]}'")
             seen_ds[b.ds_id] = inst.id
+            key = (b.endpoint.server, b.endpoint.ds_path or b.endpoint.export_path)
+            if key in seen_paths:
+                prior_ds_id, prior_alias = seen_paths[key]
+                # Intentional capacity aliases (CON-18, DUPLICATE_TARGET) share
+                # a target and endpoint on purpose; only flag anything else.
+                if not (b.alias and prior_alias):
+                    c.error("DUPLICATE_DS_PATH", f"instances[{i}].bindings",
+                            f"{key[0]}:{key[1]} is already bound as ds_id {prior_ds_id}; "
+                            "a DS below a share needs its own ds_path")
+            seen_paths[key] = (b.ds_id, b.alias)
         instances.append(inst)
     if total_ds > runtime.max_ds:
         c.error("LIMIT", "instances", f"{total_ds} bindings exceed max_ds ({runtime.max_ds})")

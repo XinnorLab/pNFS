@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sergey Platonov <135218967+XinnorLab@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 11:21:10 +0300
+Subject: [PATCH 30/31] feat(ds_connector): endpoint.ds_path pins the
+ registered DS path; no open-ended parent match
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/ds_connector.h         |  9 ++--
+ src/mds/ds_connector.c         | 62 ++++++++++++++++++++-------
+ tests/unit/test_ds_connector.c | 78 ++++++++++++++++++++++++++++------
+ 3 files changed, 117 insertions(+), 32 deletions(-)
+
+diff --git a/include/ds_connector.h b/include/ds_connector.h
+index b6b2295..c153ba9 100644
+--- a/include/ds_connector.h
++++ b/include/ds_connector.h
+@@ -107,11 +107,14 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
+ /* "YYYY-MM-DDTHH:MM:SS[.fff]Z" -> milliseconds since the epoch; 0 on error. */
+ uint64_t ds_connector_iso8601_ms(const char *s, size_t len);
+ 
+-/* Endpoint rule: server == host, port == tcp_port (when both set) and the
+- * registry export path equals the endpoint path or lies under it. */
++/* Endpoint rule (endpoint ds_path design §4): server == host,
++ * port == tcp_port when both set; without ds_path the endpoint path equals
++ * the registry path; with ds_path, ds_path equals the registry path and the
++ * endpoint path is ds_path or a component-wise ancestor of it, "/" never a
++ * parent.  Trailing '/' is ignored.  ds_path NULL or "" = absent. */
+ bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
+                                    const char *server, const char *export_path,
+-                                   uint32_t port);
++                                   const char *ds_path, uint32_t port);
+ 
+ /* -----------------------------------------------------------------------
+  * I/O half
+diff --git a/src/mds/ds_connector.c b/src/mds/ds_connector.c
+index b3641d1..193220c 100644
+--- a/src/mds/ds_connector.c
++++ b/src/mds/ds_connector.c
+@@ -375,11 +375,29 @@ uint64_t ds_connector_iso8601_ms(const char *s, size_t len)
+     return (uint64_t)secs * 1000ULL + ms;
+ }
+ 
++/* Length of p without trailing '/' ("/" keeps its one byte). */
++static size_t path_len(const char *p)
++{
++    size_t n = strlen(p);
++
++    while (n > 1 && p[n - 1] == '/') {
++        n--;
++    }
++    return n;
++}
++
++static bool path_eq(const char *a, size_t al, const char *b, size_t bl)
++{
++    return al == bl && strncmp(a, b, al) == 0;
++}
++
+ bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
+                                    const char *server, const char *export_path,
+-                                   uint32_t port)
++                                   const char *ds_path, uint32_t port)
+ {
+     size_t el;
++    size_t rl;
++    size_t dl;
+ 
+     if (ds == NULL || server == NULL || export_path == NULL) {
+         return false;
+@@ -390,26 +408,28 @@ bool ds_connector_endpoint_matches(const struct ds_connector_registry_ds *ds,
+     if (port != 0 && ds->tcp_port != 0 && port != ds->tcp_port) {
+         return false;
+     }
+-    el = strlen(export_path);
+-    if (el == 0 || export_path[0] != '/') {
++    if (export_path[0] != '/' || ds->export_path[0] != '/') {
+         return false;
+     }
+-    /* "/mnt/data/" names the same share as "/mnt/data" */
+-    while (el > 1 && export_path[el - 1] == '/') {
+-        el--;
++    el = path_len(export_path);
++    rl = path_len(ds->export_path);
++    if (ds_path == NULL || ds_path[0] == '\0') {
++        return path_eq(export_path, el, ds->export_path, rl);
+     }
+-    if (strlen(ds->export_path) == el && strncmp(ds->export_path, export_path, el) == 0) {
+-        return true;
++    if (ds_path[0] != '/') {
++        return false;
++    }
++    dl = path_len(ds_path);
++    if (!path_eq(ds_path, dl, ds->export_path, rl)) {
++        return false;
+     }
+-    /* the registered directory lies under the exported share */
+-    if (el > 1 && strncmp(ds->export_path, export_path, el) == 0 &&
+-        ds->export_path[el] == '/') {
++    if (path_eq(export_path, el, ds_path, dl)) {
+         return true;
+     }
+     if (el == 1) {
+-        return ds->export_path[0] == '/';
++        return false;   /* "/" is never the parent of a DS path */
+     }
+-    return false;
++    return el < dl && strncmp(ds_path, export_path, el) == 0 && ds_path[el] == '/';
+ }
+ 
+ void ds_connector_state_init(struct ds_connector_state *st,
+@@ -462,6 +482,7 @@ struct rec {
+     char     target_incarnation[DC_NAME_MAX];   /* "" when null */
+     char     server[MDS_DS_HOST_MAX];
+     char     export_path[MDS_DS_EXPORT_MAX];
++    char     ds_path[MDS_DS_EXPORT_MAX];   /* "" when absent */
+     uint64_t port;
+     char     access_scope[PM_SCOPE_MAX];
+     bool     valid;
+@@ -526,6 +547,12 @@ static bool parse_record(const struct jdoc *d, int obj, struct rec *r,
+         set_detail(rep, "ds %u: endpoint.transport invalid", r->ds_id);
+         return false;
+     }
++    r->ds_path[0] = '\0';
++    v = tok_get(d, ep, "ds_path");
++    if (v >= 0 && (!tok_copy(d, v, r->ds_path, sizeof(r->ds_path)) || r->ds_path[0] != '/')) {
++        set_detail(rep, "ds %u: endpoint.ds_path invalid", r->ds_id);
++        return false;
++    }
+     if (!tok_str_eq(d, tok_get(d, obj, "scope"), PM_CONN_SCOPE)) {
+         set_detail(rep, "ds %u: scope is not %s", r->ds_id, PM_CONN_SCOPE);
+         return false;
+@@ -1047,10 +1074,13 @@ enum ds_connector_drop ds_connector_apply_batch(struct ds_connector_state *st,
+                            r.access_scope, st->cfg.access_scope);
+                 continue;
+             }
+-            if (!ds_connector_endpoint_matches(rd, r.server, r.export_path, (uint32_t)r.port)) {
++            if (!ds_connector_endpoint_matches(rd, r.server, r.export_path, r.ds_path,
++                                               (uint32_t)r.port)) {
+                 rep->rejected_binding++;
+-                set_detail(rep, "ds %u: endpoint %s:%s:%llu does not match the registry %s:%s:%u",
+-                           r.ds_id, r.server, r.export_path, (unsigned long long)r.port,
++                set_detail(rep, "ds %u: endpoint %s:%s%s%s:%llu does not match the registry %s:%s:%u",
++                           r.ds_id, r.server, r.export_path,
++                           r.ds_path[0] != '\0' ? " ds_path=" : "", r.ds_path,
++                           (unsigned long long)r.port,
+                            rd->host, rd->export_path, (unsigned)rd->tcp_port);
+                 continue;
+             }
+diff --git a/tests/unit/test_ds_connector.c b/tests/unit/test_ds_connector.c
+index 90ed6f3..c9d2c4a 100644
+--- a/tests/unit/test_ds_connector.c
++++ b/tests/unit/test_ds_connector.c
+@@ -86,6 +86,11 @@ static void st_init(const char *profile_pins, const char *config_pin)
+     ds_connector_state_init(&ST, &cfg);
+ }
+ 
++/* endpoint.ds_path every record carries; NULL = omit the key.  The
++ * registry registers both DS at /mnt/data/pnfs-ds under the share
++ * /mnt/data, as on the stand. */
++static const char *REC_DS_PATH = "/mnt/data/pnfs-ds";
++
+ /* One assessment record with overridable fields, carrying profile id pid. */
+ static const char *rec_pid(const char *pid, uint32_t ds, unsigned gen, const char *target, const char *inc,
+                            const char *server, const char *path, unsigned port,
+@@ -96,16 +101,21 @@ static const char *rec_pid(const char *pid, uint32_t ds, unsigned gen, const cha
+     static char r[4][4096];
+     static int slot;
+     char *b = r[slot++ & 3];
++    char dsp[MDS_DS_EXPORT_MAX + 16];
++    dsp[0] = '\0';
++    if (REC_DS_PATH != NULL) {
++        snprintf(dsp, sizeof(dsp), ",\"ds_path\":\"%s\"", REC_DS_PATH);
++    }
+     snprintf(b, 4096,
+         "{\"ds_id\":%u,\"binding_generation\":%u,\"datastore_id\":\"ctrl-1\","
+         "\"target_id\":\"%s\",\"target_incarnation\":%s,"
+-        "\"endpoint\":{\"server\":\"%s\",\"export_path\":\"%s\",\"protocol\":\"NFS\",\"transport\":\"TCP\",\"port\":%u},"
++        "\"endpoint\":{\"server\":\"%s\",\"export_path\":\"%s\",\"protocol\":\"NFS\",\"transport\":\"TCP\",\"port\":%u%s},"
+         "\"scope\":\"%s\",\"access_scope_id\":\"%s\",\"quality\":\"%s\","
+         "\"observed_at\":\"2026-09-24T10:00:00Z\",\"evidence_age_ms\":1000,\"remaining_ttl_ms\":%u,"
+         "\"profile\":{\"id\":\"%s\",\"version\":\"1\",\"digest\":\"%s\"},"
+         "\"placement\":{\"allowed\":%s,\"multiplier_ppm\":%u,\"reason_codes\":[\"NORMAL\",\"X\"]},"
+         "\"resources\":{\"capacity_domain_id\":%s,\"shared_resource_ids\":[]},\"coverage\":[]}",
+-        ds, gen, target, inc, server, path, port, scope, access, quality, ttl, pid, profile, allowed, ppm, domain_json);
++        ds, gen, target, inc, server, path, port, dsp, scope, access, quality, ttl, pid, profile, allowed, ppm, domain_json);
+     return b;
+ }
+ 
+@@ -367,18 +377,59 @@ static void test_endpoint_rule(void)
+     snprintf(ds.host, sizeof(ds.host), "192.168.64.51");
+     snprintf(ds.export_path, sizeof(ds.export_path), "/mnt/data/pnfs-ds");
+     ds.tcp_port = 2049;
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds", 2049), true);   /* exact */
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", 2049), true);           /* under */
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/", 2049), true);          /* trailing slash */
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds/", 2049), true);
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/", 2049), true);
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/dat", 2049), false);           /* prefix, not a component */
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds/sub", 2049), false);
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.52", "/mnt/data", 2049), false);
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", 2050), false);
++    /* no ds_path: the endpoint must name the registered path exactly */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds", NULL, 2049), true);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds/", NULL, 2049), true);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", NULL, 2049), false);   /* parent, no ds_path */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", "", 2049), false);     /* "" = absent */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/", NULL, 2049), false);
++    /* ds_path pins the registered path; export_path is the share containing it */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", "/mnt/data/pnfs-ds", 2049), true);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/", "/mnt/data/pnfs-ds/", 2049), true);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds", "/mnt/data/pnfs-ds", 2049), true);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", "/mnt/data/other", 2049), false);      /* not the registry path */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/dat", "/mnt/data/pnfs-ds", 2049), false);     /* prefix, not a component */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/srv/x", "/mnt/data/pnfs-ds", 2049), false);       /* not an ancestor */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data/pnfs-ds/sub", "/mnt/data/pnfs-ds", 2049), false);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/", "/mnt/data/pnfs-ds", 2049), false);           /* "/" is never a parent */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", "relative", 2049), false);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "relative", NULL, 2049), false);
++    /* host and port rules are unchanged */
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.52", "/mnt/data", "/mnt/data/pnfs-ds", 2049), false);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", "/mnt/data/pnfs-ds", 2050), false);
+     ds.tcp_port = 0;
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", 2050), true);           /* unknown registry port */
+-    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "relative", 2049), false);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/mnt/data", "/mnt/data/pnfs-ds", 2050), true);  /* unknown registry port */
++    /* a DS registered at the root: "/" is its own share */
++    snprintf(ds.export_path, sizeof(ds.export_path), "/");
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/", NULL, 2049), true);
++    ASSERT_EQ(ds_connector_endpoint_matches(&ds, "192.168.64.51", "/", "/", 2049), true);
++}
++
++static void test_endpoint_ds_path_in_a_batch(void)
++{
++    struct placement_assessment_view v; struct ds_connector_report rep;
++    /* the share alone no longer matches a DS registered below it */
++    REC_DS_PATH = NULL;
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 0u);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++    /* ds_path naming another directory */
++    REC_DS_PATH = "/mnt/data/other";
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_binding, 1u);
++    ASSERT_TRUE(strstr(rep.detail, "ds_path=/mnt/data/other") != NULL);
++    /* a relative ds_path is a shape error */
++    REC_DS_PATH = "relative";
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.rejected_shape, 1u);
++    /* the registered path: accepted */
++    REC_DS_PATH = "/mnt/data/pnfs-ds";
++    reg_init(); st_init(NULL, NULL);
++    ASSERT_EQ(apply(batch("rt-1", "e1", 1, "2026-09-24T10:00:01Z", "c", "COMPLETE", rec_ok(0)), &v, &rep), DC_OK);
++    ASSERT_EQ(rep.accepted, 1u);
+ }
+ 
+ static void test_binding_rules_in_a_batch(void)
+@@ -1134,6 +1185,7 @@ int main(void)
+     RUN_TEST(test_poll_once_publishes_and_readiness);
+     RUN_TEST(test_iso8601);
+     RUN_TEST(test_endpoint_rule);
++    RUN_TEST(test_endpoint_ds_path_in_a_batch);
+     RUN_TEST(test_healthy_batch_is_accepted);
+     RUN_TEST(test_contract_major_mismatch);
+     RUN_TEST(test_replay_drops_the_batch_and_keeps_state);

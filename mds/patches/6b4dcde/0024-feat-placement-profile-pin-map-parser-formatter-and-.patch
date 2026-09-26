@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sergey Platonov <135218967+XinnorLab@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 17:20:38 +0300
-Subject: [PATCH 24/29] feat(placement): profile pin map parser, formatter and
+Subject: [PATCH 24/31] feat(placement): profile pin map parser, formatter and
  drop reasons
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

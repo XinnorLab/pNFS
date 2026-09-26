@@ -110,6 +110,7 @@ RUNTIME_REASONS = {
     "IDENTITY_MISMATCH": "controller_id differs from the binding's expectation; VALID deny",
     "INCARNATION_MISMATCH": "the share incarnation differs from the binding's expectation; VALID deny (rebind)",
     "EXPORT_PATH_MISMATCH": "the source's export path differs from the endpoint; VALID deny",
+    "DS_PATH_UNDER_NESTED_SHARE": "another observed share or export lies between the bound share and the binding's ds_path; VALID deny",
     "GRAPH_UNRESOLVED": "a mandatory reference does not resolve in the snapshot; UNKNOWN",
     "DEPENDENCY_ERROR": "a referenced resource is ERROR/UNKNOWN; UNKNOWN",
     "SOURCE_STALE": "evidence older than the profile's max source age; UNKNOWN",

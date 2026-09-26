@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 11:35:21 +0300
-Subject: [PATCH 17/29] feat(placement): smart candidate rule, connector
+Subject: [PATCH 17/31] feat(placement): smart candidate rule, connector
  domains, manual base weights, readiness in config show
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
