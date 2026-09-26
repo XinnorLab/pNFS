@@ -2,6 +2,7 @@
 """The xinas-mvp v1 decision policy: T-04..T-10 as pure-function tests."""
 
 import copy
+import dataclasses
 import itertools
 
 import pytest
@@ -689,3 +690,65 @@ def test_reason_codes_are_bounded(base_result):
     a = one(base_result)
     assert len(a.reason_codes) <= contract.MAX_REASON_CODES
     assert all(code in contract.ALL_REASON_CODES for code in a.reason_codes)
+
+
+# ---------------------------------------------------------------------------
+# DS_PATH_UNDER_NESTED_SHARE (endpoint ds_path design §5)
+# ---------------------------------------------------------------------------
+
+
+def _ds_binding(ds_path):
+    b = make_binding(0, "training-a", "/mnt/data/training-a", "training-a:7")
+    return dataclasses.replace(b, endpoint=dataclasses.replace(b.endpoint, ds_path=ds_path))
+
+
+def _with_share_at(result, path):
+    r = copy.deepcopy(result)
+    share = next(s for s in r["shares"] if s["share_id"] == "training-a")
+    nested = copy.deepcopy(share)
+    nested["share_id"] = "training-a-nested"
+    nested["export_path"] = path
+    r["shares"].append(nested)
+    return r
+
+
+def _with_export_at(result, path):
+    r = copy.deepcopy(result)
+    ex = next(x for x in r["resources"] if x["details"].get("kind") == "EXPORT")
+    extra = copy.deepcopy(ex)
+    extra["id"] = "export:nested"
+    extra["details"]["export_path"] = path
+    extra["details"]["present"] = True
+    r["resources"].append(extra)
+    return r
+
+
+def test_ds_path_under_a_nested_share_is_a_valid_deny(base_result):
+    a = one(_with_share_at(base_result, "/mnt/data/training-a/sub"),
+            binding=_ds_binding("/mnt/data/training-a/sub/pnfs-ds"))
+    assert a.quality == "VALID" and not a.allowed
+    assert "DS_PATH_UNDER_NESTED_SHARE" in a.reason_codes
+    assert a.diagnostics["nested_share_path"] == "/mnt/data/training-a/sub"
+
+
+def test_ds_path_that_is_itself_a_nested_share_is_denied(base_result):
+    a = one(_with_share_at(base_result, "/mnt/data/training-a/pnfs-ds"),
+            binding=_ds_binding("/mnt/data/training-a/pnfs-ds"))
+    assert "DS_PATH_UNDER_NESTED_SHARE" in a.reason_codes
+
+
+def test_ds_path_under_a_nested_unmanaged_export_is_denied(base_result):
+    a = one(_with_export_at(base_result, "/mnt/data/training-a/sub"),
+            binding=_ds_binding("/mnt/data/training-a/sub/pnfs-ds"))
+    assert "DS_PATH_UNDER_NESTED_SHARE" in a.reason_codes
+
+
+def test_ds_path_next_to_a_nested_share_is_allowed(base_result):
+    a = one(_with_share_at(base_result, "/mnt/data/training-a/other"),
+            binding=_ds_binding("/mnt/data/training-a/sub/pnfs-ds"))
+    assert a.allowed and "DS_PATH_UNDER_NESTED_SHARE" not in a.reason_codes
+
+
+def test_ds_path_equal_to_the_share_needs_no_nested_check(base_result):
+    a = one(base_result, binding=_ds_binding("/mnt/data/training-a"))
+    assert a.allowed

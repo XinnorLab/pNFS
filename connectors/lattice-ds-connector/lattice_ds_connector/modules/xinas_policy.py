@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import contract
 from ..config import Binding, Profile
-from ..paths import path_contains
+from ..paths import normalize, path_contains
 from .base import Assessment
 
 # Array words → veto reason (XMOD table).
@@ -283,6 +283,24 @@ def _shares_by_id(result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def nested_share_path(export_path: str, ds_path: str,
+                      shares: Dict[str, Dict[str, Any]],
+                      resources: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """The shallowest observed share or present export strictly below the
+    bound share that contains ``ds_path`` (endpoint ds_path design §5)."""
+    candidates = [s.get("export_path") for s in shares.values()]
+    candidates += [_details(r).get("export_path") for r in resources.values()
+                   if _kind(r) == "EXPORT" and _details(r).get("present") is not False]
+    found = sorted(
+        normalize(p) for p in candidates
+        if isinstance(p, str) and p.startswith("/")
+        and normalize(p) != export_path
+        and path_contains(export_path, normalize(p))
+        and path_contains(normalize(p), ds_path)
+    )
+    return found[0] if found else None
+
+
 def _age(rec: Optional[Dict[str, Any]]) -> Optional[int]:
     if rec is None:
         return None
@@ -464,6 +482,12 @@ def assess_binding(
     if share_path != binding.endpoint.export_path:
         v.add_veto("EXPORT_PATH_MISMATCH")
         diag["source_export_path"] = share_path
+    ds_path = binding.endpoint.ds_path
+    if ds_path is not None and ds_path != binding.endpoint.export_path:
+        nested = nested_share_path(binding.endpoint.export_path, ds_path, shares, resources)
+        if nested is not None:
+            v.add_veto("DS_PATH_UNDER_NESTED_SHARE")
+            diag["nested_share_path"] = nested
     # Audit C-05: a binding that pins nothing proves nothing. The operator
     # pins the incarnation (`lattice-ds-connector discover`) and rebinds on
     # change (XMOD-14, CON-18).

@@ -106,6 +106,7 @@ differ per share.
 | `controller_id` ≠ binding | VALID deny | `IDENTITY_MISMATCH` |
 | share `incarnation` ≠ `expected_target_incarnation` | VALID deny (rebind) | `INCARNATION_MISMATCH` |
 | share `export_path` ≠ endpoint | VALID deny | `EXPORT_PATH_MISMATCH` |
+| another share or export lies between the bound share and `ds_path` | VALID deny | `DS_PATH_UNDER_NESTED_SHARE` |
 | snapshot `FAILED` | UNKNOWN | `SOURCE_FAILED` |
 | required check not in `capabilities`/`EVALUATED` | UNKNOWN | `CAPABILITY_MISSING` |
 | oldest evidence + request duration > `source_max_age_ms` | UNKNOWN | `SOURCE_STALE` |
