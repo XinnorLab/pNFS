@@ -22,3 +22,7 @@ include = ["lattice_ds_connector*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A hung test dumps every thread's stack and ends the run instead of burning
+# the CI job; exit_on_timeout needs pytest >= 9 (older ones only dump).
+faulthandler_timeout = 60
+faulthandler_exit_on_timeout = true
