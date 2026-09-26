@@ -752,3 +752,14 @@ def test_ds_path_next_to_a_nested_share_is_allowed(base_result):
 def test_ds_path_equal_to_the_share_needs_no_nested_check(base_result):
     a = one(base_result, binding=_ds_binding("/mnt/data/training-a"))
     assert a.allowed
+
+
+def test_export_path_mismatch_skips_the_nested_check(base_result):
+    """When the share moved, EXPORT_PATH_MISMATCH already denies; the bound
+    share's own (now-ancestor) record must not also read as a nested share."""
+    b = make_binding(0, "training-a", "/mnt/data", "training-a:7")
+    b = dataclasses.replace(b, endpoint=dataclasses.replace(b.endpoint, ds_path="/mnt/data/training-a/pnfs-ds"))
+    a = one(base_result, binding=b)
+    assert "EXPORT_PATH_MISMATCH" in a.reason_codes
+    assert "DS_PATH_UNDER_NESTED_SHARE" not in a.reason_codes
+    assert "nested_share_path" not in a.diagnostics

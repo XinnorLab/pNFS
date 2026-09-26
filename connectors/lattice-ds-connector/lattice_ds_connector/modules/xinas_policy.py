@@ -483,7 +483,7 @@ def assess_binding(
         v.add_veto("EXPORT_PATH_MISMATCH")
         diag["source_export_path"] = share_path
     ds_path = binding.endpoint.ds_path
-    if ds_path is not None and ds_path != binding.endpoint.export_path:
+    if share_path == binding.endpoint.export_path and ds_path is not None and ds_path != binding.endpoint.export_path:
         nested = nested_share_path(binding.endpoint.export_path, ds_path, shares, resources)
         if nested is not None:
             v.add_veto("DS_PATH_UNDER_NESTED_SHARE")
