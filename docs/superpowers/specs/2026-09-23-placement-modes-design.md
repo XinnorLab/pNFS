@@ -335,7 +335,7 @@ our build; the module is a no-op when the mode is not `smart`):
      `endpoint.ds_path`, `endpoint.export_path` equals the registry's
      `export_path`; with it, `ds_path` equals the registry's
      `export_path` and `export_path` is `ds_path` or a component-wise
-     ancestor of it, never `/` (trailing `/` ignored;
+     ancestor of it, never `/` unless `ds_path` is `/` (trailing `/` ignored;
      `2026-09-26-endpoint-ds-path-design.md`) and `endpoint.port` equals
      `tcp_port` when the registry has one;
      when `ds_connector_expected_profiles` pins `profile.id`, its

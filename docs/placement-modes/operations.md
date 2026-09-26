@@ -134,10 +134,47 @@ know before rolling it out:
 
 ## Upgrading to `ds_path` bindings
 
-Add `ds_path` to the connector bindings of DS registered below a share
-before upgrading the MDS: an MDS without the change ignores `ds_path`
-and still accepts the record; an MDS with it rejects a parent without
-`ds_path` (`rejected_binding`, detail `does not match the registry`).
+Follow this order; each step depends on the one before it. See also "A DS
+in a subdirectory of a share" below for the `ds_path`/`export_path`
+syntax itself.
+
+1. **Upgrade the connector on every MDS host.** An old connector build
+   does not reject an unknown key, so it ignores `ds_path` in its config
+   — upgrading the connector first is safe, and is required before step 2
+   can do anything.
+2. **Add `ds_path` to the bindings of the DS registered below a share, on
+   every host, then reload it (`SIGHUP`) or restart it**
+   (`systemctl restart lattice-ds-connector`). Do this on every host
+   *before* upgrading any MDS (step 5): once an MDS runs the new build it
+   rejects a binding that lacks `ds_path` for a DS under a share
+   (`rejected_binding`, detail `does not match the registry`). While the
+   rollout is in progress, hosts already updated and hosts not yet
+   updated report different `config_digest` values — `mode verify`'s
+   `CONNECTOR_CONFIG_DIGEST_MISMATCH` during this window is expected, not
+   a failed switch; it clears once every host has `ds_path` added.
+3. **Check the binding took**: `lattice-ds-connector preflight
+   --expect-ds <id>` prints `ds_path=/mnt/data/pnfs-ds` (not `-`) on that
+   DS's row.
+4. **If `ds_connector_expected_config_digest` is pinned, re-pin it on
+   every MDS before restarting any of them.** `config_digest` hashes the
+   raw connector config, so adding `ds_path` changes it; with the old
+   pin still in place every MDS drops every batch and `smart` refuses all
+   placements until the pin is updated. Read the new digest off
+   `lattice-ds-connector preflight` or `show` (`config_digest=sha256:…`,
+   identical on every host once step 2 is done everywhere), then on every
+   MDS:
+
+   ```bash
+   lattice-placement mode set smart --config /etc/pnfs-mds/mds.conf \
+       --set ds_connector_expected_config_digest=sha256:… --apply
+   ```
+
+5. **Upgrade the MDS**, one host at a time (see "The switch, step by
+   step" above), then `lattice-placement mode verify`. Check
+   `placement_connector_last_detail` on each host has no `rejected_binding`
+   "does not match the registry" detail — that means some binding still
+   lacks `ds_path`, or its `ds_path` differs from the registered `ds[N]`
+   path; see `connectors/lattice-ds-connector/docs/troubleshooting.md`.
 
 ## `smart` prerequisites
 
@@ -156,7 +193,8 @@ and still accepts the record; an MDS with it rejects a parent without
 Bind the share in `export_path` and the `ds[N]` path in `ds_path` — the
 stand example: `export_path: /mnt/data`, `ds_path: /mnt/data/pnfs-ds`.
 The connector vetoes `DS_PATH_UNDER_NESTED_SHARE` when another share lies
-in between.
+in between. See "Upgrading to `ds_path` bindings" above for the order to
+roll this out in on a cluster that is already running.
 
 ## Reading `show`
 

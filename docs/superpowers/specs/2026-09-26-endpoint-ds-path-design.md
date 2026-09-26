@@ -98,7 +98,9 @@ the registry path is accepted end to end; an invalid `ds_path` is
 - `ROOT_EXPORT_PARENT` when `export_path` is `/` and `ds_path` is set
   and not `/`.
 - `DUPLICATE_DS_PATH` when two bindings resolve to the same
-  `(server, ds_path or export_path)`.
+  `(server, ds_path or export_path)`. Bindings that both set `alias: true`
+  (CON-18 capacity aliases) may share a DS path: the MDS registry is per
+  `ds_id` and accepts two `ds[N]` entries with the same `host:path`.
 
 `Endpoint` gets `ds_path: Optional[str] = None`; `as_dict()` adds
 `"ds_path"` only when it is set, so the record's endpoint carries it.
