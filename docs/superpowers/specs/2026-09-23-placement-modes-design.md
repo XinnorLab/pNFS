@@ -331,10 +331,13 @@ our build; the module is a no-op when the mode is not `smart`):
      contract, `contracts/connector-batch.schema.json`): `ds_id`
      registered and ≤ `ds_connector_max_ds`; `scope == "ds"` and
      `access_scope_id == ds_connector_access_scope` (default `global`);
-     `endpoint.server` and `endpoint.export_path` equal the registry's
-     `host` and `export_path` for that `ds_id` (exact strings — the
-     connector's binding must name the DS the way `ds[N]` registered it)
-     and `endpoint.port` equals `tcp_port` when the registry has one;
+     `endpoint.server` equals the registry's `host`; without
+     `endpoint.ds_path`, `endpoint.export_path` equals the registry's
+     `export_path`; with it, `ds_path` equals the registry's
+     `export_path` and `export_path` is `ds_path` or a component-wise
+     ancestor of it, never `/` (trailing `/` ignored;
+     `2026-09-26-endpoint-ds-path-design.md`) and `endpoint.port` equals
+     `tcp_port` when the registry has one;
      when `ds_connector_expected_profiles` pins `profile.id`, its
      `profile.digest` must equal the pin for that id, and the id must be
      pinned at all — otherwise only that record is rejected

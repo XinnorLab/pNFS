@@ -132,6 +132,13 @@ know before rolling it out:
   <mode>` (or re-running it with no mode change) before the restart is
   enough.
 
+## Upgrading to `ds_path` bindings
+
+Add `ds_path` to the connector bindings of DS registered below a share
+before upgrading the MDS: an MDS without the change ignores `ds_path`
+and still accepts the record; an MDS with it rejects a parent without
+`ds_path` (`rejected_binding`, detail `does not match the registry`).
+
 ## `smart` prerequisites
 
 - A `lattice-ds-connector` unit on **every** MDS host (each MDS reads only
@@ -143,6 +150,13 @@ know before rolling it out:
   `--set ds_connector_expected_config_digest=sha256:… --set ds_connector_expected_profiles=xinas-mvp=sha256:…`.
 - `lattice-ds-connector preflight --expect-ds <every registered id>` READY
   on every host.
+
+## A DS in a subdirectory of a share
+
+Bind the share in `export_path` and the `ds[N]` path in `ds_path` — the
+stand example: `export_path: /mnt/data`, `ds_path: /mnt/data/pnfs-ds`.
+The connector vetoes `DS_PATH_UNDER_NESTED_SHARE` when another share lies
+in between.
 
 ## Reading `show`
 

@@ -1,6 +1,6 @@
 {
   "name": "lattice-placement-modes",
-  "version": "1.1",
+  "version": "1.2",
   "design": "docs/superpowers/specs/2026-09-23-placement-modes-design.md",
   "mds": {
     "fork": "XinnorLab/pnfs-lattice",
@@ -300,7 +300,7 @@
   "connector_client": {
     "contract_version_major": 1,
     "scope": "NEW_ALLOCATION",
-    "endpoint_rule": "endpoint.server == registry.host; endpoint.port == registry.tcp_port when both set; registry.export_path == endpoint.export_path or lies under it; a trailing '/' on endpoint.export_path is ignored",
+    "endpoint_rule": "endpoint.server == registry.host; endpoint.port == registry.tcp_port when both set; trailing '/' is ignored on every path; without endpoint.ds_path: endpoint.export_path == registry.export_path; with endpoint.ds_path: ds_path == registry.export_path and export_path == ds_path or a component-wise ancestor of it; '/' is never a parent",
     "binding_pin": [
       "connector_instance_id",
       "binding_generation",

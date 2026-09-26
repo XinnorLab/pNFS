@@ -25,7 +25,7 @@
           "binding_generation": 2,
           "target_id": "mnt/data",
           "expected_target_incarnation": "mnt/data:0:<placement incarnation from `lattice-ds-connector discover`>",
-          "endpoint": { "server": "192.168.64.51", "export_path": "/mnt/data", "protocol": "NFS", "transport": "TCP", "port": 2049 },
+          "endpoint": { "server": "192.168.64.51", "export_path": "/mnt/data", "ds_path": "/mnt/data/pnfs-ds", "protocol": "NFS", "transport": "TCP", "port": 2049 },
           "expected_client_networks": ["192.168.64.0/22"],
           "expected_security": ["sys"]
         }
