@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 11:22:25 +0300
-Subject: [PATCH 15/23] feat(ds_connector): batch parser with envelope,
+Subject: [PATCH 15/31] feat(ds_connector): batch parser with envelope,
  sequence, digest and per-DS binding validation (pure)
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

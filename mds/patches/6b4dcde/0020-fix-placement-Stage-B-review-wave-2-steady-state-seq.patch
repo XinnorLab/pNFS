@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 12:29:29 +0300
-Subject: [PATCH 20/23] fix(placement): Stage B review wave 2 -- steady-state
+Subject: [PATCH 20/31] fix(placement): Stage B review wave 2 -- steady-state
  sequences, bounded parsing, per-batch profile digest
 
 Adversarial review of the Stage B diff (ced2043..ccfbcaa), 17 findings.

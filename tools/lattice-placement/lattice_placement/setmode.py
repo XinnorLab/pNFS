@@ -116,6 +116,13 @@ def plan_set(text: str, mode: str, extra: Dict[str, str], manifest: Manifest,
         removed += doc.remove_keys(keys=LEGACY_EXACT, prefixes=LEGACY_PREFIXES)
         # keys the block owns must not survive outside it (last key wins in config.c)
         removed += doc.remove_keys(keys=[k for k, _ in pairs] + ["placement_mode", "ds_connector_enabled"], prefixes=())
+        # keys the manifest says were removed (e.g. the single-digest pin)
+        # are a config error wherever they sit; migrate them away too.
+        removed_key_specs = manifest.raw.get("removed_keys", [])
+        removed += doc.remove_keys(keys=[r["key"] for r in removed_key_specs], prefixes=())
+        for r in removed_key_specs:
+            if r["key"] in removed:
+                notes.append("%s was removed; use %s instead" % (r["key"], r["replaced_by"]))
         managed = [("placement_mode", mode)] + pairs
         doc.replace_managed_block(begin, end, managed)
 

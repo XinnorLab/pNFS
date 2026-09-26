@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 21:54:11 +0300
-Subject: [PATCH 07/23] feat(proxy_io): split lookup from create; every DS file
+Subject: [PATCH 07/31] feat(proxy_io): split lookup from create; every DS file
  creation needs a placement admission token
 
 The write, allocate and copy paths no longer open with O_CREAT: a missing backing object goes through the gated ensure helper, a refused creation surfaces as NOSPC.

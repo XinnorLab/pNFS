@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .live import DsRow, MdsState
+from .profiles import format_pins
 
 EXIT_OK = 0
 EXIT_DIFFER = 1
@@ -41,7 +42,7 @@ def _differences(states: List[MdsState]) -> List[str]:
     smart = [s for s in states if s.mode_effective == "smart"]
     if len(smart) > 1:
         spread("CONNECTOR_CONFIG_DIGEST_MISMATCH", {s.host: s.config_digest for s in smart})
-        spread("CONNECTOR_PROFILE_DIGEST_MISMATCH", {s.host: s.profile_digest for s in smart})
+        spread("CONNECTOR_PROFILES_MISMATCH", {s.host: format_pins(s.profiles) if s.profiles else None for s in smart})
     return errs
 
 
@@ -125,8 +126,8 @@ def render_show(states: List[MdsState]) -> str:
                          "last_batch_valid=%d coverage=%s registered=%d covered=%d eligible=%d" % (
                              r.mode_active, r.connector_config_valid, r.connector_reachable, r.last_batch_valid,
                              r.coverage, r.registered_ds, r.covered_ds, r.eligible_ds))
-            lines.append("  connector: config_digest=%s profile_digest=%s last=%s" % (
-                s.config_digest or "-", s.profile_digest or "-", s.last_detail or "-"))
+            lines.append("  connector: config_digest=%s profiles=%s last=%s" % (
+                s.config_digest or "-", format_pins(s.profiles) if s.profiles else "-", s.last_detail or "-"))
         for row in s.ds:
             lines.append(render_row(row))
         m = s.metrics

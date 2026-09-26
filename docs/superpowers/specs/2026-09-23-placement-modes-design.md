@@ -106,6 +106,11 @@ MDS tests and the CLI helper (both read the same file in CI).
 | `ds_connector_request_deadline_ms` | 500 | 50..`poll_ms` | smart |
 | `ds_connector_expected_contract_major` | 1 | uint | smart |
 | `ds_connector_max_ds` | 256 | 1..256 | smart |
+| `ds_connector_expected_profiles` | unset | `<id>=<digest>[,...]`, at most 8, id `[A-Za-z0-9._-]{1,63}` | smart |
+
+`ds_connector_expected_profile_digest` is a config error (removed
+2026-09-25): replaced by `ds_connector_expected_profiles`, a map from
+profile id to digest (`2026-09-25-per-profile-digest-design.md`).
 
 Validation (`config.c`, fatal at startup, every error printed with its key):
 
@@ -326,18 +331,27 @@ our build; the module is a no-op when the mode is not `smart`):
      contract, `contracts/connector-batch.schema.json`): `ds_id`
      registered and ≤ `ds_connector_max_ds`; `scope == "ds"` and
      `access_scope_id == ds_connector_access_scope` (default `global`);
-     `endpoint.server` and `endpoint.export_path` equal the registry's
-     `host` and `export_path` for that `ds_id` (exact strings — the
-     connector's binding must name the DS the way `ds[N]` registered it)
-     and `endpoint.port` equals `tcp_port` when the registry has one;
-     `profile.digest` equal to `ds_connector_expected_profile_digest` when
-     set, and identical across every record of the batch; `quality`,
+     `endpoint.server` equals the registry's `host`; without
+     `endpoint.ds_path`, `endpoint.export_path` equals the registry's
+     `export_path`; with it, `ds_path` equals the registry's
+     `export_path` and `export_path` is `ds_path` or a component-wise
+     ancestor of it, never `/` unless `ds_path` is `/` (trailing `/` ignored;
+     `2026-09-26-endpoint-ds-path-design.md`) and `endpoint.port` equals
+     `tcp_port` when the registry has one;
+     when `ds_connector_expected_profiles` pins `profile.id`, its
+     `profile.digest` must equal the pin for that id, and the id must be
+     pinned at all — otherwise only that record is rejected
+     (`rejected_binding`); one profile id with two digests, or more than
+     8 distinct ids, in one batch drops the whole batch
+     (`PROFILE_INCONSISTENT` / `PROFILE_LIMIT`, see
+     `2026-09-25-per-profile-digest-design.md` §3.3–§3.4); `quality`,
      `placement.allowed`, `placement.multiplier_ppm` (0..1 000 000),
      `remaining_ttl_ms`, `resources.capacity_domain_id` well-typed. The
      MDS pins, per `ds_id`, the tuple
      `(connector_instance_id, binding_generation, datastore_id,
-     target_id, target_incarnation, profile.digest, access_scope_id)` of
-     the first accepted record. A later record must repeat the tuple
+     target_id, target_incarnation, access_scope_id)` of
+     the first accepted record (the profile is not part of the pin: a
+     connector profile reload is not a rebind). A later record must repeat the tuple
      exactly, **or** carry a strictly higher `binding_generation` — that
      re-pins the tuple and resets that DS to UNKNOWN until its fresh
      record is accepted (the operator rebound the DS). A lower generation,
@@ -504,18 +518,24 @@ in `docs/placement-modes/operations.md`; no online switch (CLI-05).
   mode that differs from the effective one is an error (the daemon was
   not restarted); in `smart` every MDS must report
   `connector_config_valid=1`, `connector_reachable=1` and a coverage other
-  than `none`, and the connector `config_digest` / `profile_digest` must
-  be identical across MDS. `coverage=partial` is a warning (exit 0) that
+  than `none`, and the connector `config_digest` and the profile map
+  (`placement_connector_profiles`) must be identical across MDS
+  (`CONNECTOR_PROFILES_MISMATCH`). `coverage=partial` is a warning (exit 0) that
   lists the non-eligible DS with their reasons; `--require-full-coverage`
   makes it exit 1.
 
 ## 11. Connector preflight (this repo)
 
-`lattice-ds-connector preflight [--socket] [--expect-ds 0,1,2]` reads
-`/healthz` and `/v1/assessments` and reports: instance readiness, bindings
-per DS id, quality/TTL per DS, contract version, profile/config digests,
-domain consistency (two aliases, one domain, same controller). Read-only;
-the connector still stores no placement mode. The CLI helper calls it.
+`lattice-ds-connector preflight [--socket] [--expect-ds 0,1,2]
+[--expect-profiles id=digest,...]` reads `/healthz` and `/v1/assessments`
+and reports: instance readiness, bindings per DS id, quality/TTL per DS,
+contract version, config digest, one digest per profile id
+(`PROFILE_INCONSISTENT:<id>` when a profile id carries two digests), and
+with `--expect-profiles` the pins as well
+(`PROFILE_NOT_PINNED:<id>` / `PROFILE_PIN_MISMATCH:<id>`), domain
+consistency (two aliases, one domain, same controller). Read-only;
+the connector still stores no placement mode. The CLI helper calls it,
+passing the pins automatically in `mode validate`.
 
 ## 12. Packaging and CI
 
@@ -539,7 +559,7 @@ the connector still stores no placement mode. The CLI helper calls it.
 | unit (cmocka, fork) | config parsing: absent key = legacy; each mode; every conflict and range error; profile conflict; alias map | §7.1 |
 | unit | `placement_candidates` / `placement_admit` on synthetic views: rr cyclic order; fill excludes full/stale/unknown; smart excludes deny/UNKNOWN/expired/ppm 0; single DS, 64/65/256 DS, multi-stripe, shrink vs strict, mirrors distinct, no zero weight reaches the kernel | §7.3, §7.4 |
 | unit | fairness with a seeded PRNG: equal fill → ≈ even; 80 %/20 % free → ≈ 4:1 over 100 000 draws within ±2 %; degraded 250 000 ppm vs healthy at equal capacity → ≈ 1:4; alias share: two DS on one domain vs one DS on another → domain totals equal | §7.2, §7.5 |
-| unit | connector client: schema, epoch/sequence replay, TTL expiry on the MDS clock, envelope failure excludes the batch, no fallback when the socket is gone; binding: endpoint mismatch, re-assigned ds_id with the same generation, lower generation, higher generation re-pins and resets to UNKNOWN, profile digest mismatch, config digest pin | §7.3, LAT-06 |
+| unit | connector client: schema, epoch/sequence replay, TTL expiry on the MDS clock, envelope failure excludes the batch, no fallback when the socket is gone; binding: endpoint mismatch, re-assigned ds_id with the same generation, lower generation, higher generation re-pins and resets to UNKNOWN, profile pins by id (one id with two digests drops the batch, more than 8 ids drops the batch), config digest pin | §7.3, LAT-06 |
 | unit | create boundary: with a denied (smart) or full/stale (fill) DS, each former ensure caller — ds_prepare job, LAYOUTGET refresh, promotion write, proxy READ/WRITE ensure, prealloc pop/batch/ensure — creates no file and returns the mapped status; lookup of an existing object still succeeds; a token for DS A is refused for DS B and after its max age | LAT-15/16, review finding 1 |
 | unit | weight bounds with the manual override at 10000 and N = 1 and 256: sum < 2⁶², min > 0; a value of 10001 is a config error | LAT-11, review finding 3 |
 | unit | readiness/verify: partial coverage = warning + exit 0, none = exit 1, `--require-full-coverage` | review finding 4 |
@@ -581,3 +601,5 @@ health; peer-observation freshness for metadata-only MDS.
    CI and, for A and B, with a stand trial. Stand trials restart
    `pnfs-mds` on node223/node225 inside a maintenance window and are
    announced before they run.
+8. Profiles are pinned per id (`ds_connector_expected_profiles`), not one
+   digest per batch — see `2026-09-25-per-profile-digest-design.md`.

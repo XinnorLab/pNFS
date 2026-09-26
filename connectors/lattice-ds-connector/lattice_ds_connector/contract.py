@@ -110,6 +110,7 @@ RUNTIME_REASONS = {
     "IDENTITY_MISMATCH": "controller_id differs from the binding's expectation; VALID deny",
     "INCARNATION_MISMATCH": "the share incarnation differs from the binding's expectation; VALID deny (rebind)",
     "EXPORT_PATH_MISMATCH": "the source's export path differs from the endpoint; VALID deny",
+    "DS_PATH_UNDER_NESTED_SHARE": "another observed share or export lies between the bound share and the binding's ds_path; VALID deny",
     "GRAPH_UNRESOLVED": "a mandatory reference does not resolve in the snapshot; UNKNOWN",
     "DEPENDENCY_ERROR": "a referenced resource is ERROR/UNKNOWN; UNKNOWN",
     "SOURCE_STALE": "evidence older than the profile's max source age; UNKNOWN",
@@ -179,3 +180,13 @@ XIRAID_MEMBER_WORDS = frozenset({"online", "offline", "reconstructing", "need_re
 
 #: RAID levels that carry an initialization phase (XMOD-07): everything but 0.
 LEVELS_WITHOUT_INITIALIZATION = frozenset({"0"})
+
+#: A profile id is used verbatim as a key of the MDS pin map
+#: (ds_connector_expected_profiles = id=digest,...), so it cannot carry
+#: '=', ',' or whitespace. Shared with the batch schema and the MDS parser.
+PROFILE_ID_PATTERN = r"^[A-Za-z0-9._-]{1,63}$"
+#: PM_PROFILES_MAX in the MDS.
+MAX_PROFILES = 8
+#: PM_DIGEST_MAX in the MDS is 128 bytes including the NUL terminator, so
+#: 127 is the longest digest string the MDS will accept.
+MAX_DIGEST_LEN = 127

@@ -44,7 +44,7 @@
   "placement_stripe_shrink": "allow",
   "placement_readiness": "mode_active=1 connector_config_valid=1 connector_reachable=0 last_batch_valid=0 coverage=none registered_ds=2 covered_ds=0 eligible_ds=0",
   "placement_connector_config_digest": "-",
-  "placement_connector_profile_digest": "-",
+  "placement_connector_profiles": "-",
   "placement_connector_last_detail": "socket /run/lattice-ds-connector/connector.sock: absent or refused",
   "placement_ds.0": "domain=ds:0 state=ONLINE capacity_age_ms=1617 avail=41423342665728 total=42234482262016 assessment_age_ms=none quality=NONE allowed=0 ppm=0 ttl_ms=0 weight=0 reason=MODE_NOT_READY",
   "placement_ds.1": "domain=ds:1 state=ONLINE capacity_age_ms=1615 avail=33893385240576 total=34555485487104 assessment_age_ms=none quality=NONE allowed=0 ppm=0 ttl_ms=0 weight=0 reason=MODE_NOT_READY"

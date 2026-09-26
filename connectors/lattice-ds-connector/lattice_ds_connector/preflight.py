@@ -4,7 +4,7 @@ about to run ``placement_mode = smart`` (design section 11).
 
 It reads ``/healthz`` and ``/v1/assessments`` from the local connector and
 checks what the MDS will check: contract major, every expected DS bound,
-no UNKNOWN or expired record, one profile digest, domain consistency
+no UNKNOWN or expired record, one digest per profile id, domain consistency
 (records that share a ``capacity_domain_id`` share a ``datastore_id``).
 It never changes anything and knows nothing about the MDS placement mode.
 """
@@ -12,6 +12,7 @@ It never changes anything and knows nothing about the MDS placement mode.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import contract
@@ -26,13 +27,43 @@ def _major(version: Any) -> Optional[int]:
     return int(head) if head.isdigit() else None
 
 
+def parse_profile_pins(text: str) -> Dict[str, str]:
+    """``id=digest[,id=digest...]`` -> dict; ValueError on the MDS's own
+    config errors (same rule as pm_parse_profile_pins)."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("empty value")
+    out: Dict[str, str] = {}
+    for item in text.split(","):
+        if "=" not in item:
+            raise ValueError("item %r is not id=digest" % item.strip())
+        pid, dig = (s.strip() for s in item.split("=", 1))
+        if not re.fullmatch(contract.PROFILE_ID_PATTERN, pid):
+            raise ValueError("profile id %r must match [A-Za-z0-9._-]{1,63}" % pid)
+        if not dig:
+            raise ValueError("profile %s: empty digest" % pid)
+        if len(dig) > contract.MAX_DIGEST_LEN:
+            raise ValueError("profile %s: digest must be 1..%d bytes" % (pid, contract.MAX_DIGEST_LEN))
+        if pid in out:
+            raise ValueError("profile %s pinned twice" % pid)
+        out[pid] = dig
+    if len(out) > contract.MAX_PROFILES:
+        raise ValueError("more than %d profiles" % contract.MAX_PROFILES)
+    return dict(sorted(out.items()))
+
+
+def format_profiles(profiles: Dict[str, str]) -> str:
+    return ",".join("%s=%s" % kv for kv in sorted(profiles.items())) or "-"
+
+
 def evaluate(health: Optional[Dict[str, Any]], batch: Optional[Dict[str, Any]],
-             expect_ds: Sequence[int] = ()) -> Dict[str, Any]:
+             expect_ds: Sequence[int] = (),
+             expect_profiles: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Pure: the report the CLI prints. ``ready`` is true only when every
     check passes; ``reasons`` lists the failed ones with the DS they name."""
     reasons: List[str] = []
     rows: List[Dict[str, Any]] = []
-    profile_digests = set()
+    profiles: Dict[str, str] = {}
+    inconsistent: List[str] = []
     domains: Dict[str, str] = {}
     seen_ds: Dict[int, str] = {}
     if not isinstance(health, dict):
@@ -69,14 +100,18 @@ def evaluate(health: Optional[Dict[str, Any]], batch: Optional[Dict[str, Any]],
                 "target_incarnation": a.get("target_incarnation"),
                 "binding_generation": a.get("binding_generation"),
                 "reason_codes": list(placement.get("reason_codes") or []),
+                "ds_path": (a.get("endpoint") or {}).get("ds_path"),
             }
             rows.append(row)
             if isinstance(ds, int):
                 if ds in seen_ds:
                     reasons.append("DUPLICATE_DS:%d" % ds)
                 seen_ds[ds] = iid
-            if isinstance(profile.get("digest"), str):
-                profile_digests.add(profile["digest"])
+            pid, pdig = profile.get("id"), profile.get("digest")
+            if isinstance(pid, str) and isinstance(pdig, str):
+                if pid in profiles and profiles[pid] != pdig and pid not in inconsistent:
+                    inconsistent.append(pid)
+                profiles.setdefault(pid, pdig)
             if quality != contract.QUALITY_VALID:
                 reasons.append("UNKNOWN:ds%s" % ds)
             if not isinstance(a.get("remaining_ttl_ms"), int) or a.get("remaining_ttl_ms", 0) <= 0:
@@ -90,15 +125,21 @@ def evaluate(health: Optional[Dict[str, Any]], batch: Optional[Dict[str, Any]],
     for want in expect_ds:
         if want not in seen_ds:
             reasons.append("UNBOUND:ds%d" % want)
-    if len(profile_digests) > 1:
-        reasons.append("PROFILE_DIGESTS:%d" % len(profile_digests))
+    for pid in inconsistent:
+        reasons.append("PROFILE_INCONSISTENT:%s" % pid)
+    if expect_profiles is not None:
+        for pid in sorted(profiles):
+            if pid not in expect_profiles:
+                reasons.append("PROFILE_NOT_PINNED:%s" % pid)
+            elif expect_profiles[pid] != profiles[pid]:
+                reasons.append("PROFILE_PIN_MISMATCH:%s" % pid)
     report = {
         "ready": not reasons,
         "reasons": reasons,
         "contract_version": batch.get("contract_version"),
         "runtime_epoch": batch.get("runtime_epoch"),
         "config_digest": batch.get("config_digest"),
-        "profile_digest": next(iter(profile_digests)) if len(profile_digests) == 1 else None,
+        "profiles": dict(sorted(profiles.items())),
         "generated_at": batch.get("generated_at"),
         "instances": [
             {"id": i.get("connector_instance_id"), "module": i.get("module_type"), "epoch": i.get("epoch"),
@@ -116,18 +157,18 @@ def render(report: Dict[str, Any]) -> str:
     lines.append("READY" if report["ready"] else "NOT_READY " + " ".join(report["reasons"]))
     if "contract_version" in report:
         lines.append(
-            "contract=%s runtime_epoch=%s config_digest=%s profile_digest=%s"
+            "contract=%s runtime_epoch=%s config_digest=%s profiles=%s"
             % (report.get("contract_version"), report.get("runtime_epoch"),
-               report.get("config_digest"), report.get("profile_digest"))
+               report.get("config_digest"), format_profiles(report.get("profiles") or {}))
         )
     for i in report.get("instances", []):
         lines.append("instance %s (%s) epoch=%s seq=%s snapshot=%s" % (i["id"], i["module"], i["epoch"], i["sequence"], i["snapshot_status"]))
     for r in report.get("ds", []):
         lines.append(
-            "  ds %3s %-8s allowed=%-5s ppm=%-7s ttl_ms=%-6s domain=%s datastore=%s target=%s gen=%s reasons=%s"
+            "  ds %3s %-8s allowed=%-5s ppm=%-7s ttl_ms=%-6s domain=%s datastore=%s target=%s gen=%s ds_path=%s reasons=%s"
             % (r["ds_id"], r["quality"], r["allowed"], r["multiplier_ppm"], r["remaining_ttl_ms"],
                r["capacity_domain_id"], r["datastore_id"], r["target_id"], r["binding_generation"],
-               ",".join(r["reason_codes"]))
+               r["ds_path"] or "-", ",".join(r["reason_codes"]))
         )
     for want in report.get("expected_ds", []):
         if not any(r["ds_id"] == want for r in report.get("ds", [])):
@@ -135,7 +176,8 @@ def render(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run(socket_path: str, expect_ds: Sequence[int], as_json: bool) -> int:
+def run(socket_path: str, expect_ds: Sequence[int], as_json: bool,
+        expect_profiles: Optional[Dict[str, str]] = None) -> int:
     from .server import get_json
 
     health = batch = None
@@ -148,6 +190,7 @@ def run(socket_path: str, expect_ds: Sequence[int], as_json: bool) -> int:
         batch = doc if st == 200 and isinstance(doc, dict) else None
     except OSError:
         batch = None
-    report = evaluate(health if isinstance(health, dict) else None, batch, expect_ds)
+    report = evaluate(health if isinstance(health, dict) else None, batch, expect_ds,
+                       expect_profiles=expect_profiles)
     print(json.dumps(report, indent=2) if as_json else render(report))
     return 0 if report["ready"] else 1

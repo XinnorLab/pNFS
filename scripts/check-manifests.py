@@ -36,6 +36,7 @@ MACRO_TO_KEY = {
     "PM_DEFAULT_CONN_CONTRACT_MAJOR": ("ds_connector_expected_contract_major", "default"),
     "PM_DEFAULT_CONN_ACCESS_SCOPE": ("ds_connector_access_scope", "default"),
     "PM_DEFAULT_CONN_SOCKET": ("ds_connector_socket", "default"),
+    "PM_PROFILES_MAX": ("ds_connector_expected_profiles", "max_items"),
 }
 
 

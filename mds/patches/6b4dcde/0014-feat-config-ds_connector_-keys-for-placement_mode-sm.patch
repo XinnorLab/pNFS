@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 11:14:34 +0300
-Subject: [PATCH 14/23] feat(config): ds_connector_* keys for placement_mode =
+Subject: [PATCH 14/31] feat(config): ds_connector_* keys for placement_mode =
  smart; vendor jsmn; ENABLE_DS_CONNECTOR option
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
