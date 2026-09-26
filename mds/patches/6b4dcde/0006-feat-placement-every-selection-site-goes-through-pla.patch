@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 21:47:55 +0300
-Subject: [PATCH 06/23] feat(placement): every selection site goes through
+Subject: [PATCH 06/29] feat(placement): every selection site goes through
  placement_select_gated (LAYOUTGET x2, promotion, prealloc stub and module)
 
 Promotion now honours the effective (possibly shrunk) stripe count instead of looping over phantom entries.

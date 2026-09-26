@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: XinnorLab <135218967+XinnorLab@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 21:40:13 +0300
-Subject: [PATCH 04/23] =?UTF-8?q?feat(placement):=20candidate=20gate=20and?=
+Subject: [PATCH 04/29] =?UTF-8?q?feat(placement):=20candidate=20gate=20and?=
  =?UTF-8?q?=20admit=20for=20rr/fill=20=E2=80=94=20capacity=20gate,=20decla?=
  =?UTF-8?q?red=20aliases,=20fixed-point=20weights,=20refusing=20kernel?=
 MIME-Version: 1.0

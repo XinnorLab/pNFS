@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sergey Platonov <135218967+XinnorLab@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 23:01:39 +0300
+Subject: [PATCH 28/29] fix(metrics): count the profile drop reasons
+
+connector_batches_dropped_total was fixed at [8]; DC_PROFILE_INCONSISTENT
+(8) and DC_PROFILE_LIMIT (9) fell outside both the increment guard in
+note_poll_error() and the Prometheus render loop, so
+pnfs_mds_connector_batches_dropped_total{reason="PROFILE_INCONSISTENT"|
+"PROFILE_LIMIT"} never appeared. Size the array by DC_COUNT and drop the
+"&& r < 8" / "< 8" bounds that shadowed it.
+
+Add a poll_once-level test asserting a PROFILE_INCONSISTENT batch
+increments the counter through the I/O half (note_poll_error), not just
+through the parser-level DC_PROFILE_INCONSISTENT return already covered
+by test_profiles_inconsistent_batch_is_dropped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/mds_metrics.h          |  3 ++-
+ src/common/mds_metrics.c       |  2 +-
+ src/mds/ds_connector.c         |  2 +-
+ tests/unit/test_ds_connector.c | 14 ++++++++++++++
+ 4 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/include/mds_metrics.h b/include/mds_metrics.h
+index 162ebc5..682a1d3 100644
+--- a/include/mds_metrics.h
++++ b/include/mds_metrics.h
+@@ -16,6 +16,7 @@
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include "mds_histogram.h"
++#include "placement_modes.h" /* enum ds_connector_drop, DC_COUNT */
+ 
+ /* Live counters (written by hot paths, read by snapshot). */
+ struct mds_metrics {
+@@ -175,7 +176,7 @@ struct mds_branch_metrics {
+     _Atomic uint64_t placement_mode_gauge;           /**< enum placement_mode of the gate (0 = legacy) */
+     /* Connector client (smart). */
+     _Atomic uint64_t connector_poll_errors_total[8];   /**< by enum ds_connector_poll_error */
+-    _Atomic uint64_t connector_batches_dropped_total[8]; /**< by enum ds_connector_drop */
++    _Atomic uint64_t connector_batches_dropped_total[DC_COUNT]; /**< by enum ds_connector_drop */
+     _Atomic uint64_t connector_batches_accepted_total;
+     _Atomic uint64_t connector_last_success_mono_ms;   /**< gauge source; 0 = never */
+     _Atomic uint64_t connector_covered_ds;             /**< gauge */
+diff --git a/src/common/mds_metrics.c b/src/common/mds_metrics.c
+index 2a6f9c9..5cb7326 100644
+--- a/src/common/mds_metrics.c
++++ b/src/common/mds_metrics.c
+@@ -674,7 +674,7 @@ int mds_metrics_prometheus_v2(const struct mds_metrics_snapshot *snap,
+             return -1;
+         }
+         base += extra;
+-        for (int r = 1; r < DC_COUNT && r < 8; r++) {
++        for (int r = 1; r < DC_COUNT; r++) {
+             extra = snprintf(buf + base, cap - (size_t)base,
+                 "pnfs_mds_connector_batches_dropped_total{reason=\"%s\"} %lu\n",
+                 ds_connector_drop_name((enum ds_connector_drop)r),
+diff --git a/src/mds/ds_connector.c b/src/mds/ds_connector.c
+index ad2a5d2..b3641d1 100644
+--- a/src/mds/ds_connector.c
++++ b/src/mds/ds_connector.c
+@@ -1485,7 +1485,7 @@ static void note_poll_error(enum ds_connector_poll_error e, enum ds_connector_dr
+         atomic_fetch_add_explicit(&g_branch_metrics.connector_poll_errors_total[e], 1,
+                                   memory_order_relaxed);
+     }
+-    if (e == DCP_DROP && (unsigned)d < 8) {
++    if (e == DCP_DROP && (unsigned)d < DC_COUNT) {
+         atomic_fetch_add_explicit(&g_branch_metrics.connector_batches_dropped_total[d], 1,
+                                   memory_order_relaxed);
+     }
+diff --git a/tests/unit/test_ds_connector.c b/tests/unit/test_ds_connector.c
+index 069cbf2..90ed6f3 100644
+--- a/tests/unit/test_ds_connector.c
++++ b/tests/unit/test_ds_connector.c
+@@ -786,6 +786,20 @@ static void test_poll_once_publishes_and_readiness(void)
+     ASSERT_EQ(r.covered_ds, 1u);
+     ASSERT_EQ(atomic_load(&g_branch_metrics.connector_batches_dropped_total[DC_JSON]) >= 1u, true);
+ 
++    /* a batch with two digests for one profile id: DC_PROFILE_INCONSISTENT
++     * is a real array index (8, past the old fixed-8 sizing) and must be
++     * counted like every other drop reason */
++    {
++        char recs[8192];
++        snprintf(recs, sizeof(recs), "%s,%s", rec_prof(0, "xinas-mvp", "sha256:p"),
++                 rec_prof(1, "xinas-mvp", "sha256:q"));
++        RESERVE(200, batch("rt-1", "e1", 3, "2026-09-24T10:00:03Z", "cfg-d", "COMPLETE", recs));
++        ASSERT_EQ(ds_connector_poll_once(), MDS_ERR_INVAL);
++        fake_srv_stop(&s);
++        ASSERT_EQ(atomic_load(&g_branch_metrics.connector_batches_dropped_total[DC_PROFILE_INCONSISTENT]) >= 1u,
++                  true);
++    }
++
+     /* 503 after the grace: the gauge and the fact both drop, on the same rule */
+     usleep(700 * 1000);
+     RESERVE(503, "{\"ready\":false}");
