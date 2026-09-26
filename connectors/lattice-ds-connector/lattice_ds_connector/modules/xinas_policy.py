@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import contract
 from ..config import Binding, Profile
+from ..paths import path_contains
 from .base import Assessment
 
 # Array words → veto reason (XMOD table).
@@ -303,17 +304,6 @@ def _details(rec: Dict[str, Any]) -> Dict[str, Any]:
 def _kind(rec: Dict[str, Any]) -> Optional[str]:
     k = _details(rec).get("kind")
     return k if isinstance(k, str) else None
-
-
-def path_contains(parent: str, path: str) -> bool:
-    """True when ``path`` is ``parent`` or lies under it (string paths, no I/O)."""
-    if not parent or not path:
-        return False
-    if path == parent:
-        return True
-    if parent == "/":
-        return path.startswith("/")
-    return path.startswith(parent.rstrip("/") + "/")
 
 
 def _super_option(super_options: Any, key: str) -> Optional[str]:
