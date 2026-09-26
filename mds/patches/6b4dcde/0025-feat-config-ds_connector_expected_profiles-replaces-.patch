@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sergey Platonov <135218967+XinnorLab@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 17:25:30 +0300
-Subject: [PATCH 25/29] feat(config): ds_connector_expected_profiles replaces
+Subject: [PATCH 25/31] feat(config): ds_connector_expected_profiles replaces
  the single profile digest pin
 
 Leaves one expected syntax error in src/mds/ds_connector.c
