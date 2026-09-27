@@ -73,6 +73,8 @@ class MdsState:
     readiness: Optional[Readiness] = None
     config_digest: Optional[str] = None
     profiles: Optional[Dict[str, str]] = None
+    profiles_row: bool = False              # config show had a placement_connector_profiles row
+    profiles_error: Optional[str] = None    # the row's raw value when it does not parse
     last_detail: Optional[str] = None
     ds: List[DsRow] = field(default_factory=list)
     metrics: Dict[str, float] = field(default_factory=dict)
@@ -195,11 +197,12 @@ def state_from_show(host: str, show: Dict[str, str], metrics: Optional[Dict[str,
         if v is not None and v != "-":
             setattr(st, key.replace("placement_connector_", ""), v)
     raw_profiles = show.get("placement_connector_profiles")
+    st.profiles_row = raw_profiles is not None
     if raw_profiles not in (None, "", "-"):
         try:
             st.profiles = parse_pins(raw_profiles)
         except ValueError:
-            st.profiles = {"<unparsable>": raw_profiles}
+            st.profiles_error = raw_profiles
     st.last_detail = show.get("placement_connector_last_detail")
     rows: List[DsRow] = []
     for key, value in show.items():

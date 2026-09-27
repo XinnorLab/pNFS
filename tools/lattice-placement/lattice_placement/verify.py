@@ -60,11 +60,15 @@ def verdict(states: List[MdsState], require_full_coverage: bool = False) -> Verd
         if s.desired_mode is not None and s.mode_effective is not None and s.desired_mode != s.mode_effective:
             v.errors.append("DESIRED_NE_EFFECTIVE:%s: the file says %s, the daemon runs %s (restart pending?)"
                             % (s.host, s.desired_mode, s.mode_effective))
+        if s.profiles_error is not None:
+            v.errors.append("CONNECTOR_PROFILES_INVALID:%s: %s" % (s.host, s.profiles_error))
         if s.mode_effective == "smart":
             r = s.readiness
             if r is None:
                 v.errors.append("NO_READINESS:%s: smart without a placement_readiness row" % s.host)
                 continue
+            if not s.profiles_row:
+                v.errors.append("CONNECTOR_PROFILES_MISSING:%s" % s.host)
             if not r.connector_config_valid:
                 v.errors.append("CONNECTOR_CONFIG_INVALID:%s" % s.host)
             if not r.connector_reachable:
@@ -111,6 +115,12 @@ def render_row(row: DsRow) -> str:
     return "  " + " ".join(parts)
 
 
+def _fmt_profiles(s: MdsState) -> str:
+    if s.profiles_error is not None:
+        return "INVALID(%s)" % s.profiles_error
+    return format_pins(s.profiles) if s.profiles else "-"
+
+
 def render_show(states: List[MdsState]) -> str:
     lines: List[str] = []
     for s in states:
@@ -127,7 +137,7 @@ def render_show(states: List[MdsState]) -> str:
                              r.mode_active, r.connector_config_valid, r.connector_reachable, r.last_batch_valid,
                              r.coverage, r.registered_ds, r.covered_ds, r.eligible_ds))
             lines.append("  connector: config_digest=%s profiles=%s last=%s" % (
-                s.config_digest or "-", format_pins(s.profiles) if s.profiles else "-", s.last_detail or "-"))
+                s.config_digest or "-", _fmt_profiles(s), s.last_detail or "-"))
         for row in s.ds:
             lines.append(render_row(row))
         m = s.metrics
