@@ -300,7 +300,7 @@
   "connector_client": {
     "contract_version_major": 1,
     "scope": "NEW_ALLOCATION",
-    "endpoint_rule": "endpoint.server == registry.host; endpoint.port == registry.tcp_port when both set; trailing '/' is ignored on every path; without endpoint.ds_path: endpoint.export_path == registry.export_path; with endpoint.ds_path: ds_path == registry.export_path and export_path == ds_path or a component-wise ancestor of it; '/' is never a parent",
+    "endpoint_rule": "endpoint.server == registry.host; endpoint.port == registry.tcp_port when both set; trailing '/' is ignored on every path; without endpoint.ds_path: endpoint.export_path == registry.export_path; with endpoint.ds_path: ds_path == registry.export_path and export_path == ds_path or a component-wise ancestor of it; '/' is never a parent; every path is canonical: no empty, '.' or '..' component",
     "binding_pin": [
       "connector_instance_id",
       "binding_generation",

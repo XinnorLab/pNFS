@@ -24,7 +24,7 @@ predates the modes and `verify` says so).
 |---|---|---|---|
 | `mode validate` | READY | NOT_READY (errors listed) | the file cannot be read |
 | `mode set` | dry-run printed / applied / no change | REFUSED (the result would not validate; the backup was restored if it was written) | bad arguments or I/O |
-| `mode verify` | same effective mode, generation and build on every MDS; `smart`: connector valid + reachable, coverage full or partial | any difference, a desired mode that is not effective yet, connector invalid/unreachable, coverage none, or partial with `--require-full-coverage` | an MDS could not be read |
+| `mode verify` | same effective mode, generation and build on every MDS; `smart`: connector valid + reachable, coverage full or partial | any difference, a desired mode that is not effective yet, connector invalid/unreachable, coverage none, an unreadable (`CONNECTOR_PROFILES_INVALID`) or, in `smart`, absent (`CONNECTOR_PROFILES_MISSING`) profile pin row, or partial with `--require-full-coverage` | an MDS could not be read |
 | `mode show` | rendered | — | an MDS could not be read |
 
 ## The switch, step by step
@@ -193,7 +193,12 @@ syntax itself.
 Bind the share in `export_path` and the `ds[N]` path in `ds_path` — the
 stand example: `export_path: /mnt/data`, `ds_path: /mnt/data/pnfs-ds`.
 The connector vetoes `DS_PATH_UNDER_NESTED_SHARE` when another share lies
-in between. See "Upgrading to `ds_path` bindings" above for the order to
+in between. Both paths must be canonical — no `.`, `..` or empty (`//`)
+component: the connector config reports `PATH_NOT_CANONICAL`, the MDS
+rejects such a record's shape, and `mds-admin ds add` refuses to register
+such a `ds[N]` path. The connector checks the path as written; it does not
+resolve symlinks or mounts under the share, so keep the DS directory a
+plain directory on the share's filesystem. See "Upgrading to `ds_path` bindings" above for the order to
 roll this out in on a cluster that is already running.
 
 ## Reading `show`
