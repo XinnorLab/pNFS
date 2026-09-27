@@ -587,7 +587,7 @@ def test_batch_schema_allows_an_absolute_ds_path(schemas):
     jsonschema = pytest.importorskip("jsonschema")
     ep = (schemas["batch"]["properties"]["instances"]["items"]["properties"]["assessments"]
           ["items"]["properties"]["endpoint"])
-    assert ep["properties"]["ds_path"] == {"type": "string", "pattern": "^/"}
+    assert ep["properties"]["ds_path"] == ep["properties"]["export_path"]   # both canonical (2026-09-27)
     assert "ds_path" not in ep["required"]
     base = {"server": "s", "export_path": "/mnt/data", "protocol": "NFS", "transport": "TCP", "port": 2049}
     assert jsonschema.Draft7Validator(ep).is_valid(dict(base, ds_path="/mnt/data/pnfs-ds"))

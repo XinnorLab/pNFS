@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from . import contract
-from .paths import normalize, path_contains
+from .paths import is_canonical, normalize, path_contains
 
 CONFIG_VERSION = "1.0"
 SUPPORTED_MODULES = ("xinas", "fixture")
@@ -361,6 +361,9 @@ def _parse_endpoint(c: _Collector, raw: Any, path: str) -> Optional[Endpoint]:
     export_path = _str(c, raw, "export_path", path)
     if export_path is not None and not export_path.startswith("/"):
         c.error("FORMAT", f"{path}.export_path", "must be an absolute path")
+    elif export_path is not None and not is_canonical(export_path):
+        c.error("PATH_NOT_CANONICAL", f"{path}.export_path", "no empty, '.' or '..' component")
+        export_path = None
     protocol = raw.get("protocol", "NFS")
     if protocol != "NFS":
         c.error("ENUM", f"{path}.protocol", "must be NFS")
@@ -371,6 +374,9 @@ def _parse_endpoint(c: _Collector, raw: Any, path: str) -> Optional[Endpoint]:
     ds_path = _str(c, raw, "ds_path", path, required=False)
     if ds_path is not None and not ds_path.startswith("/"):
         c.error("FORMAT", f"{path}.ds_path", "must be an absolute path")
+        ds_path = None
+    elif ds_path is not None and not is_canonical(ds_path):
+        c.error("PATH_NOT_CANONICAL", f"{path}.ds_path", "no empty, '.' or '..' component")
         ds_path = None
     if server is None or export_path is None or port is None:
         return None
