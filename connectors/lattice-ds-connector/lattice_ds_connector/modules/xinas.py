@@ -45,6 +45,29 @@ def _read_token(path: Optional[str]) -> str:
     return token
 
 
+def _start_watchdog(sock: Any, remaining_s: float, expired: threading.Event) -> threading.Timer:
+    """Shut ``sock`` down once ``remaining_s`` has passed.
+
+    The socket timeout bounds each recv/send, not their sum: a source that
+    sends a byte just inside it every time would stretch one GET far past the
+    collect deadline. Shutting the socket down wakes any blocked read.
+    """
+
+    def expire() -> None:
+        expired.set()
+        try:
+            # The plain-socket shutdown, not SSLSocket.shutdown, which also
+            # drops the SSL object under a reader in another thread.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except OSError:
+            pass  # already closed
+
+    timer = threading.Timer(max(0.0, remaining_s), expire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 def fetch_observations(
     url: str,
     token: str,
@@ -69,7 +92,15 @@ def fetch_observations(
     path = parts.path or "/"
     if parts.query:
         path += "?" + parts.query
+    expires_at = time.monotonic() + deadline_s
+    expired = threading.Event()
+    watchdog: Optional[threading.Timer] = None
+    resp: Optional[http.client.HTTPResponse] = None
     try:
+        # connect (and the TLS handshake) are bounded by the socket timeout;
+        # from here on the watchdog bounds the whole exchange.
+        conn.connect()
+        watchdog = _start_watchdog(conn.sock, expires_at - time.monotonic(), expired)
         conn.request(
             "GET",
             path,
@@ -90,21 +121,32 @@ def fetch_observations(
             if total > MAX_SOURCE_BYTES:
                 raise CollectionError("SOURCE_SCHEMA_INVALID", "response exceeds 16 MiB", retryable=False)
             chunks.append(chunk)
+        if expired.is_set():
+            # The shutdown can end a close-delimited body early as a clean EOF.
+            raise CollectionError("SOURCE_TIMEOUT", "the source did not answer within the deadline")
         body = b"".join(chunks)
         status = resp.status
     except CollectionError:
         raise
-    except socket.timeout as exc:
-        raise CollectionError("SOURCE_TIMEOUT", "the source did not answer within the deadline") from exc
-    except ssl.SSLError as exc:
-        raise CollectionError("SOURCE_TLS_FAILED", f"TLS failure: {exc.__class__.__name__}", retryable=False) from exc
     except (OSError, http.client.HTTPException) as exc:
+        if expired.is_set() or isinstance(exc, socket.timeout):
+            raise CollectionError("SOURCE_TIMEOUT", "the source did not answer within the deadline") from exc
+        if isinstance(exc, ssl.SSLError):
+            raise CollectionError("SOURCE_TLS_FAILED", f"TLS failure: {exc.__class__.__name__}", retryable=False) from exc
         raise CollectionError("SOURCE_UNAVAILABLE", f"transport failure: {exc.__class__.__name__}") from exc
     finally:
-        try:
-            conn.close()
-        except Exception:  # pragma: no cover - close is best effort
-            pass
+        if watchdog is not None:
+            watchdog.cancel()
+        # With a close-delimited (HTTP/1.0 or Connection: close) response
+        # http.client hands the socket to the response, so conn.close() alone
+        # leaves it open for as long as anything (e.g. this frame, via an
+        # exception traceback) still references resp.
+        for closeable in (resp, conn):
+            if closeable is not None:
+                try:
+                    closeable.close()
+                except Exception:  # pragma: no cover - close is best effort
+                    pass
 
     if status in (301, 302, 303, 307, 308):
         raise CollectionError("SOURCE_UNAVAILABLE", "redirect refused (CON-20)", retryable=False, details={"status": status})

@@ -5,6 +5,7 @@ auth safety, CON-20) and envelope validation."""
 import http.server
 import json
 import threading
+import time
 
 import pytest
 
@@ -16,6 +17,10 @@ from lattice_ds_connector.modules.xinas import XinasModule, fetch_observations, 
 
 
 class Scripted(http.server.BaseHTTPRequestHandler):
+    # A socket timeout on the server side: a handler blocked writing to a
+    # client that stopped reading gives up instead of wedging serve_forever,
+    # which srv.shutdown() in the fixture teardown would then wait on forever.
+    timeout = 5
     responses = []
     seen = []
 
@@ -114,6 +119,61 @@ def test_timeout_is_retryable(server):
     with pytest.raises(CollectionError) as ei:
         fetch(url, deadline=0.2)
     assert ei.value.code == "SOURCE_TIMEOUT" and ei.value.retryable
+
+
+def test_the_connection_is_released_while_the_error_is_still_held(server):
+    # The oversize path used to leave the response socket open for as long as
+    # the CollectionError's traceback was alive, so a source still writing the
+    # rest of its body blocked on a peer that neither read nor closed.
+    srv, url = server
+    finished = threading.Event()
+
+    class Flood(Scripted):
+        def do_GET(self):  # noqa: N802
+            body = b"[" + b"1," * (24 * 1024 * 1024) + b"1]"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+            finally:
+                finished.set()
+
+    srv.RequestHandlerClass = Flood
+    with pytest.raises(CollectionError) as ei:
+        fetch(url)
+    assert ei.value.code == "SOURCE_SCHEMA_INVALID"
+    assert finished.wait(3.0), "the client kept its end of the connection open"
+
+
+def test_a_trickling_source_cannot_stretch_the_deadline(server):
+    # The socket timeout bounds each recv, not the whole GET: a source that
+    # sends a byte just inside it every time must still be cut at the deadline.
+    srv, url = server
+
+    class Trickle(Scripted):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            try:
+                for _ in range(100):
+                    self.wfile.write(b" ")
+                    time.sleep(0.05)
+            except OSError:
+                pass
+
+    srv.RequestHandlerClass = Trickle
+    started = time.monotonic()
+    with pytest.raises(CollectionError) as ei:
+        fetch(url, deadline=0.5)
+    elapsed = time.monotonic() - started
+    assert ei.value.code == "SOURCE_TIMEOUT" and ei.value.retryable
+    assert elapsed < 1.5, f"the GET ran {elapsed:.1f}s against a 0.5s deadline"
 
 
 def test_https_is_the_default_and_plain_http_needs_the_flag():
