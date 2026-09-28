@@ -100,3 +100,41 @@ def test_render_show_lists_everything_and_warns_on_differences():
     assert render_show([bad]) == "m4: UNREADABLE: boom"
     a.metrics_error = "http://m1:9090/metrics: refused"
     assert "metrics: unavailable (http://m1:9090/metrics: refused)" in render_show([a])
+
+
+def _with_profiles(host, raw):
+    with open(os.path.join(FIX, "config-show-smart-mds2.json"), "r", encoding="utf-8") as fh:
+        show = parse_config_show(fh.read())
+    if raw is None:
+        del show["placement_connector_profiles"]
+    else:
+        show["placement_connector_profiles"] = raw
+    return state_from_show(host, show, None, "smart")
+
+
+def test_an_unparsable_profile_map_is_an_error_on_a_single_mds():
+    v = verdict([_with_profiles("m1", "not-a-profile-map")])
+    assert v.exit_code == EXIT_DIFFER
+    assert "CONNECTOR_PROFILES_INVALID:m1: not-a-profile-map" in v.errors
+
+
+def test_the_same_unparsable_profile_map_on_two_mds_is_an_error():
+    v = verdict([_with_profiles("m1", "not-a-profile-map"), _with_profiles("m2", "not-a-profile-map")])
+    assert v.exit_code == EXIT_DIFFER
+    assert {e for e in v.errors if e.startswith("CONNECTOR_PROFILES_INVALID")} == {
+        "CONNECTOR_PROFILES_INVALID:m1: not-a-profile-map", "CONNECTOR_PROFILES_INVALID:m2: not-a-profile-map"}
+
+
+def test_a_smart_mds_without_the_profile_row_is_an_error():
+    v = verdict([_with_profiles("m1", None)])
+    assert v.exit_code == EXIT_DIFFER and "CONNECTOR_PROFILES_MISSING:m1" in v.errors
+
+
+def test_no_pins_yet_is_not_a_profile_error():
+    v = verdict([_with_profiles("m1", "-")])
+    assert not any(e.startswith("CONNECTOR_PROFILES_") for e in v.errors)
+
+
+def test_show_marks_an_unparsable_profile_map():
+    out = render_show([_with_profiles("m1", "not-a-profile-map")])
+    assert "profiles=INVALID(not-a-profile-map)" in out

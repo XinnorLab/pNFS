@@ -218,6 +218,26 @@ def test_ds_path_must_be_the_share_or_under_it(token_file, tmp_path, ds_path, co
     assert code in {c for c, _ in errors_of(doc)}
 
 
+@pytest.mark.parametrize("suffix", [
+    "/../../data2/training-c/pnfs-ds",   # re-review P1: leaves the share
+    "/./pnfs-ds",
+    "//pnfs-ds",
+    "/pnfs-ds/..",
+    "/pnfs-ds/.",
+])
+def test_ds_path_must_be_canonical(token_file, tmp_path, suffix):
+    doc = example(token_file, tmp_path)
+    _ep(doc)["ds_path"] = _ep(doc)["export_path"].rstrip("/") + suffix
+    assert ("PATH_NOT_CANONICAL", "instances[0].bindings[0].endpoint.ds_path") in errors_of(doc)
+
+
+@pytest.mark.parametrize("export_path", ["/mnt/data/../data2", "/mnt/./data", "/mnt//data", "/mnt/data/.."])
+def test_export_path_must_be_canonical(token_file, tmp_path, export_path):
+    doc = example(token_file, tmp_path)
+    _ep(doc)["export_path"] = export_path
+    assert ("PATH_NOT_CANONICAL", "instances[0].bindings[0].endpoint.export_path") in errors_of(doc)
+
+
 def test_ds_path_prefix_is_not_a_component(token_file, tmp_path):
     doc = example(token_file, tmp_path)
     base = _ep(doc)["export_path"].rstrip("/")
