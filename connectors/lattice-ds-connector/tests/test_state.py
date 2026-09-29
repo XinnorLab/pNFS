@@ -277,6 +277,28 @@ def test_write_failure_is_tolerated_and_rate_bounded(tmp_path, monkeypatch):
     assert len(calls) == 2                                          # the next interval tries again
 
 
+def test_failed_write_is_retried_without_a_store_change(tmp_path, monkeypatch):
+    clock = FakeClock(); mod = ScriptedModule(clock)
+    rt = rt_with_state(tmp_path, clock, mod)
+    real, calls = state.save, []
+
+    def failing_once(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(28, "no space")
+        return real(*a, **k)
+
+    monkeypatch.setattr(state, "save", failing_once)
+    ir = rt.instances["xi-01"]
+    ir.run_cycle()                                                  # the write fails
+    assert len(calls) == 1 and not (tmp_path / "verdicts.json").exists()
+    mod.push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))   # retained: the store does not change
+    clock.advance(2.0)
+    ir.run_cycle()
+    assert len(calls) == 2                                          # the failed write is retried anyway
+    assert len(saved(tmp_path)["verdicts"]) == 3
+
+
 def test_saves_follow_store_changes_only(tmp_path, monkeypatch):
     clock = FakeClock(); mod = ScriptedModule(clock)
     rt = rt_with_state(tmp_path, clock, mod)

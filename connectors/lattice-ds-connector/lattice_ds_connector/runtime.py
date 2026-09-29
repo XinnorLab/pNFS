@@ -868,7 +868,8 @@ class Runtime:
         per ``collect_interval_ms`` (``force``: now, e.g. on stop). Only
         entries of configured bindings whose hold has not run out are
         written. A failure is a WARN and ``connector_state_write_errors_total``;
-        the runtime carries on with its in-memory store. Called from every
+        the runtime carries on with its in-memory store and tries again one
+        interval later, changed store or not. Called from every
         worker thread: one write at a time, and a worker never waits for
         another's write (the next cycle carries its change)."""
         path = self.config.runtime.state_path
@@ -890,10 +891,10 @@ class Runtime:
                 items = sorted(self.verdicts.items(), key=lambda kv: (kv[0].instance, kv[0].ds_id, kv[0].binding_generation))
                 entries = [state.entry_from(k, v, now, now_wall) for k, v in items if k in configured and v.remaining_ms(now) > 0]
                 state.save(path, entries, self.runtime_epoch, now_wall)
+                self._saved_version = version        # a failed write is retried next interval
             except Exception as exc:  # noqa: BLE001 - OSError above all; nothing may reach a worker
                 self.log.counters.inc("connector_state_write_errors_total", {})
                 self.log.limited("warn", "state_write_failed", "state:write", path=path, error=f"{exc.__class__.__name__}: {exc}")
-            self._saved_version = version
             self._last_save_mono = now
         finally:
             self._save_lock.release()
