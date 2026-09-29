@@ -8,7 +8,15 @@ worker joins with the deadline, so a hanging module cannot stack collects
 (at most one in flight) and cannot block other instances. A worker that is
 stuck past the deadline is abandoned (the helper is a daemon thread) and
 restarted, up to ``worker_restart_limit`` times per hour; after that the
-instance publishes UNKNOWN / WORKER_STUCK until a reload.
+instance publishes WORKER_STUCK (retained verdicts or UNKNOWN) until a reload.
+
+Verdict retention (smart verdict retention design §3, §4.2, §4.3): the last
+VALID record of every binding lives in the runtime's :class:`VerdictStore`
+and stays in force for its hold (``critical_hold_ms`` for a deny,
+``verdict_hold_ms`` otherwise), counted from its observation. A newer VALID
+record replaces it; no new data -- an UNKNOWN record or a collection error of
+any kind -- never does: the stored verdict is re-published with
+``VERDICT_RETAINED`` until its hold runs out, then the binding reads UNKNOWN.
 
 Publication is atomic: a worker builds a complete immutable
 :class:`InstanceSnapshot` and swaps it in under a lock; a reader never sees
@@ -34,6 +42,7 @@ from .log import Logger
 from .modules import create_module
 from .modules.base import Assessment, CollectionError, Module, SourceBatch, unknown_assessment
 from .modules.fixture import fixture_profile
+from .verdicts import StoredVerdict, VerdictKey, VerdictStore
 
 
 def utc_now() -> str:
@@ -43,7 +52,8 @@ def utc_now() -> str:
 @dataclass(frozen=True)
 class PublishedAssessment:
     """One normalized assessment as published, with the facts the reader needs
-    to age it: when it was fetched and the profile's max source age."""
+    to age it: when it was fetched and, for a VALID record, the hold it stays
+    in force for and the observation that hold counts from."""
 
     assessment: Assessment
     fetched_mono: float
@@ -51,22 +61,37 @@ class PublishedAssessment:
     profile_id: str
     profile_version: str
     profile_digest: str
+    hold_ms: int = 0                          # 0 = UNKNOWN record, no hold
+    hold_origin_mono: Optional[float] = None  # the observation the hold counts from
+    retained: bool = False                    # re-published without a new VALID record
+    restored: bool = False                    # ... restored from the state file
+    retained_cause: Optional[str] = None      # why there was no new VALID record
 
     def render(self, now_mono: float) -> Dict[str, Any]:
         a = self.assessment
-        age: Optional[int]
-        if a.evidence_age_ms is None:
-            age = None
-            ttl = 0
-        else:
-            age = a.evidence_age_ms + max(0, int((now_mono - self.fetched_mono) * 1000))
-            ttl = max(0, min(contract.MAX_REMAINING_TTL_MS, self.source_max_age_ms - age))
+        age: Optional[int] = None
+        ttl = 0
+        if a.evidence_age_ms is not None:
+            since_fetch_ms = max(0, int((now_mono - self.fetched_mono) * 1000))
+            age = a.evidence_age_ms + since_fetch_ms
+            if a.quality == contract.QUALITY_VALID and self.hold_origin_mono is not None:
+                # Held since the hold origin, on the same millisecond basis as
+                # the age: for a record whose hold counts from its own
+                # observation, held == age and ttl + age == hold.
+                lead_ms = int(round((self.fetched_mono - self.hold_origin_mono) * 1000))
+                held = max(0, lead_ms + since_fetch_ms)
+                ttl = max(0, min(contract.MAX_REMAINING_TTL_MS, self.hold_ms - held))
         quality, allowed, ppm, reasons = a.quality, a.allowed, a.multiplier_ppm, list(a.reason_codes)
         if ttl == 0:
             if allowed or quality == contract.QUALITY_VALID:
-                if "EVIDENCE_EXPIRED" not in reasons:
-                    reasons = (["EVIDENCE_EXPIRED"] + reasons)[: contract.MAX_REASON_CODES]
+                cause = [self.retained_cause] if self.retained and self.retained_cause else []
+                reasons = _lead(["EVIDENCE_EXPIRED"] + cause, reasons)
             quality, allowed, ppm = contract.QUALITY_UNKNOWN, False, 0
+        elif self.retained:
+            head = ["VERDICT_RETAINED"] + (["RESTORED_FROM_STATE"] if self.restored else [])
+            if self.retained_cause:
+                head.append(self.retained_cause)
+            reasons = _lead(head, reasons)
         diagnostics = _bounded_diagnostics(a.diagnostics)
         return {
             "ds_id": a.ds_id,
@@ -90,6 +115,11 @@ class PublishedAssessment:
             "coverage": list(a.coverage),
             "diagnostics": diagnostics,
         }
+
+
+def _lead(head: List[str], reasons: List[str]) -> List[str]:
+    """``head`` first, then the other reasons in order, bounded."""
+    return (head + [r for r in reasons if r not in head])[: contract.MAX_REASON_CODES]
 
 
 def _bounded_diagnostics(diag: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,9 +195,6 @@ class HoldDownTracker:
             diagnostics=diag,
         )
 
-    def forget(self, key: Tuple[int, int]) -> None:
-        self._states.pop(key, None)
-
 
 class InstanceRuntime:
     """One configured instance: its module, worker and published snapshot."""
@@ -184,8 +211,12 @@ class InstanceRuntime:
         sleeper=None,
         jitter=None,
         incarnation: int = 0,
+        store: Optional[VerdictStore] = None,
     ):
         self.instance = instance
+        #: The runtime's verdict store (shared by all instances; a private one
+        #: when the instance runs on its own, e.g. in a unit test).
+        self.store = store if store is not None else VerdictStore()
         self.profile = profile
         self.cfg = runtime_cfg
         self.log = logger
@@ -213,7 +244,7 @@ class InstanceRuntime:
         # Audit C-05: the last accepted source cycle; a replayed or regressed
         # generation within the same source epoch is ignored.
         self._last_source: Optional[Tuple[str, int]] = None
-        self.snapshot: InstanceSnapshot = self._unknown_snapshot("NO_ASSESSMENT", contract.SNAPSHOT_FAILED, publish=False)
+        self.snapshot: InstanceSnapshot = self._no_data_snapshot("NO_ASSESSMENT", contract.SNAPSHOT_FAILED, publish=False)
 
     # --- helpers ------------------------------------------------------------
 
@@ -229,22 +260,36 @@ class InstanceRuntime:
     def _datastore_id(self, b: Binding) -> str:
         return self.instance.expected_controller_id or b.datastore_id or self.instance.id
 
-    def _unknown_snapshot(self, code: str, status: str, publish: bool = True, error: Optional[str] = None) -> InstanceSnapshot:
-        now = self._clock()
+    @staticmethod
+    def static_key(instance_id: str, b: Binding) -> VerdictKey:
+        return VerdictKey(instance_id, b.ds_id, b.binding_generation, b.target_id, b.expected_target_incarnation)
+
+    def key_for(self, b: Binding) -> VerdictKey:
+        return InstanceRuntime.static_key(self.instance.id, b)
+
+    def _retained_or_unknown(
+        self, b: Binding, cause: str, now: float, fallback: Optional[PublishedAssessment] = None
+    ) -> PublishedAssessment:
+        """No new VALID record for ``b``: its verdict in force, re-published
+        as retained (``cause`` says why), else ``fallback`` -- the cycle's own
+        UNKNOWN record -- or a bare UNKNOWN record carrying ``cause``. A
+        verdict whose hold ran out is dropped from the store."""
+        key = self.key_for(b)
+        held = self.store.get(key)
+        if held is not None:
+            if held.remaining_ms(self.profile or fixture_profile(), now) > 0:
+                return replace(held.published, retained=True, restored=held.restored, retained_cause=cause)
+            self.store.drop(key, expected=held)
+        if fallback is not None:
+            return fallback
         pid, pver, pdig, max_age = self._profile_triplet()
-        records = tuple(
-            PublishedAssessment(
-                assessment=unknown_assessment(b, self._datastore_id(b), code),
-                fetched_mono=now,
-                source_max_age_ms=max_age,
-                profile_id=pid,
-                profile_version=pver,
-                profile_digest=pdig,
-            )
-            for b in self.instance.bindings
-        )
-        for b in self.instance.bindings:
-            self._hold.forget((b.ds_id, b.binding_generation))
+        return PublishedAssessment(unknown_assessment(b, self._datastore_id(b), cause), now, max_age, pid, pver, pdig)
+
+    def _no_data_snapshot(self, code: str, status: str, publish: bool = True, error: Optional[str] = None) -> InstanceSnapshot:
+        """A snapshot without new data (start, collection error, WORKER_STUCK):
+        every binding carries its retained verdict or the UNKNOWN record."""
+        now = self._clock()
+        records = tuple(self._retained_or_unknown(b, code, now) for b in self.instance.bindings)
         snap = InstanceSnapshot(
             epoch=self.epoch,
             sequence=self._sequence + 1 if publish else 0,
@@ -298,16 +343,25 @@ class InstanceRuntime:
                 a = unknown_assessment(b, self._datastore_id(b), "NO_ASSESSMENT")
             a = a.normalized()
             a = self._hold.apply(a, batch.cycle_key, now, batch.fetched_mono, profile)
-            records.append(
-                PublishedAssessment(
-                    assessment=a,
-                    fetched_mono=batch.fetched_mono,
-                    source_max_age_ms=max_age,
-                    profile_id=pid,
-                    profile_version=pver,
-                    profile_digest=pdig,
-                )
+            pa = PublishedAssessment(
+                assessment=a,
+                fetched_mono=batch.fetched_mono,
+                source_max_age_ms=max_age,
+                profile_id=pid,
+                profile_version=pver,
+                profile_digest=pdig,
             )
+            if a.quality == contract.QUALITY_VALID:
+                # A newer VALID record replaces the verdict at once (rule 2);
+                # its hold counts from its observation.
+                critical = not a.allowed
+                origin = batch.fetched_mono - (a.evidence_age_ms or 0) / 1000.0
+                pa = replace(pa, hold_ms=profile.hold_ms(critical), hold_origin_mono=origin)
+                self.store.put(self.key_for(b), StoredVerdict(pa, critical=critical, hold_origin_mono=origin, profile_id=pid))
+            else:
+                # An UNKNOWN record is no new data (rule 3): the verdict in force stays.
+                pa = self._retained_or_unknown(b, (a.reason_codes or ["NO_ASSESSMENT"])[0], now, fallback=pa)
+            records.append(pa)
         self._failures = 0
         self._backoff_s = 0.0
         snap = InstanceSnapshot(
@@ -378,20 +432,23 @@ class InstanceRuntime:
         return result["batch"], list(result["raw"])
 
     def _on_collection_error(self, exc: CollectionError) -> None:
+        """No new data of any kind revokes nothing (rule 3): a new FAILED
+        snapshot re-publishes every verdict in force as retained (cause = the
+        error code). Non-retryable errors still alert."""
         self._failures += 1
         self._backoff_s = min(contract.MAX_RETRY_BACKOFF_MS / 1000.0, (2 ** min(self._failures, 3)) * 0.5)
         self.log.counters.inc("connector_poll_errors_total", {"instance": self.instance.id, "code": exc.code})
-        now = self._clock()
-        if exc.retryable:
-            # Transport-style failure: the last VALID decisions stay until their
-            # own expiry (CON-12); nothing is refreshed.
-            with self._lock:
-                self.snapshot = replace(self.snapshot, last_error=exc.code, last_error_mono=now)
-            self.log.limited("warn", "collect_failed_retained", f"{self.instance.id}:{exc.code}", instance=self.instance.id, code=exc.code, message=str(exc), retained=True)
-            return
-        # Auth / schema / explicit source verdict: revoke immediately and alert.
-        self._unknown_snapshot(exc.code, contract.SNAPSHOT_FAILED, error=exc.code)
-        self.log.limited("error", "collect_failed_revoked", f"{self.instance.id}:{exc.code}", instance=self.instance.id, code=exc.code, message=str(exc), retained=False, alert=True)
+        snap = self._no_data_snapshot(exc.code, contract.SNAPSHOT_FAILED, error=exc.code)
+        self.log.limited(
+            "warn" if exc.retryable else "error",
+            "collect_failed_retained",
+            f"{self.instance.id}:{exc.code}",
+            instance=self.instance.id,
+            code=exc.code,
+            message=str(exc),
+            retained=sum(1 for pa in snap.assessments if pa.retained),
+            alert=not exc.retryable,
+        )
 
     # --- worker thread ------------------------------------------------------
 
@@ -443,7 +500,7 @@ class InstanceRuntime:
         if len(self._restart_times) <= self.cfg.worker_restart_limit:
             return False
         if self.snapshot.last_error != "WORKER_STUCK":
-            self._unknown_snapshot("WORKER_STUCK", contract.SNAPSHOT_FAILED, error="WORKER_STUCK")
+            self._no_data_snapshot("WORKER_STUCK", contract.SNAPSHOT_FAILED, error="WORKER_STUCK")
             self.log.error("worker_restart_limit", instance=self.instance.id, limit=self.cfg.worker_restart_limit)
         return True
 
@@ -501,6 +558,8 @@ class Runtime:
         self.config = config
         self.instances: Dict[str, InstanceRuntime] = {}
         self._incarnations: Dict[str, int] = {}
+        #: The verdicts of every binding; survives reloads (design §4.2).
+        self.verdicts = VerdictStore()
         self._build_instances(config)
         self._running = False
 
@@ -517,6 +576,7 @@ class Runtime:
             module=module,
             clock=self._clock,
             incarnation=incarnation,
+            store=self.verdicts,
         )
 
     def _build_instances(self, config: Config) -> None:
@@ -542,8 +602,11 @@ class Runtime:
         """Atomic switch to a validated configuration (CON-19).
 
         Unchanged instances keep their epoch, sequence and hold-down state;
-        a changed or new instance gets a fresh runtime (new epoch, UNKNOWN
-        until its first collect); a removed instance is stopped.
+        a changed or new instance gets a fresh runtime (new epoch; until its
+        first collect every binding carries its retained verdict or reads
+        UNKNOWN); a removed instance is stopped. The verdict store is kept;
+        a binding that is no longer configured as it was (removed, or a new
+        generation, target or pinned incarnation) loses its verdict (rule 5).
         """
         with self._lock:
             old = self.instances
@@ -562,6 +625,11 @@ class Runtime:
             for iid, prev in old.items():
                 if iid not in new:
                     prev.stop(2.0)
+            # After the old workers stopped, so none of them re-stores a stale key.
+            configured = {InstanceRuntime.static_key(inst.id, b) for inst in config.instances for b in inst.bindings}
+            for k in self.verdicts.keys():
+                if k not in configured:
+                    self.verdicts.drop(k)
             self.instances = new
             self.config = config
         self.log.info("config_reloaded", config_digest=config.digest, instances=len(self.instances))

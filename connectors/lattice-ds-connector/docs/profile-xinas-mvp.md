@@ -9,7 +9,7 @@ assessment; both MDS of a cluster must run the same digest (LAT-24).
 
 | Field | Default | Range | Effect |
 |---|---|---|---|
-| `source_max_age_ms` | 20000 | 1000..20000, ≥ 2 × collect interval | oldest evidence (+ request duration) older than this → `UNKNOWN` / `SOURCE_STALE`; also the TTL base |
+| `source_max_age_ms` | 20000 | 1000..20000, ≥ 2 × collect interval | the oldest evidence (+ request duration) the policy accepts as fresh; older → `UNKNOWN` / `SOURCE_STALE`. The published TTL now comes from the verdict holds |
 | `recovery_hold_down_ms` | 10000 | 0..600000 | continuous allow interval before an allow is published |
 | `recovery_distinct_cycles` | 2 | 1..10 | distinct source snapshots (`server_epoch:source_generation`) that must agree |
 | `critical_hold_ms` | 1200000 | `source_max_age_ms`..3600000 | how long a critical verdict (`allowed: false`) stays in force without a new one; see [Verdict holds](#verdict-holds) |
@@ -34,6 +34,17 @@ verdict (`allowed: false`), `verdict_hold_ms` (default 600 000, 10 min) for
 any other. The MDS keeps a verdict exactly this long without a new one; after
 that the data store is neutral (multiplier 1 000 000 ppm, the operator's
 capacity domain).
+
+The connector publishes `remaining_ttl_ms` = hold − age. A newer `VALID`
+record replaces the verdict at once; no new data never does: while the source
+gives only `UNKNOWN` records or fails to answer (any collection error,
+retryable or not, including `WORKER_STUCK`), the connector keeps
+re-publishing the verdict in force with `VERDICT_RETAINED` first and the
+cause second (the `UNKNOWN` record's first reason or the error code), its
+`observed_at` and age unchanged, so re-publishing never extends the hold.
+When the hold runs out the record turns `UNKNOWN` / `EVIDENCE_EXPIRED`.
+A rebind (a new `binding_generation`, target or pinned incarnation) drops
+the verdict; a configuration reload that keeps the binding does not.
 
 Both fields range from `source_max_age_ms` up to 3 600 000 (one hour, the
 `remaining_ttl_ms` cap of contract 1.1); a value below `source_max_age_ms`
@@ -153,15 +164,17 @@ one filesystem share one domain (LAT-10); `shared_resource_ids` =
 ## Runtime reason codes
 
 `RECOVERY_HOLD_DOWN` (VALID deny during the hold-down), `EVIDENCE_EXPIRED`
-(TTL reached 0), `NO_ASSESSMENT` (start-up), `SOURCE_UNAVAILABLE` /
+(the verdict's hold ran out without a new one; `UNKNOWN`, the MDS places the
+data store neutrally), `NO_ASSESSMENT` (start-up), `SOURCE_UNAVAILABLE` /
 `SOURCE_TIMEOUT` / `COLLECT_IN_FLIGHT` (transport, or a helper that is
-still inside the previous collect+evaluate; the last VALID decisions are
-retained until their own expiry), `SOURCE_REPLAY` (a snapshot whose
+still inside the previous collect+evaluate; the verdict in force is
+retained until its hold runs out), `SOURCE_REPLAY` (a snapshot whose
 `source_generation` is not newer than the last accepted one within the
 same `server_epoch` is ignored: the sequence does not advance and the
 hold-down sees no new cycle), `SOURCE_AUTH_FAILED` / `SOURCE_TLS_FAILED` /
 `SOURCE_SCHEMA_INVALID` / `SOURCE_NOT_READY` / `SOURCE_STALE` /
-`SNAPSHOT_TOO_LARGE` / `MODULE_ERROR` (revoke immediately, alert),
+`SNAPSHOT_TOO_LARGE` / `MODULE_ERROR` (the verdict in force is retained
+as for a transport failure; an alert line),
 `WORKER_STUCK` (restart budget exhausted), `VERDICT_RETAINED` (the source
 gave no new verdict; the last observed one is repeated until its hold runs
 out), `RESTORED_FROM_STATE` (the retained verdict was restored from the state

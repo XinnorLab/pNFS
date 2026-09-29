@@ -167,7 +167,8 @@ def fetch_observations(
             src_code = errors[0].get("code")
             if src_code in ("SOURCE_NOT_READY", "SOURCE_STALE", "SOURCE_FAILED", "SNAPSHOT_TOO_LARGE"):
                 code = src_code
-        # The source says its own data is not valid: revoke, do not retain.
+        # The source says its own data is not valid: not retryable (an alert);
+        # the runtime still keeps the verdicts in force (no new data).
         raise CollectionError(code, f"HTTP 503 {code}", retryable=False, details={"status": status})
     if status != 200:
         raise CollectionError("SOURCE_UNAVAILABLE", f"HTTP {status}", retryable=status >= 500, details={"status": status})

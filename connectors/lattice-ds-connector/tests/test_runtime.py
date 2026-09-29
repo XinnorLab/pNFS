@@ -1,111 +1,25 @@
 # SPDX-License-Identifier: MIT
-"""Runtime semantics: freshness/TTL, retained leases, revocation, epochs,
-sequences, hold-down, worker isolation, batch limits (T-18..T-22, T-29, T-33)."""
+"""Runtime semantics: freshness/TTL, retained verdicts, epochs, sequences,
+hold-down, worker isolation, batch limits (T-18..T-22, T-29, T-33)."""
 
-import copy
+import io
 import json
 import threading
 import time
-from typing import List, Optional
 
 import pytest
 
 import source_builder as sb
 from conftest import make_binding, make_profile, validate
 from lattice_ds_connector import contract
-from lattice_ds_connector.config import Config, Instance, RuntimeConfig
+from lattice_ds_connector.config import Instance, RuntimeConfig
 from lattice_ds_connector.log import Logger
 from lattice_ds_connector.modules.base import CollectionError, Module, SourceBatch
-from lattice_ds_connector.modules.xinas_policy import evaluate_result
-from lattice_ds_connector.runtime import BatchTooLarge, InstanceRuntime, Runtime
+from lattice_ds_connector.runtime import BatchTooLarge, Runtime
+from runtime_helpers import FakeClock, ScriptedModule, make_config, make_instance, make_runtime, records, settle
 
-
-class FakeClock:
-    def __init__(self, start: float = 1000.0):
-        self.t = start
-
-    def __call__(self) -> float:
-        return self.t
-
-    def advance(self, seconds: float) -> None:
-        self.t += seconds
-
-
-class ScriptedModule(Module):
-    """A xinas-shaped module whose collect returns scripted results."""
-
-    name = "xinas"
-
-    def __init__(self, clock: FakeClock, controller: str = sb.CONTROLLER):
-        self.clock = clock
-        self.controller = controller
-        self.results: List = []
-        self.generation = 100
-        self.epoch = "publisher-epoch-1"
-        self.request_ms = 100
-        self.collect_calls = 0
-
-    def describe(self):
-        return {"module": "xinas"}
-
-    def validate(self, instance, profile):
-        return []
-
-    def push(self, result=None, error: Optional[CollectionError] = None, same_generation: bool = False):
-        self.results.append((result, error, same_generation))
-
-    def collect(self, deadline_s: float) -> SourceBatch:
-        self.collect_calls += 1
-        result, error, same = self.results.pop(0) if self.results else (sb.base_result(), None, False)
-        if error is not None:
-            raise error
-        if not same:
-            self.generation += 1
-        result = copy.deepcopy(result)
-        result["source_generation"] = self.generation
-        result["server_epoch"] = self.epoch
-        return SourceBatch(result, self.clock(), self.request_ms, self.epoch, self.generation, result["snapshot_status"])
-
-    def evaluate(self, batch, profile, bindings):
-        return evaluate_result(batch.payload, profile, bindings, self.controller, batch.request_duration_ms)
-
-
-def make_instance(iid: str = "xi-01", module: str = "xinas", bindings=None) -> Instance:
-    return Instance(
-        id=iid,
-        module=module,
-        bindings=tuple(bindings or (
-            make_binding(0, "training-a", "/mnt/data/training-a", "training-a:7"),
-            make_binding(1, "training-b", "/mnt/data/training-b", "training-b:7"),
-            make_binding(2, "training-c", "/mnt/data2/training-c", "training-c:7"),
-        )),
-        profile_id="xinas-mvp",
-        expected_controller_id=sb.CONTROLLER,
-        source=None,
-    )
-
-
-def make_config(instances, runtime: Optional[RuntimeConfig] = None, profile=None) -> Config:
-    p = profile or make_profile()
-    return Config(config_version="1.0", test_mode=True, runtime=runtime or RuntimeConfig(collect_deadline_ms=200, collect_interval_ms=1000), profiles={p.id: p}, instances=tuple(instances), digest="sha256:" + "0" * 64)
-
-
-def make_runtime(clock: FakeClock, modules: dict, instances=None, runtime_cfg=None) -> Runtime:
-    instances = instances or [make_instance()]
-    return Runtime(make_config(instances, runtime_cfg), Logger(stream=open("/dev/null", "w")), clock=clock, module_factory=lambda inst: modules[inst.id])
-
-
-def records(rt: Runtime, iid: str = "xi-01"):
-    inst = next(i for i in rt.batch()["instances"] if i["connector_instance_id"] == iid)
-    return inst, {a["ds_id"]: a for a in inst["assessments"]}
-
-
-def settle(rt: Runtime, clock: FakeClock, iid: str = "xi-01", cycles: int = 2, gap_s: float = 6.0):
-    """Run enough cycles for the hold-down to complete."""
-    ir = rt.instances[iid]
-    for _ in range(cycles):
-        ir.run_cycle()
-        clock.advance(gap_s)
+HOLD_OTHER = contract.DEFAULT_VERDICT_HOLD_MS
+HOLD_CRIT = contract.DEFAULT_CRITICAL_HOLD_MS
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +82,13 @@ def test_t18_ages_grow_and_expire_without_a_new_collect():
     _, recs = records(rt)
     assert recs[0]["evidence_age_ms"] == age0 + 2000 and recs[0]["remaining_ttl_ms"] == ttl0 - 2000
     assert recs[0]["placement"]["allowed"]
+    # The TTL is the verdict's hold minus its age, not source_max_age_ms:
+    # 30 s later (the old 20 s expiry is long past) the allow still holds.
     clock.advance(30.0)
+    _, recs = records(rt)
+    assert recs[0]["placement"]["allowed"] and recs[0]["remaining_ttl_ms"] == ttl0 - 32000
+    assert ttl0 + age0 == HOLD_OTHER
+    clock.advance(HOLD_OTHER / 1000.0)
     inst, recs = records(rt)
     assert recs[0]["remaining_ttl_ms"] == 0
     assert recs[0]["quality"] == "UNKNOWN" and recs[0]["placement"] == {"allowed": False, "multiplier_ppm": 0, "reason_codes": ["EVIDENCE_EXPIRED", "NORMAL"]}
@@ -194,18 +114,21 @@ def test_t18_same_source_snapshot_repeated_is_not_a_new_sample():
     # does not advance and the counter records it.
     assert inst["sequence"] == first_seq
     assert sum(rt.log.counters.snapshot().get("connector_source_replay_total", {}).values()) == 4
-    # A frozen source also ages out on its own evidence (the source's age grows).
+    # A frozen source also ages on its own evidence (the source's age grows):
+    # the hold counts from the observation, so an old sample has less left.
     frozen = sb.base_result()
     for s in frozen["shares"]:
         s["evidence_age_ms"] = 19000
     mod.push(frozen)
     ir.run_cycle()
     _, recs = records(rt)
-    assert recs[0]["quality"] == "VALID" and recs[0]["remaining_ttl_ms"] < 1000
+    assert recs[0]["quality"] == "VALID" and recs[0]["placement"]["allowed"] is True
+    assert recs[0]["evidence_age_ms"] >= 19000
+    assert recs[0]["remaining_ttl_ms"] == HOLD_OTHER - recs[0]["evidence_age_ms"]
 
 
 # ---------------------------------------------------------------------------
-# T-19: transport failures retain, explicit verdicts revoke
+# T-19: no failure revokes; the last verdict holds for its hold time
 # ---------------------------------------------------------------------------
 
 
@@ -216,29 +139,57 @@ def test_t19_transport_timeout_retains_until_original_expiry():
     settle(rt, clock, cycles=3)
     inst_before, recs = records(rt)
     assert recs[0]["placement"]["allowed"]
+    ttl_before = recs[0]["remaining_ttl_ms"]
     mod.push(error=CollectionError("SOURCE_TIMEOUT", "boom", retryable=True))
     clock.advance(1.0)
     rt.instances["xi-01"].run_cycle()
     inst, recs = records(rt)
-    assert inst["sequence"] == inst_before["sequence"]
-    assert recs[0]["placement"]["allowed"] and recs[0]["remaining_ttl_ms"] > 0
+    assert inst["sequence"] == inst_before["sequence"] + 1 and inst["snapshot_status"] == "FAILED"
+    assert recs[0]["placement"]["allowed"] and recs[0]["remaining_ttl_ms"] == ttl_before - 1000
+    assert recs[0]["placement"]["reason_codes"] == ["VERDICT_RETAINED", "SOURCE_TIMEOUT", "NORMAL"]
     assert rt.health()["instances"]["xi-01"]["last_error"] == "SOURCE_TIMEOUT"
     clock.advance(25.0)
     _, recs = records(rt)
-    assert recs[0]["quality"] == "UNKNOWN" and "EVIDENCE_EXPIRED" in recs[0]["placement"]["reason_codes"]
+    assert recs[0]["quality"] == "VALID" and recs[0]["placement"]["allowed"]   # the old 20 s expiry is gone
+    clock.advance(ttl_before / 1000.0)
+    _, recs = records(rt)
+    assert recs[0]["quality"] == "UNKNOWN" and recs[0]["placement"]["reason_codes"][0] == "EVIDENCE_EXPIRED"
+    assert "VERDICT_RETAINED" not in recs[0]["placement"]["reason_codes"]
 
 
 @pytest.mark.parametrize("code", ["SOURCE_AUTH_FAILED", "SOURCE_SCHEMA_INVALID", "SOURCE_NOT_READY", "SOURCE_STALE", "SNAPSHOT_TOO_LARGE"])
-def test_t19_non_retryable_failure_revokes_immediately(code):
+def test_t19_non_retryable_failure_retains_and_alerts(code):
     clock = FakeClock()
     mod = ScriptedModule(clock)
-    rt = make_runtime(clock, {"xi-01": mod})
+    log = io.StringIO()
+    rt = make_runtime(clock, {"xi-01": mod}, logger=Logger(stream=log))
     settle(rt, clock, cycles=3)
     mod.push(error=CollectionError(code, "x", retryable=False))
     rt.instances["xi-01"].run_cycle()
     inst, recs = records(rt)
     assert inst["snapshot_status"] == "FAILED" and inst["sequence"] == 4
-    assert all(r["quality"] == "UNKNOWN" and r["placement"]["reason_codes"] == [code] for r in recs.values())
+    assert all(r["quality"] == "VALID" and r["placement"]["allowed"] for r in recs.values())
+    assert all(r["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", code] for r in recs.values())
+    lines = [json.loads(line) for line in log.getvalue().splitlines()]
+    failed = [x for x in lines if x["event"].startswith("collect_failed")]
+    assert [x["event"] for x in failed] == ["collect_failed_retained"]
+    assert failed[0]["level"] == "error" and failed[0]["alert"] is True and failed[0]["code"] == code
+    assert failed[0]["retained"] == 3
+
+
+def test_t19_retryable_failure_warns_without_an_alert():
+    clock = FakeClock()
+    mod = ScriptedModule(clock)
+    log = io.StringIO()
+    rt = make_runtime(clock, {"xi-01": mod}, logger=Logger(stream=log))
+    mod.push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))
+    rt.instances["xi-01"].run_cycle()                     # nothing observed yet: nothing to retain
+    inst, recs = records(rt)
+    assert inst["snapshot_status"] == "FAILED" and inst["sequence"] == 1
+    assert all(r["quality"] == "UNKNOWN" and r["placement"]["reason_codes"] == ["SOURCE_TIMEOUT"] for r in recs.values())
+    line = next(json.loads(x) for x in log.getvalue().splitlines() if "collect_failed" in x)
+    assert line["event"] == "collect_failed_retained" and line["level"] == "warn"
+    assert line["alert"] is False and line["retained"] == 0
 
 
 def test_t19_explicit_unknown_and_partial_snapshots():
@@ -251,14 +202,19 @@ def test_t19_explicit_unknown_and_partial_snapshots():
     rt.instances["xi-01"].run_cycle()
     inst, recs = records(rt)
     assert inst["snapshot_status"] == "PARTIAL"
-    assert recs[0]["placement"]["allowed"] and recs[1]["placement"]["allowed"]
-    assert recs[2]["quality"] == "UNKNOWN" and "DEPENDENCY_ERROR" in recs[2]["placement"]["reason_codes"]
+    assert recs[0]["placement"]["reason_codes"] == ["NORMAL"] and recs[1]["placement"]["reason_codes"] == ["NORMAL"]
+    # C's UNKNOWN record does not replace its verdict: the allow is retained
+    # and the UNKNOWN record's first reason says why.
+    assert recs[2]["quality"] == "VALID" and recs[2]["placement"]["allowed"]
+    assert recs[2]["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", "DEPENDENCY_ERROR"]
     failed = sb.base_result()
     failed["snapshot_status"] = "FAILED"
     mod.push(failed)
     rt.instances["xi-01"].run_cycle()
     inst, recs = records(rt)
-    assert inst["snapshot_status"] == "FAILED" and all(r["quality"] == "UNKNOWN" for r in recs.values())
+    assert inst["snapshot_status"] == "FAILED"
+    # A VALID record in a FAILED snapshot is always a retained verdict.
+    assert all(r["quality"] == "VALID" and r["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", "SOURCE_FAILED"] for r in recs.values())
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +252,7 @@ def test_t21_expired_lease_requires_a_fresh_hold_down():
     rt = make_runtime(clock, {"xi-01": mod})
     ir = rt.instances["xi-01"]
     settle(rt, clock, cycles=3)
-    clock.advance(30.0)  # the allow lease expires with no collect (source down)
+    clock.advance(HOLD_OTHER / 1000.0)  # the allow's hold runs out with no collect (source down)
     assert records(rt)[1][0]["quality"] == "UNKNOWN"
     ir.run_cycle()
     assert records(rt)[1][0]["placement"]["reason_codes"] == ["RECOVERY_HOLD_DOWN"]

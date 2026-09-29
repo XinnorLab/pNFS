@@ -36,7 +36,11 @@ cannot prove is `UNKNOWN`/`false`/`0` with a reason.
 Freshness is the runtime's arithmetic (CON-10/11): the source's own evidence
 age, plus the whole request duration, plus the local monotonic time since the
 fetch. A GET never refreshes anything; `remaining_ttl_ms` only shrinks until
-the next accepted collection. A restarted daemon starts with every DS
+the next accepted collection. It is the verdict's hold minus its age
+(`critical_hold_ms` for `allowed: false`, `verdict_hold_ms` otherwise; see
+"Verdict holds" in `docs/profile-xinas-mvp.md`): an `UNKNOWN` record or a
+collection error of any kind re-publishes the verdict in force with
+`VERDICT_RETAINED` until its hold runs out, never revokes it. A restarted daemon starts with every DS
 `UNKNOWN` (`NO_ASSESSMENT`).
 
 Re-entry hold-down (CON-16): after start or any deny/UNKNOWN, an allow is

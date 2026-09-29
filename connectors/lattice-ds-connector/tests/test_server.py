@@ -104,7 +104,10 @@ def test_fixture_failure_injection(served):
     ir.run_cycle()
     status, batch = get_json(sock, "/v1/assessments")
     rec = batch["instances"][0]["assessments"][0]
-    assert rec["quality"] == "UNKNOWN" and rec["placement"]["reason_codes"] == ["SOURCE_AUTH_FAILED"]
+    # An auth failure no longer revokes: the verdict of the first cycle (the
+    # hold-down deny) is retained, the error code second.
+    assert rec["quality"] == "VALID" and rec["placement"]["allowed"] is False
+    assert rec["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", "SOURCE_AUTH_FAILED"]
     assert batch["instances"][0]["snapshot_status"] == "FAILED"
 
 

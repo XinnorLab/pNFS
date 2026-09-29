@@ -83,8 +83,9 @@ class Profile:
     recovery_distinct_cycles: int = 2
     #: How long the last observed verdict of a data store is repeated without
     #: a new one, counted from its observation (contract 1.1): the longer
-    #: ``critical_hold_ms`` for a veto or a critical state, ``verdict_hold_ms``
-    #: for the rest. After that the data store is neutral.
+    #: ``critical_hold_ms`` for a critical verdict -- ``allowed: false``, and
+    #: only that -- and ``verdict_hold_ms`` for any other (an allow at any
+    #: multiplier, a degraded one included). After that the data store is neutral.
     critical_hold_ms: int = contract.DEFAULT_CRITICAL_HOLD_MS
     verdict_hold_ms: int = contract.DEFAULT_VERDICT_HOLD_MS
     degraded_multiplier_ppm: int = 250000
