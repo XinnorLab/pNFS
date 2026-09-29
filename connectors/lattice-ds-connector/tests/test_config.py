@@ -7,6 +7,8 @@ import os
 
 import pytest
 
+from conftest import make_profile
+from lattice_ds_connector import contract
 from lattice_ds_connector.config import ConfigError, load_config, validate_config_dict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +53,45 @@ def test_profile_digest_changes_only_with_placement_fields(token_file, tmp_path)
     b, _ = validate_config_dict(doc2)
     assert a.profiles["xinas-mvp"].digest != b.profiles["xinas-mvp"].digest
     assert a.digest != b.digest
+
+
+def test_profile_hold_fields_default_and_digest():
+    p = make_profile()
+    assert p.critical_hold_ms == contract.DEFAULT_CRITICAL_HOLD_MS == 1_200_000
+    assert p.verdict_hold_ms == contract.DEFAULT_VERDICT_HOLD_MS == 600_000
+    assert p.hold_ms(True) == 1_200_000 and p.hold_ms(False) == 600_000
+    assert make_profile(critical_hold_ms=180_000).digest != p.digest  # part of placement_fields
+    assert make_profile(verdict_hold_ms=180_000).digest != p.digest
+
+
+def test_example_profile_carries_the_default_holds(token_file, tmp_path):
+    config, _ = validate_config_dict(example(token_file, tmp_path))
+    prof = config.profiles["xinas-mvp"]
+    assert (prof.critical_hold_ms, prof.verdict_hold_ms) == (1_200_000, 600_000)
+
+
+@pytest.mark.parametrize(
+    "field, value, code",
+    [
+        ("critical_hold_ms", 3_600_001, "RANGE"),
+        ("verdict_hold_ms", 999, "RANGE"),
+        ("critical_hold_ms", 15_000, "HOLD_RELATION"),  # below source_max_age_ms (20 000)
+        ("verdict_hold_ms", 19_999, "HOLD_RELATION"),
+        ("source_max_age_ms", 20_001, "RANGE"),  # the source-age cap did not move
+    ],
+)
+def test_profile_hold_ranges(token_file, tmp_path, field, value, code):
+    doc = example(token_file, tmp_path)
+    doc["profiles"][0][field] = value
+    assert (code, f"profiles[0].{field}") in errors_of(doc)
+
+
+@pytest.mark.parametrize("field", ["critical_hold_ms", "verdict_hold_ms"])
+def test_profile_hold_at_the_bounds_is_valid(token_file, tmp_path, field):
+    for value in (20_000, 3_600_000):  # source_max_age_ms .. one hour
+        doc = example(token_file, tmp_path)
+        doc["profiles"][0][field] = value
+        assert errors_of(doc) == set()
 
 
 @pytest.mark.parametrize(

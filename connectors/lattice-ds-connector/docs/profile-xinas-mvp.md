@@ -12,6 +12,8 @@ assessment; both MDS of a cluster must run the same digest (LAT-24).
 | `source_max_age_ms` | 20000 | 1000..20000, ≥ 2 × collect interval | oldest evidence (+ request duration) older than this → `UNKNOWN` / `SOURCE_STALE`; also the TTL base |
 | `recovery_hold_down_ms` | 10000 | 0..600000 | continuous allow interval before an allow is published |
 | `recovery_distinct_cycles` | 2 | 1..10 | distinct source snapshots (`server_epoch:source_generation`) that must agree |
+| `critical_hold_ms` | 1200000 | `source_max_age_ms`..3600000 | how long a critical verdict (`allowed: false`) stays in force without a new one; see [Verdict holds](#verdict-holds) |
+| `verdict_hold_ms` | 600000 | `source_max_age_ms`..3600000 | the same for any other verdict (`allowed: true`, any multiplier) |
 | `degraded_multiplier_ppm` | 250000 | 0..1000000 | `degraded` array word and `offline` member |
 | `need_restripe_multiplier_ppm` | 250000 | 0..1000000 | `need_restripe` array word |
 | `scan_multiplier_ppm` | 1000000 | 0..1000000 | `sdc_scanning` array word |
@@ -20,6 +22,26 @@ assessment; both MDS of a cluster must run the same digest (LAT-24).
 | `export_source_required` | `etab` | `etab` \| `exports` | `etab` (default) accepts only kernel-effective rules (`details.source: etab`, what xiNAS publishes since 2026-09-23); `exports` also accepts a labelled `/etc/exports` source. Anything else → `UNKNOWN` / `EXPORT_SOURCE_NOT_EFFECTIVE` |
 
 The veto words and the UNKNOWN rules are not configurable.
+
+## Verdict holds
+
+Contract 1.1. A verdict is the placement part of a `VALID` assessment
+(`allowed`, `multiplier_ppm`, reason codes, capacity domain). The hold is how
+long a verdict stays in force without a new one, **counted from its
+observation** (the record's `observed_at`, not from when the connector
+fetched it): `critical_hold_ms` (default 1 200 000, 20 min) for a critical
+verdict (`allowed: false`), `verdict_hold_ms` (default 600 000, 10 min) for
+any other. The MDS keeps a verdict exactly this long without a new one; after
+that the data store is neutral (multiplier 1 000 000 ppm, the operator's
+capacity domain).
+
+Both fields range from `source_max_age_ms` up to 3 600 000 (one hour, the
+`remaining_ttl_ms` cap of contract 1.1); a value below `source_max_age_ms`
+is refused by `validate-config` (`HOLD_RELATION`).
+`source_max_age_ms` keeps its meaning and its own 20 000 cap: the oldest
+evidence the policy accepts as fresh when it computes a verdict. Both hold
+fields are part of the profile digest, so changing either changes the
+digest the MDS pins in `ds_connector_expected_profiles`.
 
 ## Array decision table (XMOD-06..08)
 
@@ -140,7 +162,10 @@ same `server_epoch` is ignored: the sequence does not advance and the
 hold-down sees no new cycle), `SOURCE_AUTH_FAILED` / `SOURCE_TLS_FAILED` /
 `SOURCE_SCHEMA_INVALID` / `SOURCE_NOT_READY` / `SOURCE_STALE` /
 `SNAPSHOT_TOO_LARGE` / `MODULE_ERROR` (revoke immediately, alert),
-`WORKER_STUCK` (restart budget exhausted), `INVALID_MULTIPLIER` /
+`WORKER_STUCK` (restart budget exhausted), `VERDICT_RETAINED` (the source
+gave no new verdict; the last observed one is repeated until its hold runs
+out), `RESTORED_FROM_STATE` (the retained verdict was restored from the state
+file after a connector restart), `INVALID_MULTIPLIER` /
 `INVALID_QUALITY` / `EVIDENCE_INCOMPLETE` / `ZERO_MULTIPLIER` (a module
 result that violated CON-06 was downgraded). The full catalogue with one
 line each is `lattice_ds_connector/contract.py` (`ALL_REASON_CODES`) and

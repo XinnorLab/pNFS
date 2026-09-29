@@ -4,7 +4,7 @@
   "title": "Lattice local connector batch v1",
   "type": "object",
   "properties": {
-    "contract_version": { "const": "1.0" },
+    "contract_version": { "const": "1.1" },
     "runtime_epoch": { "type": "string", "minLength": 1 },
     "config_digest": { "type": "string", "minLength": 1 },
     "generated_at": { "type": "string", "format": "date-time" },
@@ -43,7 +43,7 @@
                 "quality": { "type": "string", "enum": ["VALID", "UNKNOWN"] },
                 "observed_at": { "type": ["string", "null"], "format": "date-time" },
                 "evidence_age_ms": { "type": ["integer", "null"], "minimum": 0 },
-                "remaining_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 20000 },
+                "remaining_ttl_ms": { "type": "integer", "minimum": 0, "maximum": 3600000 },
                 "profile": {
                   "type": "object",
                   "properties": {
