@@ -13,7 +13,8 @@ rule, §13 acceptance rows) and of the requirements package
 The connector steers placement; it no longer decides whether a data store is usable.
 
 - A data store the connector has never reported on is placed like in `fill`: its
-  multiplier is 1 (1 000 000 ppm).
+  multiplier is 1 (1 000 000 ppm) on its domain's base weight (with manual base weights
+  configured, the manual weight of its domain — §5.2).
 - Once the connector has reported a verdict, that verdict stays in force while no new
   verdict arrives: **20 minutes** for a critical verdict (the connector denies new
   allocations), **10 minutes** for any other verdict (normal or degraded). After that the
@@ -42,7 +43,7 @@ single point of failure for new allocations.
 | **hold** | how long a verdict stays in force without a new one: `critical_hold_ms` (default 1 200 000) for a critical verdict, `verdict_hold_ms` (default 600 000) for any other; counted from *observed at* |
 | **verdict in force** | the newest verdict for a binding whose hold has not run out |
 | **no new data** | anything that is not a newer `VALID` record for the same binding: an `UNKNOWN` record (any cause), a collection error of any kind, no batch, a batch the MDS drops, a record the MDS rejects (binding mismatch, shape) |
-| **neutral** | multiplier 1 000 000 ppm and the operator's capacity domain (`ds_capacity_domain.<id>` or `ds:<id>`), i.e. the `fill` weight |
+| **neutral** | multiplier 1 (1 000 000 ppm) on the domain's base weight, in the operator's capacity domain (`ds_capacity_domain.<id>` or `ds:<id>`). The base weight is the manual weight when `placement_allow_manual_base_weights` is on and `placement_domain_weight.<domain>` is set for that domain, the fill level otherwise — without manual weights, the `fill` weight |
 
 ## 3. Rules
 
@@ -206,7 +207,8 @@ reasons[PA_REASONS_MAX][PA_REASON_LEN]; uint32_t reason_count`.
 In `smart`, per data store after the capacity gate:
 
 - no row, row not present, or `now ≥ expires_mono_ms` → **neutral**: `ppm = 1 000 000`,
-  domain = the operator map / `ds:<id>`, counted in `neutral_ds`;
+  domain = the operator map / `ds:<id>`, that domain's base weight (below), counted in
+  `neutral_ds`;
 - present and `!allowed` → excluded, `CONNECTOR_DENIED`; present and `ppm == 0` →
   `ZERO_MULTIPLIER` (as today);
 - present and allowed → weight with its `ppm` and the connector domain (the
@@ -215,6 +217,17 @@ In `smart`, per data store after the capacity gate:
 - `ctx->assess == NULL` (no batch since start) → every data store neutral; the
   `MODE_NOT_READY` refusal is removed from `candidates_weighted` and `placement_admit`.
 - `placement_ds_admitted` / `placement_gate_admit_create` follow the same rule.
+- **The base weight** of a neutral data store and of a live allow is the same function of
+  the effective domain (the connector's domain for a live row, the operator map / `ds:<id>`
+  for a neutral one): the manual weight when `placement_allow_manual_base_weights` is on
+  and `placement_domain_weight.<domain>` is set for that domain, the fill level
+  (1..100) otherwise. So a neutral data store and one with a verdict are weighted on one
+  scale. Under manual weights, declare them for the operator domains a neutral data store
+  uses (`ds_capacity_domain.<id>`, or the `ds:<id>` default) as well as for the
+  connector's domains: a data store whose effective domain has no manual weight falls back
+  to the fill scale, which is not comparable with manual weights (1..10 000) — with
+  manual weights in the thousands it is starved, with manual weights of 1..10 it takes
+  almost every file.
 - The reason enum keeps `NO_BINDING`, `ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE` and
   `MODE_NOT_READY` (metric label stability); `smart` no longer produces them.
 
