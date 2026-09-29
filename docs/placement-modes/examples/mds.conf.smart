@@ -1,5 +1,6 @@
-# Placement mode: fill weights x the per-DS connector assessment.
-# Needs ENABLE_DS_CONNECTOR=ON and a lattice-ds-connector on THIS MDS.
+# Placement mode: fill weights x the per-DS connector verdict.
+# Needs ENABLE_DS_CONNECTOR=ON; a lattice-ds-connector on THIS MDS steers it.
+# A DS without a verdict in force is placed neutrally, as in fill.
 placement_mode = smart
 ds_capacity_poll_ms = 30000
 placement_capacity_max_age_ms = 90000

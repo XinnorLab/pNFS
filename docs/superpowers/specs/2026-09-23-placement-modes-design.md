@@ -14,6 +14,15 @@ WRR kernel `modules/wrr/wrr.c`).
 (XinnorLab/pNFS) keeps the connector, the CLI helper, the contract manifest,
 the exported patch series and the stand scripts.
 
+> **Amended 2026-09-29 for `smart`.** The fail-closed rule of this design
+> (a missing, `UNKNOWN` or expired assessment means "not a candidate" and
+> `MODE_NOT_READY` without a view) is replaced by verdict retention:
+> `2026-09-29-smart-verdict-retention-design.md`. A data store without a
+> verdict in force is placed neutrally (as in `fill`); only a verdict the
+> connector actually observed can lower a weight or deny, and only for its
+> hold time. The sections below carry a pointer where they are affected;
+> where the two disagree, the retention design wins.
+
 ## 1. What the operator gets
 
 One key, `placement_mode = rr | fill | smart`, selects how a **new** backing
@@ -25,7 +34,7 @@ all three modes (MODE-03).
 |---|---|---|---|
 | `rr` | registered DS that are `DS_ONLINE`, not admin-excluded, and pass the native NFS/transport/io-limit filters | none — cyclic order over the candidate list, one position per DS (MODE-07) | not required, not consulted |
 | `fill` | the `rr` set **and** a fresh, valid capacity observation for the DS's capacity domain with `available > placement_min_free_bytes` | `domain_weight / N`, `domain_weight = max(1, floor(100 × available / total))` | not required, not consulted |
-| `smart` | the `fill` set **and** a fresh `VALID` / `allowed` / `multiplier_ppm > 0` connector assessment | `domain_weight / N × multiplier_ppm / 1 000 000` | required; UNKNOWN, stale or missing = not a candidate |
+| `smart` | the `fill` set **minus** a DS whose verdict in force denies (`allowed = false`) or has `multiplier_ppm = 0`; a DS without a verdict in force is neutral (a candidate as in `fill`) | `domain_weight / N × multiplier_ppm / 1 000 000` (neutral: `multiplier_ppm = 1 000 000`, the `fill` weight) | steers; never required to place (superseded 2026-09-29: was "required; UNKNOWN, stale or missing = not a candidate") |
 
 `fill` and `smart` are **weighted random** selection (the roulette kernel),
 not a strict rotation; every operator-facing text says "weighted
@@ -133,9 +142,14 @@ Validation (`config.c`, fatal at startup, every error printed with its key):
   `(host, f_fsid)` without an identical `ds_capacity_domain` entry is
   `SHARED_FS_ALIAS_UNMAPPED` (startup error once the first probe cycle has
   seen both; before that, both are UNKNOWN and excluded). In `smart`, the
-  domain comes from the connector's `capacity_domain_id`; an operator map
-  that disagrees is `DOMAIN_MAP_MISMATCH` for those DS (UNKNOWN, excluded,
-  logged), not a startup failure — the connector may be updated first.
+  domain comes from the connector's `capacity_domain_id` while a verdict
+  is in force; an operator map that disagrees is `DOMAIN_MAP_MISMATCH`
+  for those DS (UNKNOWN, excluded, logged), not a startup failure — the
+  connector may be updated first. Amended 2026-09-29: without a verdict
+  in force (neutral) the operator's map is the only declaration, so an
+  alias pair declared only by the connector's domain is undeclared then
+  and is `SHARED_FS_ALIAS_UNMAPPED`; declare `ds_capacity_domain.<id>`
+  with the connector's domain id to keep such a pair placeable.
 - **Legacy.** Without `placement_mode` the parser, the dispatcher and the
   log lines are byte-for-byte the upstream behaviour; the regression suite
   runs in that configuration (acceptance §7.1).
@@ -176,6 +190,14 @@ enum mds_status placement_admit(const struct placement_ctx *ctx,
 - **Order of checks** for every DS: native (caller) → capacity (fill,
   smart) → assessment (smart). The first failing check is the DS's reason;
   counts per reason go to `pnfs_mds_placement_rejections_total{reason}`.
+  Superseded for `smart` by `2026-09-29-smart-verdict-retention-design.md`
+  (2026-09-29): no verdict in force means neutral, not refusal. The
+  assessment step of `smart` is now a *verdict* step: a DS without a
+  verdict in force passes it neutrally (multiplier 1 000 000, the
+  operator's domain); only a live deny (`CONNECTOR_DENIED`) or a live
+  `multiplier_ppm = 0` (`ZERO_MULTIPLIER`) fails it. `NO_BINDING`, `ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE` and
+  `MODE_NOT_READY` stay in the reason enum (metric label stability) but
+  `smart` no longer produces them.
 - **rr:** candidates in registry order, cyclic start from the existing
   atomic counter (`rr_key` = counter or fileid for the prealloc rotation),
   `mirror_count` consecutive distinct candidates per stripe — the upstream
@@ -247,7 +269,7 @@ object vanished). Rules per mode:
 |---|---|---|
 | legacy, `rr` | admitted when the DS is `DS_ONLINE` and not admin-excluded (today's behaviour, now explicit) | same |
 | `fill` | admitted when the DS's domain passes the capacity gate | same — a full or unknown domain does not get a new object even for an old file |
-| `smart` | admitted when the DS passes the capacity and assessment gates | same — a denied/UNKNOWN DS does not get a new object; the caller sees `MDS_ERR_NOSPC` with reason `CONNECTOR_DENIED` / `ASSESSMENT_UNKNOWN`, which the LAYOUTGET refresh turns into the existing `NFS4ERR_DELAY` (entry not ready) and the proxy READ/WRITE path into `NFS4ERR_DELAY` as well, never into a create elsewhere |
+| `smart` | admitted when the DS passes the capacity gate and no verdict in force denies it (a DS without a verdict is neutral and admitted; superseded 2026-09-29, was "passes the capacity and assessment gates") | same — a DS whose verdict in force denies does not get a new object; the caller sees `MDS_ERR_NOSPC` with reason `CONNECTOR_DENIED` / `ZERO_MULTIPLIER`, which the LAYOUTGET refresh turns into the existing `NFS4ERR_DELAY` (entry not ready) and the proxy READ/WRITE path into `NFS4ERR_DELAY` as well, never into a create elsewhere |
 
 The token is a small struct `{ds_id, purpose, snapshot_generation,
 mono_ms}` valid for one call and one DS; the create helper checks that
@@ -302,7 +324,9 @@ struct ds_capacity_obs {
   rate-limited WARN and a `verify`/`validate` finding, never silent and
   never an automatic merge. `smart` takes the domain from the connector
   (which knows the filesystem UUID) and treats an operator map that
-  disagrees as `DOMAIN_MAP_MISMATCH` (§4).
+  disagrees as `DOMAIN_MAP_MISMATCH` (§4). It takes it only from a
+  verdict in force (2026-09-29): while a DS is neutral the operator's
+  declaration applies, grades (a) and (b) included.
 - `rr` never consults the record. The existing `proportional` auto-weight
   path is untouched for legacy configurations.
 
@@ -318,15 +342,17 @@ our build; the module is a no-op when the mode is not `smart`):
   finding 2):
   1. **Envelope.** `contract_version` major ==
      `ds_connector_expected_contract_major`; `runtime_epoch` — a change
-     resets every instance's sequence line and every DS to UNKNOWN; per
+     resets every instance's sequence line and every binding pin (the
+     verdicts are kept, 2026-09-29); per
      `connector_instance_id`, `epoch` + `sequence` must advance (a
      replayed or lower sequence within the same epoch drops the whole
      batch, `pnfs_mds_connector_batches_dropped_total{reason=replay}`);
      `generated_at` not older than the last accepted batch;
      `config_digest` == `ds_connector_expected_config_digest` when that key
      is set (LAT-22; `verify` compares the digests the MDS report even
-     when it is not set, LAT-24). An envelope failure excludes every DS
-     of that batch.
+     when it is not set, LAT-24). An envelope failure drops the whole
+     batch: no new data for any DS (the verdicts in force are kept and run
+     out on their own end, 2026-09-29).
   2. **Binding, per assessment** (all fields are required by the batch
      contract, `contracts/connector-batch.schema.json`): `ds_id`
      registered and ≤ `ds_connector_max_ds`; `scope == "ds"` and
@@ -353,36 +379,45 @@ our build; the module is a no-op when the mode is not `smart`):
      the first accepted record (the profile is not part of the pin: a
      connector profile reload is not a rebind). A later record must repeat the tuple
      exactly, **or** carry a strictly higher `binding_generation` — that
-     re-pins the tuple and resets that DS to UNKNOWN until its fresh
-     record is accepted (the operator rebound the DS). A lower generation,
+     re-pins the tuple and clears that DS's verdict: it is neutral until its
+     next `VALID` record is accepted (the operator rebound the DS). A lower generation,
      or the same generation with any other field changed (a DS id
      re-assigned to another share, a share recreated without a rebind),
-     is `BINDING_MISMATCH`: the record is rejected, the DS is UNKNOWN,
-     the mismatch is counted and logged with both tuples. A record that
-     fails any check excludes only that DS.
+     is `BINDING_MISMATCH`: the record is rejected (no new data: the DS keeps
+     the verdict in force, if any), the mismatch is counted and logged with
+     both tuples. A record that fails any check is rejected for that DS only.
 
-     **Unobserved incarnation (stand finding 2026-09-24).** The batch
-     schema allows `target_incarnation: null` on a `quality = UNKNOWN`
-     record and forbids it on a `VALID` one: when the connector cannot
-     read its source at all (`SOURCE_UNAVAILABLE`, `SOURCE_FAILED`) it
-     knows the binding it was configured with but not the share's
-     incarnation. Such a record is compared on the rest of the tuple
-     (instance, generation, datastore_id, target_id, access scope) and
-     the incarnation is *not* compared; the record is accepted as UNKNOWN
-     with the connector's reason codes (`ASSESSMENT_UNKNOWN` in the
-     gate), the pin is left as it was, and no pin is created from it — the
-     first VALID record pins. A higher generation on an unobserved record
-     clears the pin (rebind) without pinning. A VALID record with a null
-     incarnation is a shape error. Before this rule the MDS read the null
-     as a changed incarnation and reported `BINDING_MISMATCH` — the same
-     refusal, but it sent the operator to rebind a DS whose only problem
-     was a stopped source.
+     **Unobserved incarnation (stand finding 2026-09-24; amended
+     2026-09-29).** The batch schema allows `target_incarnation: null` on a
+     `quality = UNKNOWN` record, and on a `VALID` *deny*; it forbids it on
+     a `VALID` *allow*. When the connector cannot read its source at all
+     (`SOURCE_UNAVAILABLE`, `SOURCE_FAILED`) it knows the binding it was
+     configured with but not the share's incarnation; the same holds for
+     the deny it derives without observing the share (`SHARE_ABSENT`,
+     `IDENTITY_MISMATCH`, which carry no evidence time either). Such a
+     record is compared on the rest of the tuple (instance, generation,
+     datastore_id, target_id, access scope) and the incarnation is *not*
+     compared; the pin is left as it was, and no pin is created from it —
+     the first record with an incarnation pins. An `UNKNOWN` record is
+     accepted as no new data (it never replaces a verdict); a `VALID` deny
+     is a verdict like any other. A higher generation on an unobserved
+     record clears the pin (rebind) without pinning. A `VALID` **allow**
+     with a null incarnation is a shape error. Before the 2026-09-24 rule
+     the MDS read the null as a changed incarnation and reported
+     `BINDING_MISMATCH` — the same refusal, but it sent the operator to
+     rebind a DS whose only problem was a stopped source.
 - **Cache:** an immutable array indexed by `ds_id`, published by pointer
   swap; each entry carries `allowed`, `ppm`, `quality`, `domain`,
   `reason[0..3]`, `expires_mono_ms = receive_mono + remaining_ttl_ms`. The
-  MDS clock decides expiry (LAT-04). At startup every DS is UNKNOWN until
-  the first valid batch (MODE-10). No DS state, weight or recall is ever
-  changed by the connector (LAT-03).
+  MDS clock decides expiry (LAT-04). No DS state, weight or recall is ever
+  changed by the connector (LAT-03). Superseded for `smart` by
+  `2026-09-29-smart-verdict-retention-design.md` (2026-09-29): no verdict in
+  force means neutral, not refusal. The cache is a
+  *verdict store*: per DS the MDS keeps the last `VALID` verdict; only a
+  newer `VALID` record replaces it, and an `UNKNOWN` record, a rejected
+  record or a dropped batch never does; it ends at its own
+  `expires_mono_ms`. At startup no DS has a verdict: every DS is neutral
+  until a batch brings one, and `MODE_NOT_READY` is no longer produced.
 - **Readiness is four facts, not one flag (review finding 4).**
   `mode_active` (the effective mode is `smart`), `connector_config_valid`
   (build flags, socket path, thresholds — fixed at startup),
@@ -394,12 +429,39 @@ our build; the module is a no-op when the mode is not `smart`):
   `rr`/`fill`. `coverage = none` with `mode_active` is the operational
   alarm ("smart is placing nothing"); `partial` is a degraded-but-correct
   state and is reported as such by `show` and `verify` (§10).
+  Superseded for `smart` by `2026-09-29-smart-verdict-retention-design.md`
+  (2026-09-29): no verdict in force means neutral, not refusal.
+  `coverage` now counts the DS with a verdict in force (fresh or
+  retained); a DS without one is placed neutrally, so `coverage = none`
+  means "smart is not steering" (every DS neutral), not "smart is placing
+  nothing". The row adds `retained_ds`
+  (DS held by a retained verdict) and `neutral_ds` (registered − covered);
+  `eligible_ds` is the neutral DS plus the live allows with
+  `multiplier_ppm > 0`. A lost connector has to be alerted on
+  (`pnfs_mds_connector_reachable == 0`, a rising
+  `pnfs_mds_placement_neutral_ds`); it no longer stops placement.
 - **Candidate rule:** `quality == VALID ∧ allowed ∧ ppm > 0 ∧ not expired`.
   Reasons: `ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE`, `CONNECTOR_DENIED`,
   `ZERO_MULTIPLIER`, `NO_BINDING`.
+  Superseded for `smart` by `2026-09-29-smart-verdict-retention-design.md`
+  (2026-09-29): no verdict in force means neutral, not refusal. After the
+  capacity gate a DS is (1) *neutral* without a verdict in force — no row,
+  a row that ran out, or no view at all: multiplier 1 000 000, the
+  operator's domain; (2) excluded while a live verdict denies
+  (`CONNECTOR_DENIED`) or carries `multiplier_ppm = 0`
+  (`ZERO_MULTIPLIER`); (3) weighted by its `multiplier_ppm` while a live
+  verdict allows. An operator alias map that disagrees with the
+  connector's domain is still `DOMAIN_MAP_MISMATCH`, for live verdicts
+  only. `NO_BINDING`, `ASSESSMENT_UNKNOWN`, `ASSESSMENT_STALE` and
+  `MODE_NOT_READY` are no longer produced by `smart`.
 - **Domain identity** in `smart` is the connector's; a missing or
   contradictory domain (two records, one domain, different controllers)
-  is UNKNOWN for those DS (MODE-07).
+  is UNKNOWN for those DS (MODE-07). Amended 2026-09-29: the connector's
+  domain is taken only from a verdict in force; without one the operator's
+  map applies (`ds_capacity_domain.<id>` or `ds:<id>`), and an operator
+  entry that contradicts the domain of a live verdict is
+  `DOMAIN_MAP_MISMATCH` and excludes the DS (a configuration error, not a
+  connector failure).
 
 ## 8. WRR kernel changes (`modules/wrr/wrr.c`, mirrored into the fork)
 
@@ -442,6 +504,17 @@ instead of reading journals. One latency histogram,
 LAT-25 row compares like with like — and once per
 `placement_gate_admit_create`.
 
+**Verdict retention additions (2026-09-29).** In `smart`,
+`placement_readiness` appends `retained_ds=… neutral_ds=…` and every
+`placement_ds.<id>` row appends `verdict=fresh|retained|none
+hold_left_ms=<n>|none` (`hold_left_ms` = time until the verdict runs
+out; a neutral DS reads `quality=NONE allowed=- ppm=1000000 ttl_ms=0
+verdict=none hold_left_ms=none`). New series: gauges
+`pnfs_mds_placement_neutral_ds` and `pnfs_mds_placement_retained_ds` (at
+the last placement decision), counter
+`pnfs_mds_connector_verdicts_expired_total` (a verdict ran out without a
+new one). Details: `2026-09-29-smart-verdict-retention-design.md` §5.3.
+
 ## 10. CLI helper `lattice-placement` (this repo, `tools/lattice-placement/`)
 
 Python 3.9 stdlib, same style as the connector CLI. Commands:
@@ -458,7 +531,10 @@ Python 3.9 stdlib, same style as the connector CLI. Commands:
   consistency; for `smart` additionally `lattice-ds-connector preflight`
   over the socket (bindings cover every registered DS, no
   UNKNOWN/stale, contract and profile digests). Prints `READY` or
-  `NOT_READY` with reasons; exit code accordingly (CLI-02).
+  `NOT_READY` with reasons; exit code accordingly (CLI-02). Amended
+  2026-09-29: a connector that is not ready is a warning here, not an
+  error — `smart` places without it (neutral); the file's own errors
+  still make it `NOT_READY`.
 - `mode set <mode> [--apply]` — dry-run diff by default. `--apply` rewrites
   only the local config file: line-preserving parser (comments and unknown
   keys kept), legacy placement keys removed, managed keys written, backup
@@ -475,6 +551,16 @@ Python 3.9 stdlib, same style as the connector CLI. Commands:
   warning with the affected DS and their reasons and exits 0 — one
   UNKNOWN DS is a degraded DS, not a failed switch; `--require-full-coverage`
   turns it into exit 1 for operators who want that gate (CLI-04 step 5).
+  Superseded for `smart` by `2026-09-29-smart-verdict-retention-design.md`
+  (2026-09-29): no verdict in force means neutral, not refusal.
+  `connector_reachable = false` (`CONNECTOR_UNREACHABLE`) and
+  `coverage = none` (`STEERING_OFF`) are warnings: the cluster places,
+  it does not steer. `connector_config_valid = false`, differing modes,
+  generations, builds, digests or profile maps and a desired mode that is
+  not effective stay errors. `--require-full-coverage` turns partial and
+  no coverage into exit 1, and also a DS held only by a retained verdict
+  (`COVERAGE_RETAINED`); it is the gate to use where steering must be
+  proven.
 
 The supported switch procedure (validate → drain new creates → identical
 config on every MDS → controlled restart → verify → resume) is documented
@@ -510,9 +596,11 @@ in `docs/placement-modes/operations.md`; no online switch (CLI-05).
   = <w>` from `--ds-weight id=w`. The audit line is JSON: `ts, user,
   sudo_user, host, file, old_mode, new_mode, old_sha256, new_sha256,
   backup`. If the rewritten file fails validation the backup is restored
-  and the exit code is 1. Leaving `smart` prints the health-veto warning;
-  entering it prints that no DS is admitted before the first fresh VALID
-  assessment.
+  and the exit code is 1. Leaving `smart` prints the health-veto warning (a DS
+  the connector denies receives new objects again); entering it prints
+  that a DS without a connector verdict is placed neutrally, as in
+  `fill` (amended 2026-09-29; it used to say that no DS is admitted
+  before the first fresh VALID assessment).
 - *`verify` comparison set.* Effective mode, `placement_config_generation`
   and `placement_build` must be identical across MDS; a known desired
   mode that differs from the effective one is an error (the daemon was
@@ -522,7 +610,10 @@ in `docs/placement-modes/operations.md`; no online switch (CLI-05).
   (`placement_connector_profiles`) must be identical across MDS
   (`CONNECTOR_PROFILES_MISMATCH`). `coverage=partial` is a warning (exit 0) that
   lists the non-eligible DS with their reasons; `--require-full-coverage`
-  makes it exit 1.
+  makes it exit 1. Amended 2026-09-29: only `connector_config_valid=1`, the
+  digest and the profile-map rules stay errors; `connector_reachable=0`
+  and `coverage` `none` or `partial` are warnings, and
+  `--require-full-coverage` errors on partial, none or retained coverage.
 
 ## 11. Connector preflight (this repo)
 
@@ -557,15 +648,25 @@ passing the pins automatically in `mode validate`.
 | Level | What | Requirement |
 |---|---|---|
 | unit (cmocka, fork) | config parsing: absent key = legacy; each mode; every conflict and range error; profile conflict; alias map | §7.1 |
-| unit | `placement_candidates` / `placement_admit` on synthetic views: rr cyclic order; fill excludes full/stale/unknown; smart excludes deny/UNKNOWN/expired/ppm 0; single DS, 64/65/256 DS, multi-stripe, shrink vs strict, mirrors distinct, no zero weight reaches the kernel | §7.3, §7.4 |
+| unit | `placement_candidates` / `placement_admit` on synthetic views: rr cyclic order; fill excludes full/stale/unknown; smart excludes a live deny / ppm 0 (superseded 2026-09-29: UNKNOWN/expired/missing is neutral, not excluded); single DS, 64/65/256 DS, multi-stripe, shrink vs strict, mirrors distinct, no zero weight reaches the kernel | §7.3, §7.4 |
 | unit | fairness with a seeded PRNG: equal fill → ≈ even; 80 %/20 % free → ≈ 4:1 over 100 000 draws within ±2 %; degraded 250 000 ppm vs healthy at equal capacity → ≈ 1:4; alias share: two DS on one domain vs one DS on another → domain totals equal | §7.2, §7.5 |
-| unit | connector client: schema, epoch/sequence replay, TTL expiry on the MDS clock, envelope failure excludes the batch, no fallback when the socket is gone; binding: endpoint mismatch, re-assigned ds_id with the same generation, lower generation, higher generation re-pins and resets to UNKNOWN, profile pins by id (one id with two digests drops the batch, more than 8 ids drops the batch), config digest pin | §7.3, LAT-06 |
+| unit | connector client: schema, epoch/sequence replay, TTL expiry on the MDS clock (a verdict running out = neutral), envelope failure drops the batch, no fallback to `rr`/`fill` when the socket is gone; binding: endpoint mismatch, re-assigned ds_id with the same generation, lower generation, higher generation re-pins and clears the verdict (neutral until the next VALID record), profile pins by id (one id with two digests drops the batch, more than 8 ids drops the batch), config digest pin | §7.3, LAT-06 |
 | unit | create boundary: with a denied (smart) or full/stale (fill) DS, each former ensure caller — ds_prepare job, LAYOUTGET refresh, promotion write, proxy READ/WRITE ensure, prealloc pop/batch/ensure — creates no file and returns the mapped status; lookup of an existing object still succeeds; a token for DS A is refused for DS B and after its max age | LAT-15/16, review finding 1 |
 | unit | weight bounds with the manual override at 10000 and N = 1 and 256: sum < 2⁶², min > 0; a value of 10001 is a config error | LAT-11, review finding 3 |
-| unit | readiness/verify: partial coverage = warning + exit 0, none = exit 1, `--require-full-coverage` | review finding 4 |
+| unit | readiness/verify: partial coverage = warning + exit 0, none = exit 1, `--require-full-coverage` (superseded 2026-09-29: none and an unreachable connector are warnings too; `--require-full-coverage` also fails retained coverage) | review finding 4 |
 | integration (fork tests) | the four call sites go through the gate: a denied DS never receives a backing object via CREATE, LAYOUTGET, promotion, prealloc pop | §7.3 |
 | stand (node223/node225, box + node 71) | `rr`: 40 files ≈ 20:20 in registry order; `fill` after filling one DS: skew follows free fraction; `smart` with the connector denying one DS: 0 files there, hold-down and recovery visible; existing files untouched; `show`/`verify` output | §7.2–7.6 |
 | perf (stand) | ≥ 3 runs of the create benchmark, `smart` vs legacy: ≤ 5 % create throughput loss, ≤ 10 % p99 placement latency growth | LAT-25 |
+
+Superseded for `smart` by `2026-09-29-smart-verdict-retention-design.md`
+(2026-09-29): no verdict in force means neutral, not refusal. The
+acceptance rows that assumed refusal — "`smart` with the agent and the
+connector stopped: ENOSPC" (stand 2026-09-24), `coverage = none` = exit 1,
+an MDS without a connector refusing every placement — are replaced by the
+rows of that design's §9 (neutral placement without a verdict, a deny held
+for its hold time and restored after a restart, no ENOSPC when the
+connector is stopped). The dated stand reports under
+`docs/placement-modes/` are records of what was run and stay as written.
 
 **Status (2026-09-24):** the gate tests pass on the built MDS and every stand row above has been run — `rr`/`fill` (`stand-2026-09-23.md`), `smart` with the agent and the connector stopped (`stand-2026-09-24.md`), the two-MDS switch through the helper with `show`/`verify` and the LAT-25 row (`stand-2026-09-24-stage-c.md`: no throughput loss, +1.7 µs per gate call, p99 inside the first bucket). `smart` is no longer documented as `NOT_READY`; what stays open is in `docs/TODO.md`.
 
@@ -603,3 +704,9 @@ health; peer-observation freshness for metadata-only MDS.
    announced before they run.
 8. Profiles are pinned per id (`ds_connector_expected_profiles`), not one
    digest per batch — see `2026-09-25-per-profile-digest-design.md`.
+9. `smart` no longer fails closed: a data store without a verdict in force
+   is neutral (placed as in `fill`), and a verdict the connector observed
+   is held for its hold time (20 min critical, 10 min otherwise) —
+   `2026-09-29-smart-verdict-retention-design.md`, approved 2026-09-29.
+   This replaces the fail-closed rule of §1, §5, §5a, §7 and §13 for
+   `smart`.

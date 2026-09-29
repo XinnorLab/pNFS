@@ -132,11 +132,11 @@ def plan_set(text: str, mode: str, extra: Dict[str, str], manifest: Manifest,
     plan = Plan(mode=mode, old_mode=old_mode, before=text, after=after, diff=diff,
                 removed_keys=removed, managed=managed, notes=notes)
     if old_mode == "smart" and mode != "smart":
-        plan.warnings.append("leaving smart disables the health veto: a denied or UNKNOWN DS will "
+        plan.warnings.append("leaving smart disables the health veto: a DS the connector denies will "
                              "receive new objects again")
     if mode == "smart" and old_mode != "smart":
-        plan.notes.append("smart admits no DS until the first fresh VALID assessment; run `mode verify` "
-                          "after the restart")
+        plan.notes.append("smart places a DS without a connector verdict neutrally, as fill does; run "
+                          "`mode verify` after the restart (add --require-full-coverage to prove steering)")
     if mode != MODE_LEGACY:
         rep = validate_document(IniDocument.parse(after), mode, manifest, assume_set=False)
         plan.warnings += rep.warnings

@@ -129,7 +129,7 @@ RUNTIME_REASONS = {
     "SOURCE_FAILED": "the source snapshot is FAILED; UNKNOWN",
     "CAPABILITY_MISSING": "a required check is not in the source's capabilities; UNKNOWN",
     "EVIDENCE_EXPIRED": "the verdict's hold ran out (remaining TTL 0) without a new one; UNKNOWN",
-    "RECOVERY_HOLD_DOWN": "allow is withheld until the hold-down completes; VALID deny",
+    "RECOVERY_HOLD_DOWN": "applies when leaving a deny: the allow is withheld until the hold-down completes; VALID deny",
     "NO_ASSESSMENT": "no assessment has been produced yet; UNKNOWN",
     "BINDING_INVALID": "the binding failed validation; UNKNOWN",
     "INVALID_MULTIPLIER": "a module returned a multiplier outside [0, 1000000] or not an integer; UNKNOWN",
