@@ -106,7 +106,10 @@ write the **local** file); run `show`/`verify` from any host that has
    weights. Where steering must be proven, gate on
    `--require-full-coverage`: it makes partial and no coverage exit 1,
    and also a DS held only by a retained verdict (`COVERAGE_RETAINED`,
-   the connector is not observing it).
+   the connector is not observing it). The flag gates coverage and
+   retention only: `CONNECTOR_UNREACHABLE` stays a warning under it, so a
+   connector that has just died still reads as full coverage until its
+   verdicts run out (see "Alerts for `smart`").
 
 6. **Resume creates.**
 
@@ -231,11 +234,18 @@ together; this is the order.
    `ds_connector_expected_config_digest` would need re-pinning on every MDS;
    without the key the default path
    (`/var/lib/lattice-ds-connector/verdicts.json`) applies.
-5. **Re-gate scripts on steering.** `mode verify` exits 0 for a smart
-   cluster that is not steering (`STEERING_OFF`, `CONNECTOR_UNREACHABLE`
-   are warnings). A deploy or health script that used its exit code to
-   catch a dead connector must pass `--require-full-coverage` where
-   steering has to be proven.
+5. **Re-gate scripts on steering, and do not read a dead connector off
+   `verify`.** `mode verify` exits 0 for a smart cluster that is not
+   steering (`STEERING_OFF`, `CONNECTOR_UNREACHABLE` are warnings). A
+   deploy or health script that used its exit code to catch a dead
+   connector no longer does. `--require-full-coverage` gates coverage and
+   retention only, and `CONNECTOR_UNREACHABLE` stays a warning under it:
+   a connector that has just died, with its verdicts still `fresh` inside
+   their hold, gives `coverage=full` and `retained_ds=0`, so `verify` exits
+   0 even with the flag. It fails only once the 10 or 20 minute hold runs
+   out (or when the verdicts were already retained). The reliable
+   dead-connector signal is `pnfs_mds_connector_reachable`: alert on it
+   (see "Alerts for `smart`").
 
 ## `smart` prerequisites
 

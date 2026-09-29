@@ -91,16 +91,20 @@ entry when it lands.
   running MDS.  Done = both replaced by `mds-admin config show --json`
   captures from the retention build on the lab and the README note about
   them removed.
-- **Synced `pm-run.sh` results before the upload fix may have tested a
-  stale tree.**  The box → node225 copy of the sync tarball swallowed a
-  failed `scp` (`|| true`), so node225 could extract an archive left by an
-  earlier run while `PM_TREE` still printed `(synced)`.  Fixed in
-  `60b93f4` (a failed copy prints `PM_RESULT SYNC_FAILED` and exits 3; the
-  archive is deleted after extraction).  What node225 reported for synced
-  runs between `9a37177` (which added the `PM_TREE` line) and `b7ac016`,
-  and in principle for any synced run before `60b93f4` (the swallowed
-  failure dates from `5519e04`), may not describe the tree the run
-  claimed.  Done = the results the
-  design or a stand record relies on are re-run synced on the fixed
-  script, or confirmed by a `--no-sync` run of the same commit or the fork
-  CI.
+- **Synced `pm-run.sh` results before the 2026-09-29 fixes may have
+  tested a stale tree.**  Two defects, one long-standing and one that
+  made it worse.  (1) `9a37177` (which added the `PM_TREE` line) moved the
+  local → box upload loop into the `--no-sync` `else` branch, so a synced
+  run never uploaded the working tree at all: node225 extracted whatever
+  tarball an earlier run had left on the box, while `PM_TREE` still
+  printed `(synced)`.  `b7ac016` put the loop back.  This is the primary
+  cause for runs between `9a37177` and `b7ac016`.  (2) The box → node225
+  copy of the tarball swallowed a failed `scp` (`|| true`, from `5519e04`),
+  so a failed copy left node225 extracting an older archive as well.
+  Fixed in `60b93f4` (a failed copy prints `PM_RESULT SYNC_FAILED` and
+  exits 3; the archive is deleted after extraction).  What node225
+  reported for synced runs between `9a37177` and `b7ac016` (defect 1), and
+  in principle for any synced run before `60b93f4` (defect 2), may not
+  describe the tree the run claimed.  Done = the results the design or a
+  stand record relies on are re-run synced on the fixed script, or
+  confirmed by a `--no-sync` run of the same commit or the fork CI.
