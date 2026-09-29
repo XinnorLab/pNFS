@@ -128,6 +128,12 @@ For each binding, in this order:
 `render()` recomputes ages and TTLs at read time, as now; a retained verdict whose TTL
 reaches 0 is replaced by the `UNKNOWN` record (reason `EVIDENCE_EXPIRED` first).
 
+A collection error of any kind publishes a new snapshot (sequence + 1) built only from the
+store: each binding carries its retained verdict (cause = the error code) or the `UNKNOWN`
+record; `snapshot_status` stays `FAILED` because the source snapshot did fail. A `VALID`
+record inside a `FAILED` snapshot is therefore always a retained verdict and always carries
+`VERDICT_RETAINED`.
+
 ### 4.4 The state file
 
 - Path: `runtime.state_path`, default `/var/lib/lattice-ds-connector/verdicts.json`; `null`
@@ -175,7 +181,10 @@ received_mono_ms, expires_mono_ms; bool retained; char domain[PM_DOMAIN_ID_MAX];
 reasons[PA_REASONS_MAX][PA_REASON_LEN]; uint32_t reason_count`.
 
 - An accepted `VALID` record replaces the entry: `expires = receive + remaining_ttl_ms`,
-  `retained` = its `reason_codes` contain `VERDICT_RETAINED`.
+  `retained` = its `reason_codes` contain `VERDICT_RETAINED`. In an instance snapshot whose
+  `snapshot_status` is `FAILED` only a `VALID` record carrying `VERDICT_RETAINED` counts;
+  any other `VALID` record there is treated as `UNKNOWN` (today's rule, `valid && !failed`,
+  narrowed to fresh records).
 - An accepted `UNKNOWN` record, a rejected record (binding mismatch, shape) and a dropped
   batch do not touch the entry (rule 3).
 - A rebind (strictly higher `binding_generation`) clears the entry (rule 5); the
