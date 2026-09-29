@@ -49,7 +49,12 @@ set -e
 cd $REMOTE
 if [ "\$(git rev-parse HEAD)" != "$BASE" ]; then git fetch -q origin && git checkout -q -f $BASE; fi
 git checkout -q -- . && git clean -qfd -e build
-if [ "$SYNC" = 1 ]; then tar xzf $RTAR -C $REMOTE; fi
+if [ "$SYNC" = 1 ]; then
+    # Extract, then delete: a later run whose copy failed can never reuse a
+    # stale archive left behind by this one.
+    rc=0; tar xzf $RTAR -C $REMOTE || rc=\$?; rm -f $RTAR
+    [ \$rc = 0 ] || { echo "PM_RESULT SYNC_FAILED"; exit 3; }
+fi
 # (re)configure every time: cheap, and new options reach an existing build dir
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_RONDB=ON -DRonDB_ROOT=/opt/rondb \
     -DENABLE_EBPF=OFF -DENABLE_TESTS=ON -DENABLE_WRR=ON -DENABLE_DS_PREALLOC=OFF \
@@ -72,10 +77,13 @@ for i in 1 2 3; do
 done
 [ "$ok" = 1 ] || { echo "PM_RESULT SYNC_FAILED"; exit 1; }
 # The relay tunnel drops pre-auth now and then (rc 255): retry the hop.
+# With sync on, the box->node225 copy of the tarball must succeed: a failure
+# prints SYNC_FAILED and exits 3 (not 255, so the retry loop never masks it).
 for i in 1 2 3 4; do
     ssh -o ConnectTimeout=25 -o BatchMode=yes xinas-box \
         "scp -q -o BatchMode=yes $RSCRIPT root@192.168.65.225:$RSCRIPT && \
-         ( [ $SYNC = 1 ] && scp -q -o BatchMode=yes $RTAR root@192.168.65.225:$RTAR || true ) && \
+         { [ $SYNC = 0 ] || scp -q -o BatchMode=yes $RTAR root@192.168.65.225:$RTAR || \
+           { echo 'PM_RESULT SYNC_FAILED'; exit 3; }; } && \
          ssh -o BatchMode=yes root@192.168.65.225 'bash $RSCRIPT'"
     rc=$?
     [ $rc -ne 255 ] && exit $rc
