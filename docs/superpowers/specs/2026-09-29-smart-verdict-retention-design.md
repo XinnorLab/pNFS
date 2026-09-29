@@ -109,7 +109,9 @@ critical verdict under hold-down — `critical_observed_at` (the last critical o
   longer revoke anything.
 - An entry expires when `now_utc − observed_at ≥ hold(entry)`; expired entries are dropped.
 - A binding removed from the configuration, or whose generation/target/incarnation changed,
-  loses its entry (rule 5).
+  loses its entry (rule 5). So does a binding whose instance a reload moves to another
+  profile id: a verdict stored under another profile id is dropped, as the state file
+  refuses it (`PROFILE_MISMATCH`, §4.4).
 
 ### 4.3 What the batch carries
 
@@ -122,7 +124,10 @@ For each binding, in this order:
    `observed_at` = the stored one, `evidence_age_ms` = now − observed_at,
    `remaining_ttl_ms` = hold − that age, `reason_codes = ["VERDICT_RETAINED", <why no new
    data: the UNKNOWN record's first reason or the collection error code>, <stored reasons>…]`
-   (bounded to `MAX_REASON_CODES`).
+   (bounded to `MAX_REASON_CODES`). `profile` is the profile in force now (id, version,
+   digest), not the one the verdict was stored under; the verdict keeps its stored hold. A
+   reload that changed the profile digest must not put two digests of one profile id into a
+   batch: the MDS drops such a batch whole (`DC_PROFILE_INCONSISTENT`).
 3. Otherwise → the `UNKNOWN` record as today (null `target_incarnation` allowed).
 
 `render()` recomputes ages and TTLs at read time, as now; a retained verdict whose TTL

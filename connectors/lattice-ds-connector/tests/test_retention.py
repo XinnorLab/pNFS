@@ -11,11 +11,12 @@ from types import SimpleNamespace
 import pytest
 
 import source_builder as sb
-from conftest import make_profile, validate
+from conftest import make_binding, make_profile, validate
 from lattice_ds_connector import contract
+from lattice_ds_connector.config import sha256_digest
 from lattice_ds_connector.modules.base import CollectionError
 from lattice_ds_connector.verdicts import StoredVerdict, VerdictKey, VerdictStore
-from runtime_helpers import FakeClock, ScriptedModule, make_runtime, records, settle
+from runtime_helpers import FakeClock, ScriptedModule, make_instance, make_runtime, records, settle
 
 HOLD_OTHER = contract.DEFAULT_VERDICT_HOLD_MS
 HOLD_CRIT = contract.DEFAULT_CRITICAL_HOLD_MS
@@ -458,3 +459,88 @@ def test_a_changed_hold_applies_to_the_next_fresh_verdict():
     a = records(rt)[1][0]
     assert a["placement"]["reason_codes"] == ["NORMAL"]
     assert a["remaining_ttl_ms"] == 300_000 - a["evidence_age_ms"]
+
+
+def two_instances_rt():
+    """xi-01 (DS 0..2) and xi-02 (DS 7) on one profile, both settled."""
+    clock = FakeClock()
+    mods = {"xi-01": ScriptedModule(clock), "xi-02": ScriptedModule(clock)}
+    other = make_instance("xi-02", bindings=[make_binding(7, "training-a", "/mnt/data/training-a", "training-a:7")])
+    rt = make_runtime(clock, mods, instances=[make_instance(), other])
+    for _ in range(3):
+        for ir in rt.instances.values():
+            ir.run_cycle()
+        clock.advance(6.0)
+    return clock, mods, rt
+
+
+def test_a_profile_changing_reload_publishes_one_digest_per_profile_id():
+    # Final review F1: the store survives a reload, but the MDS drops a whole
+    # batch that carries two digests for one profile id. A retained verdict is
+    # published under the profile in force now, keeping the hold it was stored with.
+    clock, mods, rt = two_instances_rt()
+    old = rt.config.profiles["xinas-mvp"]
+    p = make_profile(verdict_hold_ms=300_000)
+    assert p.id == old.id and p.digest != old.digest
+    rt.reload(replace(rt.config, profiles={p.id: p}))         # both instances are recreated on the new profile
+    mods["xi-01"].push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))
+    clock.advance(5.0)
+    rt.instances["xi-01"].run_cycle()                         # no new data: DS 0..2 retained
+    rt.instances["xi-02"].run_cycle()                         # DS 7 fresh, under the new profile
+    batch = rt.batch()
+    recs = [a for i in batch["instances"] for a in i["assessments"]]
+    assert {a["profile"]["id"] for a in recs} == {p.id}
+    assert {a["profile"]["digest"] for a in recs} == {p.digest}
+    assert {a["profile"]["version"] for a in recs} == {p.version}
+    retained = records(rt)[1][0]
+    assert retained["quality"] == "VALID"
+    assert retained["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", "SOURCE_TIMEOUT"]
+    # The retained verdict keeps the hold it was stored with (10 min), not the new 5 min.
+    assert retained["remaining_ttl_ms"] == HOLD_OTHER - retained["evidence_age_ms"]
+    ir = rt.instances["xi-01"]
+    assert rt.verdicts.get(ir.key_for(ir.instance.bindings[0])).published.hold_ms == HOLD_OTHER
+    from lattice_ds_connector.preflight import evaluate
+    rep = evaluate({"ready": True}, batch, expect_ds=[0, 1, 2, 7])
+    assert rep["ready"] is True, rep["reasons"]
+
+
+def test_a_changed_profile_id_drops_the_verdict():
+    # The same binding moved to another profile id by a reload: its verdict
+    # is not the binding's any more (restore() refuses it: PROFILE_MISMATCH).
+    clock, mod, rt = healthy_rt()
+    other = replace(make_profile(), id="xinas-other")
+    other = replace(other, digest=sha256_digest(other.placement_fields()))
+    cfg = rt.config
+    inst = replace(cfg.instances[0], profile_id=other.id)
+    keys = rt.verdicts.keys()
+    assert len(keys) == 3
+    rt.reload(replace(cfg, profiles={other.id: other}, instances=(inst,)))
+    ir = rt.instances["xi-01"]
+    assert ir.key_for(ir.instance.bindings[0]) in keys        # the key itself did not change ...
+    assert rt.verdicts.keys() == []                           # ... the recreated instance's first snapshot dropped it
+    recs = records(rt)[1]
+    assert all(a["quality"] == "UNKNOWN" and a["profile"]["id"] == other.id for a in recs.values())
+    mod.push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))
+    clock.advance(5.0)
+    ir.run_cycle()
+    recs = records(rt)[1]
+    assert all(a["quality"] == "UNKNOWN" and a["profile"]["id"] == other.id for a in recs.values())
+    assert recs[0]["placement"]["reason_codes"][0] == "SOURCE_TIMEOUT"
+    assert rt.verdicts.keys() == []
+
+
+def test_a_stopped_worker_never_drops_a_verdict_of_the_new_profile():
+    clock, mod, rt = healthy_rt()
+    old = rt.instances["xi-01"]
+    other = replace(make_profile(), id="xinas-other")
+    other = replace(other, digest=sha256_digest(other.placement_fields()))
+    inst = replace(rt.config.instances[0], profile_id=other.id)
+    rt.reload(replace(rt.config, profiles={other.id: other}, instances=(inst,)))
+    old.stop(0.1)                                             # the replaced worker (never started here)
+    clock.advance(5.0)
+    rt.instances["xi-01"].run_cycle()                         # fresh verdicts under the new profile id
+    assert {v.profile_id for _, v in rt.verdicts.items()} == {other.id}
+    version = rt.verdicts.version
+    mod.push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))
+    old.run_cycle()                                           # the late finish of the stopped worker
+    assert rt.verdicts.version == version and len(rt.verdicts.keys()) == 3

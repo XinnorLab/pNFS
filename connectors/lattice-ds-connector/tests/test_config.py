@@ -70,6 +70,18 @@ def test_example_profile_carries_the_default_holds(token_file, tmp_path):
     assert (prof.critical_hold_ms, prof.verdict_hold_ms) == (1_200_000, 600_000)
 
 
+def test_parsed_holds_land_in_their_own_profile_fields(token_file, tmp_path):
+    # Two distinct explicit values: a swap between the keys and the fields shows.
+    doc = example(token_file, tmp_path)
+    doc["profiles"][0]["critical_hold_ms"] = 900_000
+    doc["profiles"][0]["verdict_hold_ms"] = 300_000
+    config, issues = validate_config_dict(doc)
+    assert config is not None, issues
+    prof = config.profiles["xinas-mvp"]
+    assert (prof.critical_hold_ms, prof.verdict_hold_ms) == (900_000, 300_000)
+    assert prof.hold_ms(True) == 900_000 and prof.hold_ms(False) == 300_000
+
+
 @pytest.mark.parametrize(
     "field, value, code",
     [

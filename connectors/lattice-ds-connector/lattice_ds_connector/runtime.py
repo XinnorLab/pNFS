@@ -295,22 +295,55 @@ class InstanceRuntime:
     def key_for(self, b: Binding) -> VerdictKey:
         return InstanceRuntime.static_key(self.instance.id, b)
 
+    def _stored_verdict(self, key: VerdictKey, profile_id: str) -> Optional[StoredVerdict]:
+        """The binding's stored verdict, or None. A verdict stored under
+        another profile id (a reload moved the instance to another profile)
+        is no longer the binding's: it is dropped, as ``restore()`` refuses
+        it (PROFILE_MISMATCH). A stopped worker only reads -- its successor
+        may already have stored a verdict under the new profile id."""
+        held = self.store.get(key)
+        if held is None or held.profile_id == profile_id:
+            return held
+        if not self._stop.is_set():
+            self.store.drop(key, expected=held)
+        return None
+
     def _retained_or_unknown(
-        self, b: Binding, cause: str, now: float, fallback: Optional[PublishedAssessment] = None
+        self,
+        b: Binding,
+        cause: str,
+        now: float,
+        fallback: Optional[PublishedAssessment] = None,
+        triplet: Optional[Tuple[str, str, str, int]] = None,
     ) -> PublishedAssessment:
         """No new VALID record for ``b``: its verdict in force, re-published
         as retained (``cause`` says why), else ``fallback`` -- the cycle's own
         UNKNOWN record -- or a bare UNKNOWN record carrying ``cause``. A
-        verdict whose hold ran out is dropped from the store."""
+        verdict whose hold ran out is dropped from the store.
+
+        A retained record carries the profile in force now (``triplet``, by
+        default the instance's), not the one it was stored under: a reload
+        that changed the profile's digest must not put two digests of one
+        profile id into a batch -- the MDS drops such a batch whole. The
+        verdict keeps the hold it was stored with (``hold_ms``, origin)."""
         key = self.key_for(b)
-        held = self.store.get(key)
+        pid, pver, pdig, max_age = triplet or self._profile_triplet()
+        held = self._stored_verdict(key, pid)
         if held is not None:
             if held.remaining_ms(now) > 0:
-                return replace(held.published, retained=True, restored=held.restored, retained_cause=cause)
+                return replace(
+                    held.published,
+                    profile_id=pid,
+                    profile_version=pver,
+                    profile_digest=pdig,
+                    source_max_age_ms=max_age,
+                    retained=True,
+                    restored=held.restored,
+                    retained_cause=cause,
+                )
             self.store.drop(key, expected=held)
         if fallback is not None:
             return fallback
-        pid, pver, pdig, max_age = self._profile_triplet()
         return PublishedAssessment(unknown_assessment(b, self._datastore_id(b), cause), now, max_age, pid, pver, pdig)
 
     def _no_data_snapshot(self, code: str, status: str, publish: bool = True, error: Optional[str] = None) -> InstanceSnapshot:
@@ -377,7 +410,7 @@ class InstanceRuntime:
                 # FAILED snapshot is always a retained one.
                 a = replace(a, quality=contract.QUALITY_UNKNOWN, allowed=False, multiplier_ppm=0)
             key = self.key_for(b)
-            held = self.store.get(key)
+            held = self._stored_verdict(key, pid)
             deny_in_force = held is not None and held.critical and held.remaining_ms(now) > 0
             a = self._hold.apply(a, batch.cycle_key, now, batch.fetched_mono, profile, deny_in_force)
             pa = PublishedAssessment(
@@ -408,7 +441,7 @@ class InstanceRuntime:
                     self.store.put(key, StoredVerdict(pa, critical=critical, hold_origin_mono=origin, profile_id=pid))
             else:
                 # An UNKNOWN record is no new data (rule 3): the verdict in force stays.
-                pa = self._retained_or_unknown(b, (a.reason_codes or ["NO_ASSESSMENT"])[0], now, fallback=pa)
+                pa = self._retained_or_unknown(b, (a.reason_codes or ["NO_ASSESSMENT"])[0], now, fallback=pa, triplet=(pid, pver, pdig, max_age))
             records.append(pa)
         self._failures = 0
         self._backoff_s = 0.0
