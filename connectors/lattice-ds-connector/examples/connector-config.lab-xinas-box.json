@@ -5,8 +5,7 @@
   "runtime": {
     "socket_path": "/run/lattice-ds-connector/connector.sock",
     "collect_interval_ms": 5000,
-    "collect_deadline_ms": 2000,
-    "state_path": "/var/lib/lattice-ds-connector/verdicts.json"
+    "collect_deadline_ms": 2000
   },
   "profiles": [{ "id": "xinas-mvp", "version": "1" }],
   "instances": [
