@@ -411,8 +411,10 @@ lab capture):
 `covered` is the number of DS with a verdict in force (fresh or
 retained), `retained` those held by a retained verdict, `neutral` the
 registered DS without one; `eligible` is the neutral DS plus the live
-allows with a multiplier above 0 (DS state and capacity are not counted).
-A neutral DS has no `assess=` part: it shows its `fill` weight and the
+allows with a multiplier above 0 (DS state, capacity, the alias grades
+and `DOMAIN_MAP_MISMATCH` are not counted). A neutral DS has no
+`assess=` part: it shows its base weight (the manual domain weight when
+configured, else the fill level) and the
 gate's `reason` (`NONE` when it is a candidate, else for example
 `CAPACITY_FULL`). The raw `config show` row also carries `quality=NONE
 allowed=- ppm=1000000` for it.

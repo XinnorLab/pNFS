@@ -86,6 +86,16 @@ entry when it lands.
   for the merged branch in the pNFS PR (or one merged together with it),
   so `mds/manifest.json` `fork_sha` and `mds/patches/` match; the pNFS PR
   merges only after that (`scripts/check-manifests.py` ok).
+- **A test-mode fixture instance loses its verdict on a collection error
+  when its document names a non-default profile.** An instance with no
+  configured profile takes its profile id from the batch document; the
+  no-data path resolves the triplet without a batch, so the stored
+  verdict (stored under the document's id) reads as another profile's and
+  is dropped instead of retained. `test_mode` only: xinas instances always
+  carry a configured profile. Left because no deployed instance runs
+  without one. Done = the no-data path uses the profile id the verdict
+  was stored under when the instance has no configured profile, with a
+  test.
 - **The stand trial (R10) has not run.** Verdict retention is proven by
   unit tests and the fork CI, not on the lab.  Done = the design §9 stand
   rows on node223/node225 with the shortened holds (`critical_hold_ms =
