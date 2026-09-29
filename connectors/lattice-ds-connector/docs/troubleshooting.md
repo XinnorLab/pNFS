@@ -13,8 +13,9 @@ verdict, still `VALID`, with `VERDICT_RETAINED` first and the row's code
 second, until its hold runs out (`critical_hold_ms`, 20 min, for
 `allowed: false`; `verdict_hold_ms`, 10 min, otherwise; counted from the
 observation). The instance's `snapshot_status` is `FAILED` after a
-collection error; a `VALID` record in a `FAILED` snapshot is always a
-retained one.
+collection error or when the source's own snapshot is `FAILED` (no new data
+either way); a `VALID` record in a `FAILED` snapshot is always a retained
+one.
 
 | Symptom | Reasons you will see | Cause and fix |
 |---|---|---|
@@ -34,9 +35,9 @@ retained one.
 | `COLLECT_IN_FLIGHT` | retained verdict | The previous collect+evaluate helper is still running; this tick was skipped rather than stacking a second one. Repeated occurrences count against the restart budget like a timeout. |
 | `SOURCE_REPLAY` in the journal (`source_replay_ignored`) | no change | The source answered with a generation not newer than the last accepted one in the same epoch (a delayed or replayed response). Ignored. Persisting means the xiNAS publisher is frozen — see `SOURCE_STALE`. |
 | `SOURCE_UNAVAILABLE` / `SOURCE_TIMEOUT`, DS still allowed | retained verdict | Transport failure: the verdicts in force stay until their hold runs out (10 min for an allow, 20 min for a deny, from the observation), then `EVIDENCE_EXPIRED`. Fix the path; nothing is refreshed until a collect succeeds. |
-| `SHARE_ABSENT` (VALID deny) | | The source enumerated its shares (`COMPLETE`) and the bound `target_id` is not among them: the share was deleted, or the binding names the wrong id (xiNAS share ids are the desired Share ids, `xinasctl shares list`). |
+| `SHARE_ABSENT` | VALID deny, held as critical (20 min from the fetch: the record carries no evidence age) | The source enumerated its shares (`COMPLETE`) and the bound `target_id` is not among them: the share was deleted, or the binding names the wrong id (xiNAS share ids are the desired Share ids, `xinasctl shares list`). |
 | `INCARNATION_MISMATCH` | VALID deny | The share was recreated (new fsid) or the binding's `expected_target_incarnation` is stale. Compare with the source's `shares[].incarnation`, then rebind with a new `binding_generation`. |
-| `EXPORT_PATH_MISMATCH` / `IDENTITY_MISMATCH` | VALID deny | The endpoint's `export_path` or the instance's `expected_controller_id` does not match what the source publishes. Fix the config; both are deliberate guards against binding the wrong node. |
+| `EXPORT_PATH_MISMATCH` / `IDENTITY_MISMATCH` | VALID deny, held as critical (`IDENTITY_MISMATCH` carries no evidence age: 20 min from the fetch) | The endpoint's `export_path` or the instance's `expected_controller_id` does not match what the source publishes. Fix the config; both are deliberate guards against binding the wrong node. |
 | `EXPORT_ACCESS_MISSING` | VALID deny | No `/etc/exports` rule covers one of `expected_client_networks`. Add the MDS/client networks to the export on xiNAS. |
 | `EXPORT_RULE_UNSUPPORTED` | UNKNOWN | The export carries a netgroup, hostname or wildcard-host rule; the MVP evaluates only IP/CIDR/`*` rules and such a rule may contradict them for some hosts. Rewrite the export with CIDR rules only. |
 | MDS: `rejected_binding`, detail "… does not match the registry …" after upgrading the MDS | | The binding lacks `ds_path` (or it differs from the registered `ds[N]` path). Add `ds_path` to the binding equal to the `ds[N]` path; see `docs/placement-modes/operations.md` "Upgrading to `ds_path` bindings". |

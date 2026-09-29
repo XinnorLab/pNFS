@@ -241,3 +241,75 @@ def test_store_is_safe_under_concurrent_writers():
     for t in threads:
         t.join()
     assert s.version == 8 * 500 and len(s.keys()) == 8
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: evidence-less denies; a FAILED source snapshot is no new data
+# ---------------------------------------------------------------------------
+
+
+def without_share(share_id):
+    r = sb.base_result()
+    r["shares"] = [s for s in r["shares"] if s["share_id"] != share_id]
+    return r
+
+
+def test_evidence_less_deny_is_a_held_critical_verdict(schemas):
+    clock, mod, rt = healthy_rt()
+    assert records(rt)[1][0]["placement"]["allowed"] is True
+    mod.push(without_share("training-a"))                   # COMPLETE snapshot: SHARE_ABSENT, no evidence age
+    rt.instances["xi-01"].run_cycle()
+    inst, recs = records(rt)
+    a = recs[0]
+    assert inst["snapshot_status"] == "COMPLETE"
+    assert a["quality"] == "VALID" and a["placement"]["allowed"] is False
+    assert a["placement"]["reason_codes"][0] == "SHARE_ABSENT"
+    assert a["remaining_ttl_ms"] == HOLD_CRIT                # the hold counts from the fetch
+    assert a["evidence_age_ms"] is None and a["observed_at"] is None   # as the policy produced them
+    validate(schemas["batch"], rt.batch())
+    mod.push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))
+    clock.advance(30.0)
+    rt.instances["xi-01"].run_cycle()
+    inst, recs = records(rt)
+    a = recs[0]
+    assert inst["snapshot_status"] == "FAILED"
+    assert a["quality"] == "VALID" and a["placement"]["allowed"] is False
+    assert a["placement"]["reason_codes"][:3] == ["VERDICT_RETAINED", "SOURCE_TIMEOUT", "SHARE_ABSENT"]
+    assert a["remaining_ttl_ms"] == HOLD_CRIT - 30_000       # counting down from that fetch
+    validate(schemas["batch"], rt.batch())
+    clock.advance(HOLD_CRIT / 1000.0)
+    assert records(rt)[1][0]["quality"] == "UNKNOWN" and records(rt)[1][0]["placement"]["reason_codes"][0] == "EVIDENCE_EXPIRED"
+
+
+def wrong_controller_failed():
+    r = sb.base_result(snapshot_status="FAILED")
+    r["controller_id"] = "someone-else"                      # the policy vetoes identity before the FAILED check
+    return r
+
+
+def test_failed_source_snapshot_retains_instead_of_a_fresh_verdict(schemas):
+    clock, mod, rt = healthy_rt()
+    mod.push(wrong_controller_failed())
+    clock.advance(5.0)
+    rt.instances["xi-01"].run_cycle()
+    inst, recs = records(rt)
+    assert inst["snapshot_status"] == "FAILED"
+    for r in recs.values():
+        assert r["quality"] == "VALID" and r["placement"]["allowed"] is True    # the stored allow, not the fresh deny
+        assert r["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", "IDENTITY_MISMATCH"]
+    validate(schemas["batch"], rt.batch())
+
+
+def test_failed_source_snapshot_without_a_verdict_is_unknown(schemas):
+    clock = FakeClock()
+    mod = ScriptedModule(clock)
+    rt = make_runtime(clock, {"xi-01": mod})
+    mod.push(wrong_controller_failed())
+    rt.instances["xi-01"].run_cycle()
+    inst, recs = records(rt)
+    assert inst["snapshot_status"] == "FAILED"
+    for r in recs.values():
+        assert r["quality"] == "UNKNOWN" and r["placement"]["reason_codes"][0] == "IDENTITY_MISMATCH"
+        assert r["remaining_ttl_ms"] == 0
+    assert rt.verdicts.keys() == []                          # nothing stored from a FAILED snapshot
+    validate(schemas["batch"], rt.batch())

@@ -43,6 +43,12 @@ re-publishing the verdict in force with `VERDICT_RETAINED` first and the
 cause second (the `UNKNOWN` record's first reason or the error code), its
 `observed_at` and age unchanged, so re-publishing never extends the hold.
 When the hold runs out the record turns `UNKNOWN` / `EVIDENCE_EXPIRED`.
+Every `VALID` deny is a critical verdict, including the two the policy emits
+without evidence (`SHARE_ABSENT`, `IDENTITY_MISMATCH`: `observed_at` and
+`evidence_age_ms` are null); their hold counts from the fetch. A `FAILED`
+source snapshot is no new data: a `VALID` record the policy still derives
+from it (`IDENTITY_MISMATCH` is checked first) is not published as a fresh
+verdict, so a `VALID` record in a `FAILED` snapshot is always a retained one.
 A rebind (a new `binding_generation`, target or pinned incarnation) drops
 the verdict; a configuration reload that keeps the binding does not.
 

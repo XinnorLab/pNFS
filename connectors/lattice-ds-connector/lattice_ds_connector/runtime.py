@@ -69,18 +69,18 @@ class PublishedAssessment:
 
     def render(self, now_mono: float) -> Dict[str, Any]:
         a = self.assessment
-        age: Optional[int] = None
+        since_fetch_ms = max(0, int((now_mono - self.fetched_mono) * 1000))
+        age: Optional[int] = None if a.evidence_age_ms is None else a.evidence_age_ms + since_fetch_ms
         ttl = 0
-        if a.evidence_age_ms is not None:
-            since_fetch_ms = max(0, int((now_mono - self.fetched_mono) * 1000))
-            age = a.evidence_age_ms + since_fetch_ms
-            if a.quality == contract.QUALITY_VALID and self.hold_origin_mono is not None:
-                # Held since the hold origin, on the same millisecond basis as
-                # the age: for a record whose hold counts from its own
-                # observation, held == age and ttl + age == hold.
-                lead_ms = int(round((self.fetched_mono - self.hold_origin_mono) * 1000))
-                held = max(0, lead_ms + since_fetch_ms)
-                ttl = max(0, min(contract.MAX_REMAINING_TTL_MS, self.hold_ms - held))
+        if a.quality == contract.QUALITY_VALID and self.hold_origin_mono is not None:
+            # Held since the hold origin, on the same millisecond basis as the
+            # age: for a record whose hold counts from its own observation,
+            # held == age and ttl + age == hold. A deny the policy emits
+            # without an evidence age (SHARE_ABSENT, IDENTITY_MISMATCH) is
+            # still a critical verdict: its hold counts from the fetch.
+            lead_ms = int(round((self.fetched_mono - self.hold_origin_mono) * 1000))
+            held = max(0, lead_ms + since_fetch_ms)
+            ttl = max(0, min(contract.MAX_REMAINING_TTL_MS, self.hold_ms - held))
         quality, allowed, ppm, reasons = a.quality, a.allowed, a.multiplier_ppm, list(a.reason_codes)
         if ttl == 0:
             if allowed or quality == contract.QUALITY_VALID:
@@ -342,6 +342,12 @@ class InstanceRuntime:
             if a is None or a.binding_generation != b.binding_generation:
                 a = unknown_assessment(b, self._datastore_id(b), "NO_ASSESSMENT")
             a = a.normalized()
+            if batch.snapshot_status == contract.SNAPSHOT_FAILED and a.quality == contract.QUALITY_VALID:
+                # A FAILED source snapshot is no new data (design §4.3): a VALID
+                # record the policy still derived from it (IDENTITY_MISMATCH is
+                # checked first) is not a fresh verdict, so a VALID record in a
+                # FAILED snapshot is always a retained one.
+                a = replace(a, quality=contract.QUALITY_UNKNOWN, allowed=False, multiplier_ppm=0)
             a = self._hold.apply(a, batch.cycle_key, now, batch.fetched_mono, profile)
             pa = PublishedAssessment(
                 assessment=a,
@@ -353,7 +359,8 @@ class InstanceRuntime:
             )
             if a.quality == contract.QUALITY_VALID:
                 # A newer VALID record replaces the verdict at once (rule 2);
-                # its hold counts from its observation.
+                # its hold counts from its observation (the fetch, when the
+                # policy gave the deny no evidence age).
                 critical = not a.allowed
                 origin = batch.fetched_mono - (a.evidence_age_ms or 0) / 1000.0
                 pa = replace(pa, hold_ms=profile.hold_ms(critical), hold_origin_mono=origin)
