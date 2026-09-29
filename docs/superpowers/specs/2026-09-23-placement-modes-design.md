@@ -555,9 +555,11 @@ Python 3.9 stdlib, same style as the connector CLI. Commands:
   (2026-09-29): no verdict in force means neutral, not refusal.
   `connector_reachable = false` (`CONNECTOR_UNREACHABLE`) and
   `coverage = none` (`STEERING_OFF`) are warnings: the cluster places,
-  it does not steer. `connector_config_valid = false`, differing modes,
-  generations, builds, digests or profile maps and a desired mode that is
-  not effective stay errors. `--require-full-coverage` turns partial and
+  it does not steer (except against an MDS that predates retention, and
+  when the MDS admits no DS: see that design §6).
+  `connector_config_valid = false`, differing modes, generations, builds,
+  digests or profile maps and a desired mode that is not effective stay
+  errors. `--require-full-coverage` turns partial and
   no coverage into exit 1, and also a DS held only by a retained verdict
   (`COVERAGE_RETAINED`); it is the gate to use where steering must be
   proven.

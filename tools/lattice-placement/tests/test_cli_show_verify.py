@@ -49,13 +49,15 @@ def test_verify_exit_codes(tmp_path, capsys):
     assert main(["mode", "verify", "--mds", "10.0.0.1,10.0.0.3", "--mds-admin", admin, "--no-metrics",
                  "--require-full-coverage"]) == 1
     assert "error:   COVERAGE_PARTIAL" in capsys.readouterr().out
-    # 10.0.0.2 is an older MDS without a connector: no steering is only a warning, the digest spread is the error
+    # 10.0.0.2 is an MDS that predates verdict retention, without a connector: it refuses
+    # every new file, so no coverage and an unreachable connector are errors there
     assert main(["mode", "verify", "--mds", "10.0.0.1,10.0.0.2", "--mds-admin", admin, "--no-metrics", "--json"]) == 1
     data = json.loads(capsys.readouterr().out)
     assert data["ok"] is False and any(e.startswith("CONNECTOR_CONFIG_DIGEST_MISMATCH") for e in data["errors"])
-    assert not any(e.startswith("COVERAGE_NONE") for e in data["errors"])
-    assert any(w.startswith("STEERING_OFF:10.0.0.2") for w in data["warnings"])
-    assert any(w.startswith("CONNECTOR_UNREACHABLE:10.0.0.2") for w in data["warnings"])
+    assert any(e.startswith("COVERAGE_NONE:10.0.0.2") for e in data["errors"])
+    assert any(e.startswith("CONNECTOR_UNREACHABLE:10.0.0.2") for e in data["errors"])
+    assert not any(w.startswith("STEERING_OFF:10.0.0.2") for w in data["warnings"])
+    assert data["mds"][1]["readiness"]["retention_aware"] is False
     assert main(["mode", "verify", "--mds", "10.0.0.1,10.0.0.9", "--mds-admin", admin, "--no-metrics"]) == 2
     assert "MDS_UNREADABLE:10.0.0.9" in capsys.readouterr().out
 

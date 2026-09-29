@@ -250,6 +250,13 @@ In `smart`, per data store after the capacity gate:
   profile maps, `DESIRED_NE_EFFECTIVE`, `connector_config_valid=0`, an unreadable MDS.
   `--require-full-coverage` still turns partial or no coverage into exit 1, and now also a
   data store held only by a retained verdict (`--require-fresh` is not added: YAGNI).
+- Two exceptions keep `verify` from passing a cluster that refuses every new file. An MDS
+  that predates retention (its `placement_readiness` row carries no `retained_ds` /
+  `neutral_ds`; the helper records this as `retention_aware`) still refuses a data store
+  without a verdict, so against it `connector_reachable=0` (`CONNECTOR_UNREACHABLE`) and
+  `coverage=none` (`COVERAGE_NONE`) stay **errors**, as before retention. On any build,
+  `smart` with `registered_ds > 0` and `eligible_ds == 0` is an **error**
+  (`NO_ELIGIBLE_DS`: the MDS admits no DS).
 - `mode validate smart`: a connector that is not ready is a **warning**, not an error.
 - `mode show`: the per-DS line shows `verdict=… hold_left=…`; the readiness line shows
   `retained=… neutral=…`.

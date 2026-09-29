@@ -21,16 +21,21 @@ Exit codes: 0 ready / same; 1 not ready / a difference / refused; 2 an
 argument, file or MDS could not be read. `--json` on every command.
 
 `mode verify` in `smart`. A data store without a verdict in force is placed
-neutrally (by its fill weight), so a cluster whose connector is gone still
-places: the helper reports that it is not steering, and fails only when you
-ask for steering.
+neutrally (multiplier 1 on its domain's base weight), so a cluster whose
+connector is gone still places: the helper reports that it is not steering,
+and fails only when you ask for steering. Two exceptions fail on their own:
+an MDS that predates verdict retention (its readiness row has no
+`retained_ds`/`neutral_ds`: it refuses a data store without a verdict), and
+an MDS that admits no data store at all.
 
 | Finding | Default | With `--require-full-coverage` |
 |---|---|---|
 | `MDS_UNREADABLE` | exit 2 | exit 2 |
 | `MODE_MISMATCH`, `GENERATION_MISMATCH`, `BUILD_MISMATCH`, `CONNECTOR_CONFIG_DIGEST_MISMATCH`, `CONNECTOR_PROFILES_MISMATCH` (MDS differ); `DESIRED_NE_EFFECTIVE`; `CONNECTOR_CONFIG_INVALID`; `CONNECTOR_PROFILES_INVALID` / `_MISSING`; `NO_READINESS` | error, exit 1 | error, exit 1 |
-| `CONNECTOR_UNREACHABLE:<host>` (`connector_reachable=0`) | warning | warning |
+| `NO_ELIGIBLE_DS:<host>` (`registered_ds > 0`, `eligible_ds = 0`: the MDS admits no DS, any build) | error, exit 1 | error, exit 1 |
+| `CONNECTOR_UNREACHABLE:<host>` (`connector_reachable=0`) | warning; error against an MDS that predates retention | warning; error against an MDS that predates retention |
 | `STEERING_OFF:<host>` (`coverage=none`: no data store has a verdict in force) | warning | error, exit 1 |
+| `COVERAGE_NONE:<host>` (`coverage=none` on an MDS that predates retention: it refuses every new file) | error, exit 1 | error, exit 1 |
 | `COVERAGE_PARTIAL:<host>` (some data stores are neutral; they are named with the gate's reason) | warning | error, exit 1 |
 | `COVERAGE_RETAINED:<host>` (a data store is held only by a retained verdict: the connector is not observing it) | not reported | error, exit 1 |
 

@@ -439,8 +439,8 @@
     "mds_admin_port_default": 50051,
     "metrics_port_default": 9090,
     "verify_exit": {
-      "0": "same effective mode, generation and build on every MDS and no error reported; smart: an unreachable connector and coverage partial or none are warnings (the cluster places neutrally, it does not steer)",
-      "1": "any difference, a desired mode not yet effective, connector_config_valid=0, a connector config digest or profile map that differs between MDS, an unreadable (CONNECTOR_PROFILES_INVALID) or, in smart, absent (CONNECTOR_PROFILES_MISSING) profile pin row; with --require-full-coverage also partial, none or retained coverage",
+      "0": "same effective mode, generation and build on every MDS and no error reported; smart on an MDS with verdict retention: an unreachable connector and coverage partial or none are warnings (the cluster places neutrally, it does not steer)",
+      "1": "any difference, a desired mode not yet effective, connector_config_valid=0, a connector config digest or profile map that differs between MDS, an unreadable (CONNECTOR_PROFILES_INVALID) or, in smart, absent (CONNECTOR_PROFILES_MISSING) profile pin row; in smart an MDS that admits no DS (NO_ELIGIBLE_DS: registered_ds > 0, eligible_ds = 0) and, against an MDS that predates verdict retention (no retained_ds/neutral_ds in its readiness row), an unreachable connector or coverage none (COVERAGE_NONE); with --require-full-coverage also partial, none or retained coverage",
       "2": "an MDS could not be read"
     }
   }

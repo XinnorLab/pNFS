@@ -32,17 +32,40 @@ def test_two_identical_smart_mds_with_partial_coverage():
     assert v.exit_code == EXIT_DIFFER and any(e.startswith("COVERAGE_PARTIAL:m1") for e in v.errors)
 
 
-def test_coverage_none_and_unreachable_no_longer_fail_by_themselves():
-    """An older MDS (no verdict fields) whose connector is gone: the cluster
-    places, so it is a warning; the digest spread is still an error."""
-    a = smart2("m2")
+def test_a_pre_retention_mds_without_steering_refuses_every_file_and_fails():
+    """An MDS that predates verdict retention (its readiness row has no
+    retained_ds/neutral_ds) refuses every new file without a verdict
+    (MODE_NOT_READY / ASSESSMENT_* -> ENOSPC): no coverage and an unreachable
+    connector stay errors there, as before retention (final review F3)."""
     b = load("config-show-smart-mds1-none.json", "m1", "smart")
-    v = verdict([a, b])
+    assert b.readiness.retention_aware is False
+    v = verdict([b])
     assert v.exit_code == EXIT_DIFFER
-    assert any(w.startswith("CONNECTOR_UNREACHABLE:m1") for w in v.warnings)
-    assert any(w.startswith("STEERING_OFF:m1") for w in v.warnings)
-    assert not any(e.startswith(("CONNECTOR_UNREACHABLE", "COVERAGE_NONE", "STEERING_OFF")) for e in v.errors)
+    assert any(e.startswith("CONNECTOR_UNREACHABLE:m1: socket /run/lattice-ds-connector") for e in v.errors)
+    assert any(e.startswith("COVERAGE_NONE:m1") for e in v.errors)
+    assert any(e.startswith("NO_ELIGIBLE_DS:m1") for e in v.errors)     # registered_ds=2 eligible_ds=0
+    assert not any(w.startswith(("CONNECTOR_UNREACHABLE", "STEERING_OFF")) for w in v.warnings)
+    a = smart2("m2")
+    assert a.readiness.retention_aware is False
+    v = verdict([a, b])
     assert any(e.startswith("CONNECTOR_CONFIG_DIGEST_MISMATCH") for e in v.errors)   # m1 has no digest
+    assert not any(e.endswith(":m2") or ":m2:" in e for e in v.errors)             # m2 is reachable, partial
+
+
+def test_an_mds_that_admits_no_ds_fails_on_any_build():
+    s = load("config-show-smart-retention.json", "m1")
+    assert s.readiness.retention_aware is True
+    # both DS denied by fresh verdicts: full coverage, nothing eligible
+    s.readiness.coverage, s.readiness.covered_ds, s.readiness.neutral_ds = "full", 2, 0
+    s.readiness.retained_ds, s.readiness.eligible_ds = 0, 0
+    v = verdict([s])
+    assert v.exit_code == EXIT_DIFFER
+    assert [e.split(":")[0] for e in v.errors] == ["NO_ELIGIBLE_DS"]
+    assert v.errors[0].startswith("NO_ELIGIBLE_DS:m1: the MDS admits no DS (2 registered, 0 eligible)")
+    s.readiness.eligible_ds = 1
+    assert verdict([s]).exit_code == EXIT_OK
+    s.readiness.registered_ds, s.readiness.covered_ds, s.readiness.eligible_ds = 0, 0, 0   # nothing registered yet
+    assert not any(e.startswith("NO_ELIGIBLE_DS") for e in verdict([s]).errors)
 
 
 def test_no_coverage_and_unreachable_are_warnings_now():
@@ -142,8 +165,8 @@ def test_legacy_pair_is_fine_and_a_lone_smart_has_no_digest_rule():
     assert v.exit_code == EXIT_OK and v.warnings == []
     lone = load("config-show-smart-mds1-none.json", "m1")
     v = verdict([lone])
-    assert not any("DIGEST" in e for e in v.errors)
-    assert v.exit_code == EXIT_OK and any(w.startswith("STEERING_OFF:m1") for w in v.warnings)
+    assert not any("DIGEST" in e for e in v.errors)                  # one MDS: nothing to compare
+    assert any(e.startswith("COVERAGE_NONE:m1") for e in v.errors)   # a pre-retention MDS without steering
 
 
 def test_render_show_lists_everything_and_warns_on_differences():

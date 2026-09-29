@@ -62,9 +62,11 @@ def test_parse_readiness_build_metrics():
     assert r.mode_active and r.connector_config_valid and not r.connector_reachable
     assert r.coverage == "none" and r.registered_ds == 2 and r.covered_ds == 0
     assert r.retained_ds == 0 and r.neutral_ds == 2            # an older MDS: neutral = registered - covered
+    assert r.retention_aware is False                          # ... and it refuses a DS without a verdict
     r = parse_readiness("mode_active=1 connector_config_valid=1 connector_reachable=1 last_batch_valid=1 "
                         "coverage=partial registered_ds=2 covered_ds=1 eligible_ds=2 retained_ds=1 neutral_ds=1")
     assert r.eligible_ds == 2 and r.retained_ds == 1 and r.neutral_ds == 1
+    assert r.retention_aware is True and r.as_dict()["retention_aware"] is True
     assert r.as_dict()["retained_ds"] == 1 and r.as_dict()["neutral_ds"] == 1
     assert parse_build("wrr=1 connector=1 prealloc=0") == {"wrr": 1, "connector": 1, "prealloc": 0}
     m = parse_metrics(fixture("metrics-smart-mds2.txt"))

@@ -102,8 +102,11 @@ write the **local** file); run `show`/`verify` from any host that has
    `COVERAGE_PARTIAL` is a warning: the named DS have no verdict in force
    and are placed neutrally (their gate reasons are printed; `CAPACITY_*`
    needs a capacity observation). `STEERING_OFF` (`coverage=none`) and
-   `CONNECTOR_UNREACHABLE` are warnings too: the cluster places by fill
-   weights. Where steering must be proven, gate on
+   `CONNECTOR_UNREACHABLE` are warnings too: the cluster places
+   neutrally. Two findings fail on their own: `NO_ELIGIBLE_DS` (the MDS
+   admits no DS) and, against an MDS that predates verdict retention,
+   `COVERAGE_NONE` / `CONNECTOR_UNREACHABLE` (that MDS refuses a DS
+   without a verdict). Where steering must be proven, gate on
    `--require-full-coverage`: it makes partial and no coverage exit 1,
    and also a DS held only by a retained verdict (`COVERAGE_RETAINED`,
    the connector is not observing it). The flag gates coverage and
@@ -201,7 +204,11 @@ together; this is the order.
    is neutral afterwards instead of refused. Then upgrade the connector.
    The reverse pairing — the new connector with an old MDS — is accepted
    (TTL up to 1 h) and holds denies for their hold, but that MDS still
-   refuses on `UNKNOWN`: do not run it on purpose.
+   refuses on `UNKNOWN`: do not run it on purpose. Upgrade the
+   `lattice-placement` helper after the MDS: against an MDS that predates
+   retention it keeps `CONNECTOR_UNREACHABLE` and `COVERAGE_NONE` as
+   errors (that MDS refuses a DS without a verdict), so a new helper's
+   `verify` is strict until every MDS runs the new build.
 2. **Update the profile pins in the same window.** `critical_hold_ms` and
    `verdict_hold_ms` are part of the profile digest, so the digest of
    every profile changes with the connector. If

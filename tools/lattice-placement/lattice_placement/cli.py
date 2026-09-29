@@ -276,10 +276,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_live_args(sh)
     sh.set_defaults(func=cmd_show)
 
-    vf = sub.add_parser("verify", help="exit 0 when every MDS runs the same mode/generation/build and is ready")
+    vf = sub.add_parser("verify", help="exit 0 when every MDS runs the same mode/generation/build and can place; "
+                                       "in smart, missing steering is only a warning")
     _add_live_args(vf)
     vf.add_argument("--require-full-coverage", action="store_true",
-                    help="smart: partial coverage is a failure, not a warning")
+                    help="smart: fail unless every DS has a verdict in force that is not a retained one "
+                         "(partial or no coverage, or a retained verdict, exits 1)")
     vf.set_defaults(func=cmd_verify)
     return p
 

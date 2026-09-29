@@ -60,6 +60,10 @@ class Readiness:
     eligible_ds: int = 0                    # neutral DS plus live allows with ppm > 0
     retained_ds: int = 0                    # live retained verdicts, allow or deny
     neutral_ds: int = 0                     # registered - covered
+    #: The row carries retained_ds/neutral_ds: the MDS places a DS without a
+    #: verdict neutrally. An older MDS refuses such a DS (MODE_NOT_READY /
+    #: ASSESSMENT_* -> ENOSPC), so no steering there means no placement.
+    retention_aware: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -172,6 +176,7 @@ def parse_readiness(value: str) -> Readiness:
         retained_ds=_int(kv.get("retained_ds")) or 0,
         # an MDS that predates the retention keys: neutral is registered - covered by definition
         neutral_ds=max(registered - covered, 0) if neutral is None else neutral,
+        retention_aware="retained_ds" in kv and "neutral_ds" in kv,
     )
 
 

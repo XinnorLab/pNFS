@@ -85,19 +85,30 @@ def verdict(states: List[MdsState], require_full_coverage: bool = False) -> Verd
                 v.errors.append("CONNECTOR_PROFILES_MISSING:%s" % s.host)
             if not r.connector_config_valid:
                 v.errors.append("CONNECTOR_CONFIG_INVALID:%s" % s.host)
-            # A cluster without steering still places (a DS without a verdict in force is
-            # neutral: fill weight), so an unreachable connector or no coverage is a
-            # warning; --require-full-coverage is the gate for operators who need steering.
+            # A retention-aware MDS without steering still places (a DS without a verdict
+            # in force is neutral), so an unreachable connector or no coverage is a
+            # warning there; --require-full-coverage is the gate for operators who need
+            # steering. An MDS that predates retention refuses such a DS (ENOSPC): there
+            # both stay errors, as before retention.
             if not r.connector_reachable:
-                v.warnings.append("CONNECTOR_UNREACHABLE:%s: %s" % (s.host, s.last_detail or ""))
+                msg = "CONNECTOR_UNREACHABLE:%s: %s" % (s.host, s.last_detail or "")
+                (v.warnings if r.retention_aware else v.errors).append(msg)
             if r.coverage == "none":
-                msg = "STEERING_OFF:%s: no data store has a verdict in force; placing by fill weights" % s.host
-                (v.errors if require_full_coverage else v.warnings).append(msg)
+                if r.retention_aware:
+                    msg = "STEERING_OFF:%s: no data store has a verdict in force; placing neutrally" % s.host
+                    (v.errors if require_full_coverage else v.warnings).append(msg)
+                else:
+                    v.errors.append("COVERAGE_NONE:%s: no DS has a verdict and this MDS predates verdict "
+                                    "retention: it refuses every new file (%s)" % (s.host, s.last_detail or ""))
             elif r.coverage == "partial":
                 neutral = ", ".join("ds %d %s" % (row.ds_id, _neutral_reason(row)) for row in s.ds if not _has_verdict(row))
                 msg = "COVERAGE_PARTIAL:%s: %d of %d DS have a verdict in force (neutral: %s)" % (
                     s.host, r.covered_ds, r.registered_ds, neutral)
                 (v.errors if require_full_coverage else v.warnings).append(msg)
+            # On any build: every registered DS denied, zeroed or refused -> ENOSPC for every file.
+            if r.registered_ds > 0 and r.eligible_ds == 0:
+                v.errors.append("NO_ELIGIBLE_DS:%s: the MDS admits no DS (%d registered, 0 eligible)"
+                                % (s.host, r.registered_ds))
             if require_full_coverage and r.retained_ds > 0:
                 v.errors.append("COVERAGE_RETAINED:%s: %d DS held by retained verdicts "
                                 "(the connector is not observing them)" % (s.host, r.retained_ds))
