@@ -292,14 +292,19 @@ def run_preflight(connector_cli: str, socket: Optional[str], expect_ds: Sequence
 
 
 def fold_preflight(report: Report, preflight: Optional[Dict[str, Any]]) -> Report:
-    """smart only: the connector's verdict joins the report."""
+    """smart only: the connector's verdict joins the report as WARNINGS.
+
+    A smart cluster whose connector is absent or not ready still places (a
+    data store without a verdict in force is neutral), so the connector
+    cannot make the file NOT_READY; `ready` stays what the file's own errors
+    say."""
     if report.mode != "smart":
         return report
     report.connector = preflight
     if preflight is None:
-        report.errors.append("CONNECTOR:UNAVAILABLE (lattice-ds-connector preflight did not answer)")
+        report.warnings.append("CONNECTOR:UNAVAILABLE (lattice-ds-connector preflight did not answer)")
     elif not preflight.get("ready"):
         for reason in preflight.get("reasons", []) or ["NOT_READY"]:
-            report.errors.append("CONNECTOR:%s" % reason)
+            report.warnings.append("CONNECTOR:%s" % reason)
     report.ready = not report.errors
     return report
