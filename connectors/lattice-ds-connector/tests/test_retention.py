@@ -24,7 +24,7 @@ def healthy_rt():
     clock = FakeClock()
     mod = ScriptedModule(clock)
     rt = make_runtime(clock, {"xi-01": mod})
-    settle(rt, clock, cycles=3)                # allowed with or without the R3 hold-down change
+    settle(rt, clock, cycles=3)                # allowed at once: no deny was in force
     return clock, mod, rt
 
 
@@ -313,3 +313,105 @@ def test_failed_source_snapshot_without_a_verdict_is_unknown(schemas):
         assert r["remaining_ttl_ms"] == 0
     assert rt.verdicts.keys() == []                          # nothing stored from a FAILED snapshot
     validate(schemas["batch"], rt.batch())
+
+
+# ---------------------------------------------------------------------------
+# R3: the recovery hold-down only follows a deny (design rule 6)
+# ---------------------------------------------------------------------------
+
+
+def test_first_collect_after_start_allows_at_once():
+    clock = FakeClock()
+    mod = ScriptedModule(clock)
+    rt = make_runtime(clock, {"xi-01": mod})
+    rt.instances["xi-01"].run_cycle()
+    a = records(rt)[1][0]
+    assert a["placement"]["allowed"] is True and a["placement"]["reason_codes"] == ["NORMAL"]
+
+
+def test_hold_down_follows_a_deny_and_does_not_extend_the_critical_clock():
+    clock = FakeClock()
+    mod = ScriptedModule(clock)
+    rt = make_runtime(clock, {"xi-01": mod})
+    mod.push(sb.with_array_states(sb.base_result(), "data1", ["offline"]))
+    rt.instances["xi-01"].run_cycle()                        # critical observed at t0
+    crit_ttl = records(rt)[1][0]["remaining_ttl_ms"]
+    clock.advance(5.0)
+    rt.instances["xi-01"].run_cycle()                        # healthy again: hold-down deny
+    a = records(rt)[1][0]
+    assert a["placement"]["allowed"] is False and a["placement"]["reason_codes"][0] == "RECOVERY_HOLD_DOWN"
+    assert crit_ttl - 6_000 <= a["remaining_ttl_ms"] <= crit_ttl - 4_000   # counted from t0, not refreshed
+    clock.advance(11.0)                                      # the hold-down began at the first allow: >= 10 s later, 2 cycles
+    rt.instances["xi-01"].run_cycle()
+    assert records(rt)[1][0]["placement"]["allowed"] is True
+
+
+def test_unknown_period_without_a_deny_needs_no_hold_down():
+    clock, mod, rt = healthy_rt()
+    mod.push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))
+    clock.advance(5.0)
+    rt.instances["xi-01"].run_cycle()
+    clock.advance(5.0)
+    rt.instances["xi-01"].run_cycle()                        # healthy again
+    assert records(rt)[1][0]["placement"]["reason_codes"] == ["NORMAL"]
+
+
+def test_neutral_period_after_an_allow_needs_no_hold_down():
+    clock, mod, rt = healthy_rt()
+    clock.advance(HOLD_OTHER / 1000.0 + 60.0)                # the allow's hold ran out with no collect
+    assert records(rt)[1][0]["quality"] == "UNKNOWN"
+    rt.instances["xi-01"].run_cycle()                        # the source is back
+    a = records(rt)[1][0]
+    assert a["quality"] == "VALID" and a["placement"]["allowed"] is True and a["placement"]["reason_codes"] == ["NORMAL"]
+
+
+def test_expired_deny_needs_no_hold_down():
+    clock = FakeClock()
+    mod = ScriptedModule(clock)
+    rt = make_runtime(clock, {"xi-01": mod})
+    mod.push(sb.with_array_states(sb.base_result(), "data1", ["offline"]))
+    rt.instances["xi-01"].run_cycle()
+    clock.advance(HOLD_CRIT / 1000.0 + 1.0)                  # the deny's 20 min ran out: neutral, nothing in force
+    assert records(rt)[1][0]["quality"] == "UNKNOWN"
+    rt.instances["xi-01"].run_cycle()
+    a = records(rt)[1][0]
+    assert a["placement"]["allowed"] is True and a["placement"]["reason_codes"] == ["NORMAL"]
+
+
+def test_a_retained_deny_still_holds_down_the_recovery():
+    clock = FakeClock()
+    mod = ScriptedModule(clock)
+    rt = make_runtime(clock, {"xi-01": mod})
+    mod.push(sb.with_array_states(sb.base_result(), "data1", ["offline"]))
+    rt.instances["xi-01"].run_cycle()
+    mod.push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))
+    clock.advance(30.0)
+    rt.instances["xi-01"].run_cycle()                        # no new data: the deny is retained, not revoked
+    assert records(rt)[1][0]["placement"]["reason_codes"][0] == "VERDICT_RETAINED"
+    clock.advance(5.0)
+    rt.instances["xi-01"].run_cycle()                        # healthy again: leaving that deny is held down
+    a = records(rt)[1][0]
+    assert a["placement"]["allowed"] is False and a["placement"]["reason_codes"][0] == "RECOVERY_HOLD_DOWN"
+    assert a["remaining_ttl_ms"] < HOLD_CRIT - 35_000        # counting from the critical observation
+
+
+def test_hold_down_deny_keeps_the_critical_origin_in_the_store():
+    clock = FakeClock()
+    mod = ScriptedModule(clock)
+    rt = make_runtime(clock, {"xi-01": mod})
+    ir = rt.instances["xi-01"]
+    key = ir.key_for(ir.instance.bindings[0])
+    mod.push(sb.with_array_states(sb.base_result(), "data1", ["offline"]))
+    ir.run_cycle()
+    crit = rt.verdicts.get(key)
+    assert crit.critical is True
+    clock.advance(5.0)
+    ir.run_cycle()                                           # hold-down deny
+    held = rt.verdicts.get(key)
+    assert held.critical is True and held.hold_origin_mono == crit.hold_origin_mono
+    assert held.published.assessment.reason_codes[0] == "RECOVERY_HOLD_DOWN"
+    clock.advance(11.0)
+    ir.run_cycle()                                           # the hold-down completed: a fresh allow replaces the deny
+    allow = rt.verdicts.get(key)
+    assert allow.critical is False and allow.hold_origin_mono > crit.hold_origin_mono
+    assert allow.published.assessment.allowed is True

@@ -40,7 +40,7 @@ def test_start_is_all_unknown_and_the_batch_validates(schemas):
     assert rt.health()["ready"] is False
 
 
-def test_first_collect_publishes_with_hold_down_then_allows(schemas):
+def test_first_collect_publishes_at_once(schemas):
     clock = FakeClock()
     rt = make_runtime(clock, {"xi-01": ScriptedModule(clock)})
     ir = rt.instances["xi-01"]
@@ -48,21 +48,18 @@ def test_first_collect_publishes_with_hold_down_then_allows(schemas):
     inst, recs = records(rt)
     assert inst["sequence"] == 1 and inst["snapshot_status"] == "COMPLETE"
     a = recs[0]
-    assert a["quality"] == "VALID" and a["placement"]["allowed"] is False
-    assert a["placement"]["reason_codes"] == ["RECOVERY_HOLD_DOWN"]
-    assert a["diagnostics"]["hold_down"]["completed"] is False
+    # No deny was in force: the first verdict after a start is not held down (design rule 6).
+    assert a["quality"] == "VALID" and a["placement"]["allowed"] is True
+    assert a["placement"]["multiplier_ppm"] == contract.PPM_FULL
+    assert a["placement"]["reason_codes"] == ["NORMAL"]
+    assert "hold_down" not in a["diagnostics"]
     assert a["target_incarnation"] == "training-a:7" and a["resources"]["capacity_domain_id"]
     validate(schemas["batch"], rt.batch())
-    clock.advance(5.0)
-    ir.run_cycle()
-    assert records(rt)[1][0]["placement"]["allowed"] is False  # 2 cycles but < 10 s
+    assert rt.health()["ready"] is True
     clock.advance(5.0)
     ir.run_cycle()
     inst, recs = records(rt)
-    assert recs[0]["placement"]["allowed"] is True and recs[0]["placement"]["multiplier_ppm"] == contract.PPM_FULL
-    assert recs[0]["placement"]["reason_codes"] == ["NORMAL"]
-    assert inst["sequence"] == 3
-    assert rt.health()["ready"] is True
+    assert recs[0]["placement"]["allowed"] is True and inst["sequence"] == 2
     validate(schemas["batch"], rt.batch())
 
 
@@ -101,7 +98,10 @@ def test_t18_same_source_snapshot_repeated_is_not_a_new_sample():
     mod = ScriptedModule(clock)
     rt = make_runtime(clock, {"xi-01": mod})
     ir = rt.instances["xi-01"]
-    ir.run_cycle()
+    mod.push(sb.with_array_states(sb.base_result(), "data1", ["offline"]))
+    ir.run_cycle()  # a deny is in force, so the recovery is held down
+    clock.advance(1.0)
+    ir.run_cycle()  # healthy: the first sample of the hold-down
     first_seq = records(rt)[0]["sequence"]
     for _ in range(4):
         clock.advance(4.0)
@@ -109,6 +109,7 @@ def test_t18_same_source_snapshot_repeated_is_not_a_new_sample():
         ir.run_cycle()
     inst, recs = records(rt)
     assert recs[0]["placement"]["allowed"] is False
+    assert recs[0]["placement"]["reason_codes"][0] == "RECOVERY_HOLD_DOWN"
     assert recs[0]["diagnostics"]["hold_down"]["distinct_cycles"] == 1
     # Audit C-05: a replayed generation is ignored outright — the sequence
     # does not advance and the counter records it.
@@ -233,13 +234,24 @@ def test_t21_flap_resets_the_hold_down():
     ir.run_cycle()
     _, recs = records(rt)
     assert not recs[0]["placement"]["allowed"] and "READ_ONLY" in recs[0]["placement"]["reason_codes"]
-    assert recs[2]["placement"]["allowed"]  # C untouched, no reset for it
+    assert recs[2]["placement"]["allowed"]  # C untouched: no deny in force, so no hold-down for it
     clock.advance(5.0)
     ir.run_cycle()  # healthy again: cycle 1 of the new streak
     _, recs = records(rt)
     assert recs[0]["placement"]["reason_codes"] == ["RECOVERY_HOLD_DOWN"]
+    assert recs[2]["placement"]["reason_codes"] == ["NORMAL"]
     clock.advance(5.0)
     ir.run_cycle()  # cycle 2 but only 5 s
+    assert records(rt)[1][0]["placement"]["allowed"] is False
+    clock.advance(4.0)
+    mod.push(sb.with_array_states(sb.base_result(), "data1", ["online", "initialized", "read_only"]))
+    ir.run_cycle()  # the flap: a deny inside the hold-down resets the streak
+    assert "READ_ONLY" in records(rt)[1][0]["placement"]["reason_codes"]
+    clock.advance(4.0)
+    ir.run_cycle()  # cycle 1 of a new streak
+    assert records(rt)[1][0]["placement"]["reason_codes"] == ["RECOVERY_HOLD_DOWN"]
+    clock.advance(6.0)
+    ir.run_cycle()  # 19 s after the first healthy cycle, but only 6 s into the new streak
     assert records(rt)[1][0]["placement"]["allowed"] is False
     clock.advance(5.0)
     ir.run_cycle()
@@ -251,11 +263,21 @@ def test_t21_expired_lease_requires_a_fresh_hold_down():
     mod = ScriptedModule(clock)
     rt = make_runtime(clock, {"xi-01": mod})
     ir = rt.instances["xi-01"]
-    settle(rt, clock, cycles=3)
-    clock.advance(HOLD_OTHER / 1000.0)  # the allow's hold runs out with no collect (source down)
-    assert records(rt)[1][0]["quality"] == "UNKNOWN"
+    mod.push(sb.with_array_states(sb.base_result(), "data1", ["offline"]))
+    ir.run_cycle()  # a deny is in force
+    clock.advance(5.0)
+    ir.run_cycle()  # healthy: the hold-down starts
+    assert records(rt)[1][0]["placement"]["reason_codes"][0] == "RECOVERY_HOLD_DOWN"
+    clock.advance(25.0)  # the source is silent past the lease (source_max_age_ms 20 s); the deny stays held
     ir.run_cycle()
-    assert records(rt)[1][0]["placement"]["reason_codes"] == ["RECOVERY_HOLD_DOWN"]
+    # Two cycles and 30 s since the first healthy one would satisfy a
+    # hold-down that ignored the lease; the silent gap restarts it instead.
+    a = records(rt)[1][0]
+    assert a["placement"]["reason_codes"][0] == "RECOVERY_HOLD_DOWN"
+    assert a["diagnostics"]["hold_down"]["distinct_cycles"] == 1
+    clock.advance(11.0)
+    ir.run_cycle()
+    assert records(rt)[1][0]["placement"]["allowed"] is True
 
 
 def test_hold_down_parameters_from_profile():
@@ -263,7 +285,11 @@ def test_hold_down_parameters_from_profile():
     mod = ScriptedModule(clock)
     p = make_profile(recovery_hold_down_ms=0, recovery_distinct_cycles=1)
     rt = Runtime(make_config([make_instance()], RuntimeConfig(collect_deadline_ms=200, collect_interval_ms=1000), profile=p), Logger(stream=open("/dev/null", "w")), clock=clock, module_factory=lambda inst: mod)
-    rt.instances["xi-01"].run_cycle()
+    mod.push(sb.with_array_states(sb.base_result(), "data1", ["offline"]))
+    rt.instances["xi-01"].run_cycle()  # a deny is in force
+    assert records(rt)[1][0]["placement"]["allowed"] is False
+    clock.advance(1.0)
+    rt.instances["xi-01"].run_cycle()  # no hold-down time, one cycle: the allow is published at once
     assert records(rt)[1][0]["placement"]["allowed"] is True
 
 
@@ -527,7 +553,7 @@ def test_metrics_text_has_bounded_labels():
     rt.instances["xi-01"].run_cycle()
     text = rt.metrics_text()
     assert 'connector_collect_total{instance="xi-01",result="ok"} 1' in text
-    assert 'connector_assessment_allowed{instance="xi-01",ds_id="0"} 0' in text
+    assert 'connector_assessment_allowed{instance="xi-01",ds_id="0"} 1' in text
 
 
 def test_batch_schema_rejects_a_profile_id_that_cannot_be_pinned(schemas):

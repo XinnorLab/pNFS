@@ -144,7 +144,13 @@ class InstanceSnapshot:
 
 
 class HoldDownTracker:
-    """Re-entry hold-down per (ds_id, binding_generation) (CON-16)."""
+    """Re-entry hold-down per (ds_id, binding_generation) (CON-16).
+
+    It applies only while the verdict in force is a deny (design rule 6): the
+    first allow after a start, an UNKNOWN period or a neutral period is
+    published at once, while an allow that leaves a deny is withheld until
+    ``recovery_distinct_cycles`` distinct source cycles and
+    ``recovery_hold_down_ms`` agree."""
 
     @dataclass
     class _State:
@@ -155,14 +161,26 @@ class HoldDownTracker:
     def __init__(self) -> None:
         self._states: Dict[Tuple[int, int], HoldDownTracker._State] = {}
 
-    def apply(self, a: Assessment, cycle_key: str, now_mono: float, fetched_mono: float, profile: Profile) -> Assessment:
+    def apply(
+        self,
+        a: Assessment,
+        cycle_key: str,
+        now_mono: float,
+        fetched_mono: float,
+        profile: Profile,
+        deny_in_force: bool,
+    ) -> Assessment:
         key = (a.ds_id, a.binding_generation)
-        st = self._states.setdefault(key, HoldDownTracker._State())
         if not a.allowed:
-            st.start_mono = None
-            st.cycles = set()
-            st.lease_expiry_mono = None
+            self._states.pop(key, None)
             return a
+        if not deny_in_force:
+            # Rule 6: only leaving a deny is held down. No deny in force (a
+            # start, an UNKNOWN or neutral period, an allow after an allow)
+            # means there is nothing to protect the placement from.
+            self._states.pop(key, None)
+            return a
+        st = self._states.setdefault(key, HoldDownTracker._State())
         # The previous allow lease expired before this cycle: start over.
         if st.lease_expiry_mono is not None and now_mono > st.lease_expiry_mono:
             st.start_mono = None
@@ -348,7 +366,10 @@ class InstanceRuntime:
                 # checked first) is not a fresh verdict, so a VALID record in a
                 # FAILED snapshot is always a retained one.
                 a = replace(a, quality=contract.QUALITY_UNKNOWN, allowed=False, multiplier_ppm=0)
-            a = self._hold.apply(a, batch.cycle_key, now, batch.fetched_mono, profile)
+            key = self.key_for(b)
+            held = self.store.get(key)
+            deny_in_force = held is not None and held.critical and held.remaining_ms(profile, now) > 0
+            a = self._hold.apply(a, batch.cycle_key, now, batch.fetched_mono, profile, deny_in_force)
             pa = PublishedAssessment(
                 assessment=a,
                 fetched_mono=batch.fetched_mono,
@@ -360,11 +381,17 @@ class InstanceRuntime:
             if a.quality == contract.QUALITY_VALID:
                 # A newer VALID record replaces the verdict at once (rule 2);
                 # its hold counts from its observation (the fetch, when the
-                # policy gave the deny no evidence age).
+                # policy gave the deny no evidence age). A hold-down deny is
+                # the exception (rule 6): it keeps the last critical
+                # observation, so the hold-down never extends the critical hold.
                 critical = not a.allowed
-                origin = batch.fetched_mono - (a.evidence_age_ms or 0) / 1000.0
+                withheld = deny_in_force and a.reason_codes[:1] == ["RECOVERY_HOLD_DOWN"]
+                if withheld and held is not None:
+                    origin = held.hold_origin_mono
+                else:
+                    origin = batch.fetched_mono - (a.evidence_age_ms or 0) / 1000.0
                 pa = replace(pa, hold_ms=profile.hold_ms(critical), hold_origin_mono=origin)
-                self.store.put(self.key_for(b), StoredVerdict(pa, critical=critical, hold_origin_mono=origin, profile_id=pid))
+                self.store.put(key, StoredVerdict(pa, critical=critical, hold_origin_mono=origin, profile_id=pid))
             else:
                 # An UNKNOWN record is no new data (rule 3): the verdict in force stays.
                 pa = self._retained_or_unknown(b, (a.reason_codes or ["NO_ASSESSMENT"])[0], now, fallback=pa)

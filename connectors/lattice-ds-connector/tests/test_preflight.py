@@ -146,12 +146,12 @@ def test_preflight_cli_over_the_socket(tmp_path, capsys):
         server.start()
         try:
             rt.instances["fixture-01"].run_cycle()
-            for _ in range(3):   # hold-down: two distinct cycles
+            for _ in range(3):   # a few more cycles
                 rt.instances["fixture-01"].run_cycle()
             rc = main(["preflight", "--socket", cfg.runtime.socket_path, "--expect-ds", "2"])
             out = capsys.readouterr().out
             assert "ds   2" in out
-            assert rc in (0, 1)   # the fixture may still be in its hold-down; the report itself is what we check
+            assert rc in (0, 1)   # the report itself is what we check
             rc = main(["preflight", "--socket", cfg.runtime.socket_path, "--expect-ds", "2,9", "--json"])
             doc = json.loads(capsys.readouterr().out)
             assert rc == 1 and "UNBOUND:ds9" in doc["reasons"]

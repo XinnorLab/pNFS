@@ -43,9 +43,12 @@ collection error of any kind re-publishes the verdict in force with
 `VERDICT_RETAINED` until its hold runs out, never revokes it. A restarted daemon starts with every DS
 `UNKNOWN` (`NO_ASSESSMENT`).
 
-Re-entry hold-down (CON-16): after start or any deny/UNKNOWN, an allow is
+Re-entry hold-down (CON-16): an allow that leaves a deny in force is
 withheld (`RECOVERY_HOLD_DOWN`) until two *distinct* source cycles agreed
-and 10 s passed; a repeated identical source snapshot is one sample.
+and 10 s passed; a repeated identical source snapshot is one sample. The
+deny it keeps publishing counts its hold from the last critical
+observation. After a start, an UNKNOWN period or a neutral period (no deny
+in force) the first verdict is published at once.
 
 ## Layout
 

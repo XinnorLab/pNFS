@@ -10,8 +10,8 @@ assessment; both MDS of a cluster must run the same digest (LAT-24).
 | Field | Default | Range | Effect |
 |---|---|---|---|
 | `source_max_age_ms` | 20000 | 1000..20000, ≥ 2 × collect interval | the oldest evidence (+ request duration) the policy accepts as fresh; older → `UNKNOWN` / `SOURCE_STALE`. The published TTL now comes from the verdict holds |
-| `recovery_hold_down_ms` | 10000 | 0..600000 | continuous allow interval before an allow is published |
-| `recovery_distinct_cycles` | 2 | 1..10 | distinct source snapshots (`server_epoch:source_generation`) that must agree |
+| `recovery_hold_down_ms` | 10000 | 0..600000 | continuous allow interval before an allow that leaves a deny is published; see [Recovery hold-down](#recovery-hold-down) |
+| `recovery_distinct_cycles` | 2 | 1..10 | distinct source snapshots (`server_epoch:source_generation`) that must agree (same rule) |
 | `critical_hold_ms` | 1200000 | `source_max_age_ms`..3600000 | how long a critical verdict (`allowed: false`) stays in force without a new one; see [Verdict holds](#verdict-holds) |
 | `verdict_hold_ms` | 600000 | `source_max_age_ms`..3600000 | the same for any other verdict (`allowed: true`, any multiplier) |
 | `degraded_multiplier_ppm` | 250000 | 0..1000000 | `degraded` array word and `offline` member |
@@ -36,10 +36,11 @@ that the data store is neutral (multiplier 1 000 000 ppm, the operator's
 capacity domain).
 
 The connector publishes `remaining_ttl_ms` = hold − age. A newer `VALID`
-record replaces the verdict at once; no new data never does: while the source
-gives only `UNKNOWN` records or fails to answer (any collection error,
-retryable or not, including `WORKER_STUCK`), the connector keeps
-re-publishing the verdict in force with `VERDICT_RETAINED` first and the
+record replaces the verdict at once (an allow that leaves a deny goes
+through the [recovery hold-down](#recovery-hold-down) first); no new data
+never does: while the source gives only `UNKNOWN` records or fails to
+answer (any collection error, retryable or not, including `WORKER_STUCK`),
+the connector keeps re-publishing the verdict in force with `VERDICT_RETAINED` first and the
 cause second (the `UNKNOWN` record's first reason or the error code), its
 `observed_at` and age unchanged, so re-publishing never extends the hold.
 When the hold runs out the record turns `UNKNOWN` / `EVIDENCE_EXPIRED`.
@@ -59,6 +60,32 @@ is refused by `validate-config` (`HOLD_RELATION`).
 evidence the policy accepts as fresh when it computes a verdict. Both hold
 fields are part of the profile digest, so changing either changes the
 digest the MDS pins in `ds_connector_expected_profiles`.
+
+## Recovery hold-down
+
+The re-entry hold-down (CON-16) applies **only when the verdict in force is a
+deny**: a critical verdict (`allowed: false`) whose hold has not run out.
+When a fresh `VALID` record allows while such a deny is in force, the
+connector keeps publishing the deny (`allowed: false`, 0 ppm,
+`RECOVERY_HOLD_DOWN` first, the record's other reasons after it,
+`diagnostics.hold_down` with the elapsed time and the cycle count) until
+`recovery_distinct_cycles` distinct source cycles agreed and
+`recovery_hold_down_ms` passed since the first allowing cycle; then the
+allow replaces it. A repeated identical source snapshot is one sample. A
+deny or an `UNKNOWN` record inside the window, or a silence longer than the
+evidence lease (`source_max_age_ms` less the evidence age of the last
+allowing sample), restarts the count.
+
+The deny the hold-down keeps publishing counts its hold **from the last
+critical observation**, not from the healthy samples: its `remaining_ttl_ms`
+keeps shrinking as if no allow had been seen, so the hold-down never extends
+the critical hold (`critical_hold_ms`). Once that hold has run out the deny
+is no longer in force and the next fresh verdict is published at once.
+
+With no deny in force there is nothing to hold down: after a connector start,
+after an `UNKNOWN` period that followed an allow, or after a neutral period
+(the previous verdict's hold ran out) the first fresh verdict is published at
+once. A restart no longer turns into a deny.
 
 ## Array decision table (XMOD-06..08)
 
@@ -169,7 +196,8 @@ one filesystem share one domain (LAT-10); `shared_resource_ids` =
 
 ## Runtime reason codes
 
-`RECOVERY_HOLD_DOWN` (VALID deny during the hold-down), `EVIDENCE_EXPIRED`
+`RECOVERY_HOLD_DOWN` (VALID deny published while an allow leaves a deny in
+force; see [Recovery hold-down](#recovery-hold-down)), `EVIDENCE_EXPIRED`
 (the verdict's hold ran out without a new one; `UNKNOWN`, the MDS places the
 data store neutrally), `NO_ASSESSMENT` (start-up), `SOURCE_UNAVAILABLE` /
 `SOURCE_TIMEOUT` / `COLLECT_IN_FLIGHT` (transport, or a helper that is

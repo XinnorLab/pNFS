@@ -75,8 +75,8 @@ def test_fixture_module_gives_generic_results(served, schemas):
     status, batch = get_json(sock, "/v1/assessments")
     rec = batch["instances"][0]["assessments"][0]
     assert rec["datastore_id"] == "fixture-zfs-01" and rec["target_incarnation"] == "dataset-a-inc-1"
-    assert rec["quality"] == "VALID" and rec["placement"]["allowed"] is False  # hold-down
-    assert rec["placement"]["reason_codes"] == ["RECOVERY_HOLD_DOWN", "FIXTURE_HEALTHY"]
+    assert rec["quality"] == "VALID" and rec["placement"]["allowed"] is True  # no deny in force: no hold-down
+    assert rec["placement"]["reason_codes"] == ["FIXTURE_HEALTHY"]
     assert rec["resources"]["capacity_domain_id"] == "fixture-zfs-01/pool-01"
     assert rec["profile"]["id"] == "fixture-zfs-shaped" and rec["profile"]["digest"].startswith("sha256:")
     assert rec["diagnostics"]["test_only"] is True
@@ -104,9 +104,9 @@ def test_fixture_failure_injection(served):
     ir.run_cycle()
     status, batch = get_json(sock, "/v1/assessments")
     rec = batch["instances"][0]["assessments"][0]
-    # An auth failure no longer revokes: the verdict of the first cycle (the
-    # hold-down deny) is retained, the error code second.
-    assert rec["quality"] == "VALID" and rec["placement"]["allowed"] is False
+    # An auth failure no longer revokes: the verdict of the first cycle is
+    # retained, the error code second.
+    assert rec["quality"] == "VALID" and rec["placement"]["allowed"] is True
     assert rec["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", "SOURCE_AUTH_FAILED"]
     assert batch["instances"][0]["snapshot_status"] == "FAILED"
 
