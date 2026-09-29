@@ -149,7 +149,7 @@ RUNTIME_REASONS = {
     "VERDICT_RETAINED": "the source gave no new verdict; the last observed one is repeated until its hold runs out",
     "RESTORED_FROM_STATE": "the retained verdict was restored from the state file after a connector restart",
     "MODULE_ERROR": "an uncaught module error; UNKNOWN",
-    "WORKER_STUCK": "the collect worker exceeded its restart budget; UNKNOWN until reload",
+    "WORKER_STUCK": "the collect worker exceeded its restart budget; the verdicts in force are retained until their hold runs out, then UNKNOWN, until reload",
     "FIXTURE_HEALTHY": "fixture module: healthy (test only)",
 }
 

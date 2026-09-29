@@ -35,6 +35,10 @@ any other. The MDS keeps a verdict exactly this long without a new one; after
 that the data store is neutral (multiplier 1 000 000 ppm, the operator's
 capacity domain).
 
+The one exception is the deny the recovery hold-down keeps publishing: its
+hold counts from the last critical observation, not from the healthy sample
+it withholds (see [Recovery hold-down](#recovery-hold-down)).
+
 The connector publishes `remaining_ttl_ms` = hold − age. A newer `VALID`
 record replaces the verdict at once (an allow that leaves a deny goes
 through the [recovery hold-down](#recovery-hold-down) first); no new data
@@ -51,7 +55,19 @@ source snapshot is no new data: a `VALID` record the policy still derives
 from it (`IDENTITY_MISMATCH` is checked first) is not published as a fresh
 verdict, so a `VALID` record in a `FAILED` snapshot is always a retained one.
 A rebind (a new `binding_generation`, target or pinned incarnation) drops
-the verdict; a configuration reload that keeps the binding does not.
+the verdict; a configuration reload that keeps the binding does not. A
+verdict keeps the hold it was published with: a reload that changes
+`critical_hold_ms` or `verdict_hold_ms` applies to the next fresh verdict.
+
+A connector restart keeps the verdicts in force through the state file
+(`runtime.state_path`, see the README): at start, before the first
+publication, each verdict whose binding, profile id and data store are
+unchanged and whose hold has not run out by the wall clock (under the
+current profile's hold) is published again as retained, `VERDICT_RETAINED`
+then `RESTORED_FROM_STATE`, with the observation its age counts from as
+`observed_at` (the fetch, for a deny the policy emitted without evidence); a
+critical verdict's hold counts from its last critical observation. A stamp
+in the future (the clock stepped back) counts as age 0.
 
 Both fields range from `source_max_age_ms` up to 3 600 000 (one hour, the
 `remaining_ttl_ms` cap of contract 1.1); a value below `source_max_age_ms`
@@ -85,7 +101,9 @@ is no longer in force and the next fresh verdict is published at once.
 With no deny in force there is nothing to hold down: after a connector start,
 after an `UNKNOWN` period that followed an allow, or after a neutral period
 (the previous verdict's hold ran out) the first fresh verdict is published at
-once. A restart no longer turns into a deny.
+once. A restart no longer turns into a deny. A deny the connector restored
+from its state file is a deny in force: the first fresh allow after that
+restart is held down, counting from the restored critical observation.
 
 ## Array decision table (XMOD-06..08)
 

@@ -4,8 +4,14 @@ verdict per binding, kept across cycles and configuration reloads, dropped
 on a rebind or when its hold runs out.
 
 One store per :class:`~lattice_ds_connector.runtime.Runtime`, shared by
-every instance worker; a binding's key belongs to exactly one instance, so
-workers never contend for the same entry. The lock makes each call atomic.
+every instance worker; a binding's key belongs to one configured instance.
+During a reload the replaced worker and its successor briefly overlap (the
+new one starts before the old one's bounded stop returns); a stopped worker
+stores nothing, so only the successor writes the key after that. The lock
+makes each call atomic; it does not order two workers' puts.
+
+The runtime persists the store in the state file (:mod:`.state`); the file
+takes only the entries whose hold has not run out, whatever lingers here.
 """
 
 from __future__ import annotations
@@ -30,7 +36,8 @@ class VerdictKey:
 @dataclass(frozen=True)
 class StoredVerdict:
     #: The VALID record as published (after normalisation and hold-down):
-    #: a ``runtime.PublishedAssessment``.
+    #: a ``runtime.PublishedAssessment``. Its ``hold_ms`` is the verdict's
+    #: hold, fixed when the verdict was stored.
     published: Any
     #: ``allowed: false`` — held for ``critical_hold_ms``, otherwise ``verdict_hold_ms``.
     critical: bool
@@ -40,10 +47,15 @@ class StoredVerdict:
     #: Restored from the state file after a connector restart.
     restored: bool = False
 
-    def remaining_ms(self, profile, now_mono: float) -> int:
-        """Hold left at ``now_mono``; an origin in the future counts as age 0."""
+    def remaining_ms(self, now_mono: float) -> int:
+        """Hold left at ``now_mono``; an origin in the future counts as age 0.
+
+        The hold is the one the verdict was published with
+        (``published.hold_ms``), not the current profile's: the store and the
+        published ``remaining_ttl_ms`` give one answer, and a changed hold
+        takes effect with the next fresh verdict."""
         held = int((now_mono - self.hold_origin_mono) * 1000)
-        return max(0, profile.hold_ms(self.critical) - max(0, held))
+        return max(0, self.published.hold_ms - max(0, held))
 
 
 class VerdictStore:

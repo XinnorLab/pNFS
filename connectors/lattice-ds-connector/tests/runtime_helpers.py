@@ -84,12 +84,17 @@ def make_config(instances, runtime: Optional[RuntimeConfig] = None, profile=None
     return Config(config_version="1.0", test_mode=True, runtime=runtime or RuntimeConfig(collect_deadline_ms=200, collect_interval_ms=1000), profiles={p.id: p}, instances=tuple(instances), digest="sha256:" + "0" * 64)
 
 
-def make_runtime(clock: FakeClock, modules: dict, instances=None, runtime_cfg=None, wall_clock=None, logger=None) -> Runtime:
+def make_runtime(clock: FakeClock, modules: dict, instances=None, runtime_cfg=None, wall_clock=None, logger=None, profile=None) -> Runtime:
+    """``wall_clock`` (() -> aware UTC datetime) dates the state file; None
+    is the real clock."""
     instances = instances or [make_instance()]
-    # ``wall_clock`` is passed through only when given: the runtime takes it
-    # once the state file needs a UTC clock.
-    extra = {} if wall_clock is None else {"wall_clock": wall_clock}
-    return Runtime(make_config(instances, runtime_cfg), logger or Logger(stream=open("/dev/null", "w")), clock=clock, module_factory=lambda inst: modules[inst.id], **extra)
+    return Runtime(
+        make_config(instances, runtime_cfg, profile=profile),
+        logger or Logger(stream=open("/dev/null", "w")),
+        clock=clock,
+        module_factory=lambda inst: modules[inst.id],
+        wall_clock=wall_clock,
+    )
 
 
 def records(rt: Runtime, iid: str = "xi-01"):

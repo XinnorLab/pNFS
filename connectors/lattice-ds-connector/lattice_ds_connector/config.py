@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from . import contract
 from .paths import is_canonical, normalize, path_contains
+from .state import DEFAULT_STATE_PATH
 
 CONFIG_VERSION = "1.0"
 SUPPORTED_MODULES = ("xinas", "fixture")
@@ -70,8 +71,14 @@ class RuntimeConfig:
     max_ds: int = contract.MAX_DS_PER_MDS
     max_instances: int = contract.MAX_INSTANCES
     max_batch_bytes: int = contract.MAX_BATCH_BYTES
-    #: Restarts of a stuck worker per hour before the instance stays UNKNOWN.
+    #: Restarts of a stuck worker per hour before the instance publishes
+    #: WORKER_STUCK (its retained verdicts, then UNKNOWN) until a reload.
     worker_restart_limit: int = 3
+    #: The verdict state file (smart verdict retention design §4.4); None
+    #: disables persistence. The parser defaults an absent key to
+    #: ``state.DEFAULT_STATE_PATH``; the dataclass default is None so a
+    #: hand-built configuration (tests, fixtures) never touches /var/lib.
+    state_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +315,15 @@ def _parse_runtime(c: _Collector, raw: Dict[str, Any]) -> RuntimeConfig:
     if group is not None and (not isinstance(group, str) or not group):
         c.error("TYPE", f"{path}.socket_group", "must be a group name")
         group = None
+    # Absent: the unit's StateDirectory; null: no state file.
+    state_path = raw.get("state_path", DEFAULT_STATE_PATH)
+    if state_path is not None:
+        if not isinstance(state_path, str):
+            c.error("TYPE", f"{path}.state_path", "must be an absolute path or null")
+            state_path = None
+        elif not state_path.startswith("/") or state_path.endswith("/"):
+            c.error("RANGE", f"{path}.state_path", "must be an absolute file path (or null to disable the state file)")
+            state_path = None
     return RuntimeConfig(
         socket_path=socket_path,
         socket_group=group,
@@ -317,6 +333,7 @@ def _parse_runtime(c: _Collector, raw: Dict[str, Any]) -> RuntimeConfig:
         max_instances=_int(c, raw, "max_instances", path, d.max_instances, 1, contract.MAX_INSTANCES) or d.max_instances,
         max_batch_bytes=_int(c, raw, "max_batch_bytes", path, d.max_batch_bytes, 4096, contract.MAX_BATCH_BYTES) or d.max_batch_bytes,
         worker_restart_limit=_int(c, raw, "worker_restart_limit", path, d.worker_restart_limit, 0, 100) or d.worker_restart_limit,
+        state_path=state_path,
     )
 
 

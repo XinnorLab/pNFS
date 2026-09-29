@@ -6,6 +6,7 @@ dropped on a rebind or when its hold runs out."""
 
 import threading
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -200,14 +201,16 @@ def _key(ds_id=0):
     return VerdictKey("xi-01", ds_id, 1, "training-a", "training-a:7")
 
 
-def test_stored_verdict_remaining_uses_the_class_hold():
-    p = make_profile()
-    crit = StoredVerdict(published=None, critical=True, hold_origin_mono=100.0, profile_id=p.id)
-    other = replace(crit, critical=False)
-    assert crit.remaining_ms(p, 100.0) == HOLD_CRIT and other.remaining_ms(p, 100.0) == HOLD_OTHER
-    assert other.remaining_ms(p, 100.0 + HOLD_OTHER / 1000.0) == 0
-    assert crit.remaining_ms(p, 100.0 + HOLD_OTHER / 1000.0) == HOLD_CRIT - HOLD_OTHER
-    assert crit.remaining_ms(p, 90.0) == HOLD_CRIT       # an origin in the future counts as age 0
+def test_stored_verdict_remaining_uses_the_stored_hold():
+    # The hold the verdict was published with -- not the current profile's:
+    # the store and the published TTL give one answer (a changed hold takes
+    # effect with the next fresh verdict).
+    crit = StoredVerdict(published=SimpleNamespace(hold_ms=HOLD_CRIT), critical=True, hold_origin_mono=100.0, profile_id="xinas-mvp")
+    other = replace(crit, published=SimpleNamespace(hold_ms=HOLD_OTHER), critical=False)
+    assert crit.remaining_ms(100.0) == HOLD_CRIT and other.remaining_ms(100.0) == HOLD_OTHER
+    assert other.remaining_ms(100.0 + HOLD_OTHER / 1000.0) == 0
+    assert crit.remaining_ms(100.0 + HOLD_OTHER / 1000.0) == HOLD_CRIT - HOLD_OTHER
+    assert crit.remaining_ms(90.0) == HOLD_CRIT       # an origin in the future counts as age 0
 
 
 def test_store_version_bumps_on_put_and_real_drop_only():
@@ -415,3 +418,43 @@ def test_hold_down_deny_keeps_the_critical_origin_in_the_store():
     allow = rt.verdicts.get(key)
     assert allow.critical is False and allow.hold_origin_mono > crit.hold_origin_mono
     assert allow.published.assessment.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# R4: the store is what the state file persists
+# ---------------------------------------------------------------------------
+
+
+def test_a_stopped_worker_stores_nothing():
+    # Runtime.reload stops a replaced worker with a bounded join; with a 2 s
+    # collect deadline the old worker can still finish its cycle after the
+    # reload dropped the keys of the old binding. It must not store them again.
+    clock, mod, rt = healthy_rt()
+    old = rt.instances["xi-01"]
+    rt.reload(rebind(rt.config, ds_id=0, generation=2))
+    assert not any(k.ds_id == 0 and k.binding_generation == 1 for k in rt.verdicts.keys())
+    version = rt.verdicts.version
+    clock.advance(5.0)
+    old.run_cycle()                                           # the late finish of the stopped worker
+    assert not any(k.ds_id == 0 and k.binding_generation == 1 for k in rt.verdicts.keys())
+    assert rt.verdicts.version == version
+
+
+def test_a_changed_hold_applies_to_the_next_fresh_verdict():
+    clock, mod, rt = healthy_rt()                             # allows, held 10 min
+    p = make_profile(verdict_hold_ms=300_000)
+    rt.reload(replace(rt.config, profiles={p.id: p}))        # the instance is recreated on the new profile
+    ir = rt.instances["xi-01"]
+    key = ir.key_for(ir.instance.bindings[0])
+    mod.push(error=CollectionError("SOURCE_TIMEOUT", "t", retryable=True))
+    clock.advance(400.0)                                      # past the new hold, inside the published one
+    ir.run_cycle()
+    a = records(rt)[1][0]
+    assert a["quality"] == "VALID" and a["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", "SOURCE_TIMEOUT"]
+    assert a["remaining_ttl_ms"] == HOLD_OTHER - a["evidence_age_ms"]
+    assert abs(rt.verdicts.get(key).remaining_ms(clock()) - a["remaining_ttl_ms"]) <= 1
+    clock.advance(5.0)
+    ir.run_cycle()                                            # a fresh verdict takes the new hold
+    a = records(rt)[1][0]
+    assert a["placement"]["reason_codes"] == ["NORMAL"]
+    assert a["remaining_ttl_ms"] == 300_000 - a["evidence_age_ms"]

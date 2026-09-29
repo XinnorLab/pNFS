@@ -168,6 +168,40 @@ def test_limits(token_file, tmp_path):
     assert ("LIMIT", "instances") in errors_of(doc)
 
 
+def test_state_path_defaults_to_the_state_directory(token_file, tmp_path):
+    from lattice_ds_connector.config import RuntimeConfig
+    from lattice_ds_connector.state import DEFAULT_STATE_PATH
+    doc = example(token_file, tmp_path)
+    doc["runtime"].pop("state_path", None)
+    config, issues = validate_config_dict(doc)
+    assert config is not None, issues
+    assert config.runtime.state_path == DEFAULT_STATE_PATH == "/var/lib/lattice-ds-connector/verdicts.json"
+    assert RuntimeConfig().state_path is None          # the dataclass default: no persistence (tests)
+
+
+def test_state_path_null_disables_persistence(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    doc["runtime"]["state_path"] = None
+    config, issues = validate_config_dict(doc)
+    assert config is not None, issues
+    assert config.runtime.state_path is None
+
+
+def test_state_path_explicit(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    doc["runtime"]["state_path"] = str(tmp_path / "verdicts.json")
+    config, issues = validate_config_dict(doc)
+    assert config is not None, issues
+    assert config.runtime.state_path == str(tmp_path / "verdicts.json")
+
+
+@pytest.mark.parametrize("value, code", [("verdicts.json", "RANGE"), ("var/lib/x.json", "RANGE"), ("", "RANGE"), (5, "TYPE"), (True, "TYPE")])
+def test_state_path_must_be_absolute(token_file, tmp_path, value, code):
+    doc = example(token_file, tmp_path)
+    doc["runtime"]["state_path"] = value
+    assert (code, "runtime.state_path") in errors_of(doc)
+
+
 def test_load_config_reports_every_error_at_once(tmp_path):
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"config_version": "1.0", "runtime": {"collect_deadline_ms": 9000}, "profiles": [], "instances": [{"id": "x", "module": "zfs", "bindings": []}]}))

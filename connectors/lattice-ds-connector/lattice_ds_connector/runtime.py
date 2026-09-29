@@ -18,6 +18,12 @@ record replaces it; no new data -- an UNKNOWN record or a collection error of
 any kind -- never does: the stored verdict is re-published with
 ``VERDICT_RETAINED`` until its hold runs out, then the binding reads UNKNOWN.
 
+The state file (design §4.4, :mod:`.state`): the runtime writes the store
+after the cycles that change it, at most once per ``collect_interval_ms``, and
+once more on stop; at start it restores the verdicts still in force before
+the first publication (``VERDICT_RETAINED``, ``RESTORED_FROM_STATE``). A bad
+or unwritable file costs persistence, never the start or a cycle.
+
 Publication is atomic: a worker builds a complete immutable
 :class:`InstanceSnapshot` and swaps it in under a lock; a reader never sees
 records from two cycles. ``GET /v1/assessments`` only reads snapshots and
@@ -34,9 +40,9 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import contract
+from . import contract, state
 from .config import Binding, Config, Instance, Profile
 from .log import Logger
 from .modules import create_module
@@ -230,11 +236,15 @@ class InstanceRuntime:
         jitter=None,
         incarnation: int = 0,
         store: Optional[VerdictStore] = None,
+        on_change: Optional[Callable[[], None]] = None,
     ):
         self.instance = instance
         #: The runtime's verdict store (shared by all instances; a private one
         #: when the instance runs on its own, e.g. in a unit test).
         self.store = store if store is not None else VerdictStore()
+        #: Called after every cycle and collection error: the runtime saves
+        #: the store to the state file (rate-bounded; it never raises here).
+        self._on_change = on_change
         self.profile = profile
         self.cfg = runtime_cfg
         self.log = logger
@@ -295,7 +305,7 @@ class InstanceRuntime:
         key = self.key_for(b)
         held = self.store.get(key)
         if held is not None:
-            if held.remaining_ms(self.profile or fixture_profile(), now) > 0:
+            if held.remaining_ms(now) > 0:
                 return replace(held.published, retained=True, restored=held.restored, retained_cause=cause)
             self.store.drop(key, expected=held)
         if fallback is not None:
@@ -368,7 +378,7 @@ class InstanceRuntime:
                 a = replace(a, quality=contract.QUALITY_UNKNOWN, allowed=False, multiplier_ppm=0)
             key = self.key_for(b)
             held = self.store.get(key)
-            deny_in_force = held is not None and held.critical and held.remaining_ms(profile, now) > 0
+            deny_in_force = held is not None and held.critical and held.remaining_ms(now) > 0
             a = self._hold.apply(a, batch.cycle_key, now, batch.fetched_mono, profile, deny_in_force)
             pa = PublishedAssessment(
                 assessment=a,
@@ -391,7 +401,11 @@ class InstanceRuntime:
                 else:
                     origin = batch.fetched_mono - (a.evidence_age_ms or 0) / 1000.0
                 pa = replace(pa, hold_ms=profile.hold_ms(critical), hold_origin_mono=origin)
-                self.store.put(key, StoredVerdict(pa, critical=critical, hold_origin_mono=origin, profile_id=pid))
+                if not self._stop.is_set():
+                    # A stopped worker stores nothing: a reload replaced it and
+                    # its bounded stop may have returned while this cycle was
+                    # still collecting -- the reload may have dropped this key.
+                    self.store.put(key, StoredVerdict(pa, critical=critical, hold_origin_mono=origin, profile_id=pid))
             else:
                 # An UNKNOWN record is no new data (rule 3): the verdict in force stays.
                 pa = self._retained_or_unknown(b, (a.reason_codes or ["NO_ASSESSMENT"])[0], now, fallback=pa)
@@ -421,6 +435,82 @@ class InstanceRuntime:
             allowed=sum(1 for r in records if r.assessment.allowed),
             bound=len(records),
         )
+        self._changed()
+
+    def _changed(self) -> None:
+        """Hand the (possibly) changed store to the runtime's state writer.
+        A stopped worker has nothing to persist; a writer failure never
+        reaches the cycle."""
+        if self._on_change is None or self._stop.is_set():
+            return
+        try:
+            self._on_change()
+        except Exception as exc:  # pragma: no cover - save_state catches its own errors
+            self.log.limited("warn", "state_save_failed", f"{self.instance.id}:state", instance=self.instance.id, error=f"{exc.__class__.__name__}: {exc}")
+
+    # --- the state file -----------------------------------------------------
+
+    def restore(self, b: Binding, entry: Dict[str, Any], observed_at: str, obs_age_ms: int, hold_age_ms: int) -> Optional[str]:
+        """Put a verdict read from the state file into the store (design
+        §4.4): the stored verdict as a VALID record whose evidence is
+        ``obs_age_ms`` old and whose hold -- the current profile's for its
+        class, so the published TTL and the store agree -- started
+        ``hold_age_ms`` ago. ``entry`` passed ``state.check_entry``.
+
+        Returns None when restored, else why not: PROFILE_MISMATCH (another
+        profile id), DATASTORE_MISMATCH (the instance now names another data
+        store), EXPIRED (the hold ran out by the wall clock), INVALID (the
+        CON-06 invariants reject the record)."""
+        now = self._clock()
+        pid, pver, pdig, max_age = self._profile_triplet()
+        if entry["profile_id"] != pid:
+            return "PROFILE_MISMATCH"
+        if entry["datastore_id"] != self._datastore_id(b):
+            return "DATASTORE_MISMATCH"
+        critical = bool(entry["critical"])
+        hold_ms = (self.profile or fixture_profile()).hold_ms(critical)
+        if hold_age_ms >= hold_ms:
+            return "EXPIRED"
+        a = Assessment(
+            ds_id=b.ds_id,
+            binding_generation=b.binding_generation,
+            datastore_id=entry["datastore_id"],
+            target_id=b.target_id,
+            target_incarnation=entry.get("target_incarnation"),
+            quality=contract.QUALITY_VALID,
+            allowed=entry["allowed"],
+            multiplier_ppm=entry["multiplier_ppm"],
+            reason_codes=list(entry["reason_codes"]),
+            observed_at=observed_at,
+            evidence_age_ms=obs_age_ms,
+            capacity_domain_id=entry.get("capacity_domain_id"),
+            shared_resource_ids=list(entry["shared_resource_ids"]),
+        ).normalized()
+        if a.quality != contract.QUALITY_VALID or a.allowed != entry["allowed"]:
+            return "INVALID"
+        origin = now - hold_age_ms / 1000.0
+        pa = PublishedAssessment(
+            assessment=a,
+            fetched_mono=now,
+            source_max_age_ms=max_age,
+            profile_id=pid,
+            profile_version=pver,
+            profile_digest=pdig,
+            hold_ms=hold_ms,
+            hold_origin_mono=origin,
+            restored=True,
+        )
+        self.store.put(self.key_for(b), StoredVerdict(pa, critical=critical, hold_origin_mono=origin, profile_id=pid, restored=True))
+        return None
+
+    def republish_from_store(self) -> None:
+        """Rebuild the start-up snapshot (sequence 0, never published by a
+        cycle yet) from the store, so the first publication already carries
+        the restored verdicts."""
+        with self._lock:
+            if self._sequence != 0:
+                return
+        self._publish(self._no_data_snapshot("NO_ASSESSMENT", contract.SNAPSHOT_FAILED, publish=False))
 
     def _collect_bounded(self, deadline_s: float) -> Tuple[SourceBatch, List[Assessment]]:
         """Run module.collect AND module.evaluate in one helper thread bounded
@@ -483,6 +573,7 @@ class InstanceRuntime:
             retained=sum(1 for pa in snap.assessments if pa.retained),
             alert=not exc.retryable,
         )
+        self._changed()
 
     # --- worker thread ------------------------------------------------------
 
@@ -582,9 +673,12 @@ class BatchTooLarge(Exception):
 class Runtime:
     """All instances of one configuration; owns the epoch and the batch."""
 
-    def __init__(self, config: Config, logger: Optional[Logger] = None, clock=time.monotonic, module_factory=None):
+    def __init__(self, config: Config, logger: Optional[Logger] = None, clock=time.monotonic, module_factory=None, wall_clock=None):
         self.log = logger or Logger()
         self._clock = clock
+        #: () -> aware UTC datetime; dates the state file (monotonic time does
+        #: not survive a restart).
+        self._wall = wall_clock or (lambda: datetime.now(timezone.utc))
         self._module_factory = module_factory
         self.started_at = utc_now()
         self.runtime_epoch = f"{socket.gethostname()}:{self.started_at}:{os.getpid()}"
@@ -592,9 +686,16 @@ class Runtime:
         self.config = config
         self.instances: Dict[str, InstanceRuntime] = {}
         self._incarnations: Dict[str, int] = {}
-        #: The verdicts of every binding; survives reloads (design §4.2).
+        #: The verdicts of every binding; survives reloads (design §4.2) and,
+        #: through the state file, restarts (§4.4).
         self.verdicts = VerdictStore()
+        # The state writer: one write at a time, at most one per interval.
+        self._save_lock = threading.Lock()
+        self._saved_version = -1
+        self._last_save_mono: Optional[float] = None
         self._build_instances(config)
+        if config.runtime.state_path:
+            self._restore_state()
         self._running = False
 
     def _make(self, inst: Instance, config: Config) -> InstanceRuntime:
@@ -611,6 +712,7 @@ class Runtime:
             clock=self._clock,
             incarnation=incarnation,
             store=self.verdicts,
+            on_change=self.save_state,
         )
 
     def _build_instances(self, config: Config) -> None:
@@ -630,6 +732,8 @@ class Runtime:
             self._running = False
             for ir in self.instances.values():
                 ir.stop(max(0.1, deadline - self._clock()))
+        # The last change a cycle made inside the rate bound is not lost.
+        self.save_state(force=True)
         self.log.info("runtime_stopped")
 
     def reload(self, config: Config) -> None:
@@ -659,7 +763,10 @@ class Runtime:
             for iid, prev in old.items():
                 if iid not in new:
                     prev.stop(2.0)
-            # After the old workers stopped, so none of them re-stores a stale key.
+            # After the old workers were told to stop. A bounded stop can return
+            # while a worker is still collecting; it finishes that cycle but
+            # stores nothing once stopped (run_cycle), and the state writer
+            # takes configured bindings only.
             configured = {InstanceRuntime.static_key(inst.id, b) for inst in config.instances for b in inst.bindings}
             for k in self.verdicts.keys():
                 if k not in configured:
@@ -667,6 +774,96 @@ class Runtime:
             self.instances = new
             self.config = config
         self.log.info("config_reloaded", config_digest=config.digest, instances=len(self.instances))
+
+    # --- the state file (design §4.4) ----------------------------------------
+
+    def _restore_state(self) -> None:
+        """Load the state file once, before the first publication. An entry
+        comes back only when it is well-formed, its key matches a configured
+        binding exactly, its profile id is the binding's and its hold has not
+        run out by the wall clock under the current profile. Nothing here can
+        stop the start."""
+        path = self.config.runtime.state_path
+        outcome: Dict[str, int] = {}
+        try:
+            entries, warning = state.load(path)
+            if warning:
+                self.log.warn("state_file_ignored", path=path, reason=warning)
+            now_wall = self._wall()
+            bound = {InstanceRuntime.static_key(inst.id, b): (inst.id, b) for inst in self.config.instances for b in inst.bindings}
+            invalid: Optional[str] = None
+            for e in entries:
+                why = state.check_entry(e)
+                if why is not None:
+                    invalid = invalid or why
+                    why = "INVALID"
+                else:
+                    why = self._restore_entry(e, bound, now_wall)
+                outcome[why or "RESTORED"] = outcome.get(why or "RESTORED", 0) + 1
+            if outcome:
+                restored = outcome.pop("RESTORED", 0)
+                self.log.info("state_restored", path=path, restored=restored, skipped=outcome, first_invalid=invalid)
+        except Exception as exc:  # noqa: BLE001 - a bad file costs the restore, never the start
+            self.log.warn("state_restore_failed", path=path, error=f"{exc.__class__.__name__}: {exc}")
+        for ir in self.instances.values():
+            ir.republish_from_store()
+
+    def _restore_entry(self, e: Dict[str, Any], bound: Dict[VerdictKey, Tuple[str, Binding]], now_wall: datetime) -> Optional[str]:
+        key = VerdictKey(e["instance"], e["ds_id"], e["binding_generation"], e["target_id"], e.get("expected_target_incarnation"))
+        if key not in bound:
+            return "UNBOUND"                   # removed, rebound or another target/incarnation (rule 5)
+        if self.verdicts.get(key) is not None:
+            return "DUPLICATE"
+        iid, b = bound[key]
+        observed = state.parse_utc(e["observed_at"])
+        # The hold of a critical verdict counts from its last critical
+        # observation -- never later than its observation (a hold-down deny
+        # carries the earlier one); any other verdict's from its observation.
+        origin = observed
+        if e["critical"]:
+            crit = state.parse_utc(e.get("critical_observed_at"))
+            if crit is not None and crit < observed:
+                origin = crit
+        # A stamp in the future (the clock stepped back) counts as age 0, so
+        # the remaining hold is at most the full hold.
+        obs_age_ms = max(0, int(round((now_wall - observed).total_seconds() * 1000)))
+        hold_age_ms = max(0, int(round((now_wall - origin).total_seconds() * 1000)))
+        return self.instances[iid].restore(b, e, state.iso(min(observed, now_wall)), obs_age_ms, hold_age_ms)
+
+    def save_state(self, force: bool = False) -> None:
+        """Write the store to the state file: after a change, at most once
+        per ``collect_interval_ms`` (``force``: now, e.g. on stop). Only
+        entries of configured bindings whose hold has not run out are
+        written. A failure is a WARN and ``connector_state_write_errors_total``;
+        the runtime carries on with its in-memory store. Called from every
+        worker thread: one write at a time, and a worker never waits for
+        another's write (the next cycle carries its change)."""
+        path = self.config.runtime.state_path
+        if not path:
+            return
+        if not (self._save_lock.acquire(timeout=2.0) if force else self._save_lock.acquire(blocking=False)):
+            return
+        try:
+            now = self._clock()
+            version = self.verdicts.version
+            if not force:
+                if version == self._saved_version:
+                    return
+                if self._last_save_mono is not None and (now - self._last_save_mono) * 1000 < self.config.runtime.collect_interval_ms:
+                    return
+            try:
+                now_wall = self._wall()
+                configured = {InstanceRuntime.static_key(inst.id, b) for inst in self.config.instances for b in inst.bindings}
+                items = sorted(self.verdicts.items(), key=lambda kv: (kv[0].instance, kv[0].ds_id, kv[0].binding_generation))
+                entries = [state.entry_from(k, v, now, now_wall) for k, v in items if k in configured and v.remaining_ms(now) > 0]
+                state.save(path, entries, self.runtime_epoch, now_wall)
+            except Exception as exc:  # noqa: BLE001 - OSError above all; nothing may reach a worker
+                self.log.counters.inc("connector_state_write_errors_total", {})
+                self.log.limited("warn", "state_write_failed", "state:write", path=path, error=f"{exc.__class__.__name__}: {exc}")
+            self._saved_version = version
+            self._last_save_mono = now
+        finally:
+            self._save_lock.release()
 
     # --- outputs ------------------------------------------------------------
 
