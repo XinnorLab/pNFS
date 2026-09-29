@@ -75,6 +75,17 @@ entry when it lands.
 
 ## Smart verdict retention (design `docs/superpowers/specs/2026-09-29-smart-verdict-retention-design.md`)
 
+- **The MDS patch series does not carry verdict retention yet.**
+  `mds/manifest.json` still pins `fork_sha` 639b6c5 and `mds/patches/6b4dcde/`
+  has no retention patches, while the contract manifest (1.3) and the
+  connector's contract 1.1 describe the retention rows, metrics and TTLs
+  up to one hour.  Deferred on purpose: the fork branch
+  `xinnor/smart-verdict-retention` is not merged, and an export now would
+  pin an unmerged SHA.  Done = after the fork PR merges into
+  `xinnor/placement-modes`, run `scripts/export-patches.sh <fork checkout>`
+  for the merged branch in the pNFS PR (or one merged together with it),
+  so `mds/manifest.json` `fork_sha` and `mds/patches/` match; the pNFS PR
+  merges only after that (`scripts/check-manifests.py` ok).
 - **The stand trial (R10) has not run.** Verdict retention is proven by
   unit tests and the fork CI, not on the lab.  Done = the design §9 stand
   rows on node223/node225 with the shortened holds (`critical_hold_ms =

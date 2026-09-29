@@ -144,8 +144,8 @@ Validation (`config.c`, fatal at startup, every error printed with its key):
   seen both; before that, both are UNKNOWN and excluded). In `smart`, the
   domain comes from the connector's `capacity_domain_id` while a verdict
   is in force; an operator map that disagrees is `DOMAIN_MAP_MISMATCH`
-  for those DS (UNKNOWN, excluded, logged), not a startup failure — the
-  connector may be updated first. Amended 2026-09-29: without a verdict
+  for those DS (excluded with that reason and logged — not neutral), not
+  a startup failure — the connector may be updated first. Amended 2026-09-29: without a verdict
   in force (neutral) the operator's map is the only declaration, so an
   alias pair declared only by the connector's domain is undeclared then
   and is `SHARED_FS_ALIAS_UNMAPPED`; declare `ds_capacity_domain.<id>`

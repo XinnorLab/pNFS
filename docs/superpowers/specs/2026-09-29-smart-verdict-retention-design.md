@@ -279,9 +279,17 @@ In `smart`, per data store after the capacity gate:
 
 ## 8. Rollout and compatibility
 
-- **MDS first.** The new MDS with the current connector (contract 1.0, TTL 20 s, `UNKNOWN` on
-  failure) is safe: verdicts are held for the connector's 20 s and the data store is
-  neutral afterwards instead of refused.
+- **MDS first, the connector right after it on each host.** The new MDS with the current
+  connector (contract 1.0, TTL 20 s, `UNKNOWN` on failure) holds verdicts for the
+  connector's 20 s and places the data store neutrally afterwards instead of refusing it —
+  with one exception: the current connector gives a TTL only to records that carry an
+  evidence age, so it publishes the evidence-less denies `SHARE_ABSENT` and
+  `IDENTITY_MISMATCH` as `UNKNOWN` (`EVIDENCE_EXPIRED`). The old MDS refused on those; the
+  new MDS places that data store neutrally. On an MDS without profile pins, for as long as
+  that pairing runs, a data store whose share was deleted or whose binding names the wrong
+  controller receives new files. Hence the connector upgrade on a host follows its MDS
+  upgrade at once. (With the pins updated in the same window, the MDS rejects every record
+  of the old connector anyway and every data store is neutral until the new connector runs.)
 - **Connector second.** The new connector with an old MDS (Stage C) is accepted (TTL ≤ 1 h),
   holds denies for their hold, but that MDS still refuses on `UNKNOWN` — do not run that
   pairing on purpose.

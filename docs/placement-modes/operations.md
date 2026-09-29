@@ -197,11 +197,21 @@ Design: `docs/superpowers/specs/2026-09-29-smart-verdict-retention-design.md`.
 The MDS build, the connector (contract 1.1) and the helper change
 together; this is the order.
 
-1. **MDS first, connector second.** Upgrade the MDS build on every host
-   first (see "The switch, step by step" for the restart). The new MDS
-   with the *current* connector (contract 1.0, 20 s TTLs, `UNKNOWN` on
-   failure) is safe: verdicts are held for the connector's 20 s and the DS
-   is neutral afterwards instead of refused. Then upgrade the connector.
+1. **MDS first, the connector right after it, host by host.** Upgrade
+   the MDS build on a host (see "The switch, step by step" for the
+   restart), then the connector on that host. The new MDS with the
+   *current* connector (contract 1.0, 20 s TTLs, `UNKNOWN` on failure)
+   holds verdicts for the connector's 20 s and places the DS neutrally
+   afterwards instead of refusing it, with one exception: the current
+   connector publishes the denies that carry no evidence time
+   (`SHARE_ABSENT`, `IDENTITY_MISMATCH`) as `UNKNOWN`
+   (`EVIDENCE_EXPIRED`). The old MDS refused on those; the new MDS places
+   that DS neutrally. On an MDS without profile pins, for as long as that
+   pairing runs, a DS whose share was deleted or whose binding names the
+   wrong controller receives new files, so do not leave a host in it.
+   (With the pins of step 2 the MDS rejects every record of the old
+   connector anyway, and every DS is neutral until the new connector
+   runs.)
    The reverse pairing — the new connector with an old MDS — is accepted
    (TTL up to 1 h) and holds denies for their hold, but that MDS still
    refuses on `UNKNOWN`: do not run it on purpose. Upgrade the
@@ -240,7 +250,13 @@ together; this is the order.
    need another path.** The key changes `config_digest`, so a pinned
    `ds_connector_expected_config_digest` would need re-pinning on every MDS;
    without the key the default path
-   (`/var/lib/lattice-ds-connector/verdicts.json`) applies.
+   (`/var/lib/lattice-ds-connector/verdicts.json`) applies. The same holds
+   for explicit `critical_hold_ms` / `verdict_hold_ms` in a profile of
+   `config.json` (the lab's shortened holds, for one): they change
+   `config_digest` (it is over the document, so even the default values
+   do) and, with other values, the profile digest. Re-pin
+   `ds_connector_expected_config_digest` on every MDS as well as the
+   profile digests of step 2, or the MDS drops every batch.
 5. **Re-gate scripts on steering, and do not read a dead connector off
    `verify`.** `mode verify` exits 0 for a smart cluster that is not
    steering (`STEERING_OFF`, `CONNECTOR_UNREACHABLE` are warnings). A
@@ -258,7 +274,7 @@ together; this is the order.
 
 - A `lattice-ds-connector` unit on **every** MDS host to steer (each MDS
   reads only its local socket; an MDS without one reports `coverage=none`
-  and places every DS neutrally, by its fill weight — `verify` warns
+  and places every DS neutrally — `verify` warns
   `STEERING_OFF` and `--require-full-coverage` fails).
 - The same connector configuration on every host (same
   `config_digest`); `verify` compares the digests the MDS report. After
@@ -271,18 +287,34 @@ together; this is the order.
 
 `smart` steers placement; it does not decide whether a data store is
 usable. A DS without a **verdict in force** is *neutral*: it is placed as
-in `fill` — multiplier 1 000 000 ppm, the operator's capacity domain
-(`ds_capacity_domain.<id>`, else `ds:<id>`), the `fill` weight. The
+in `fill` — multiplier 1 000 000 ppm on the base weight of the
+operator's capacity domain (`ds_capacity_domain.<id>`, else `ds:<id>`):
+the fill level, or, with `placement_allow_manual_base_weights`, that
+domain's `placement_domain_weight.<domain>`. Under manual weights,
+declare them for these operator domains too, or a neutral DS falls back
+to the fill scale (1..100), which does not compare with manual weights
+(1..10 000). The
 gates the MDS owns still apply to a neutral DS exactly as in `fill`: the
 DS state (`ONLINE`, not admin-excluded), the capacity gate (`statvfs` of
 the back-mount, `placement_min_free_bytes`, observation freshness) and
 the alias grades. A dead or full DS still drops out through them; a
 connector that is down cannot take a healthy DS out of service.
 
-A DS is neutral when the connector has no binding for it or never
-reported on it, when the connector never answered, when the MDS has had no
-accepted batch since it started, when its verdict ran out, or when a
-rebind (a strictly higher `binding_generation`) cleared it.
+A DS is neutral when the connector never reported on it (it has no
+binding for it), when the connector never answered, when the MDS has had
+no accepted batch since it started, when its verdict ran out, or when a
+rebind (a strictly higher `binding_generation`) cleared it. Removing a
+binding does **not** end a verdict the MDS already holds: no record
+replaces it, so a deny stays for the rest of its hold (up to 20 minutes)
+and an allow for the rest of its own. The same goes for a DS
+re-registered under a reused `ds_id` with a new endpoint: the MDS rejects
+the old binding's records for it (the endpoint differs — no new data), so
+the old DS's verdict applies to the new one until it runs out. To end a
+verdict at once, bind the DS with a higher `binding_generation`: the MDS
+clears the old verdict on the first record of the new generation, and
+what stands then is a fresh observation (or neutral), not the old
+verdict. To keep a DS out of placement whatever its verdict, use its
+admin state (`mds-admin ds set-state`).
 
 A **verdict** is the placement part of a `VALID` assessment. The
 connector holds it for `remaining_ttl_ms`, counted from its observation
@@ -332,12 +364,19 @@ A lost connector no longer refuses placements, so it has to be alerted on:
   places, but it no longer steers. It counts the DS that reached the
   verdict step at the last placement decision; `neutral_ds` in the
   readiness row counts every registered DS.
+- Both placement gauges (`pnfs_mds_placement_neutral_ds`,
+  `pnfs_mds_placement_retained_ds`) move only at a placement decision:
+  on an idle cluster they keep the last decision's values. They say how
+  the last files were placed, not whether the connector is alive —
+  `pnfs_mds_connector_reachable` does.
 - `pnfs_mds_placement_retained_ds > 0` for longer than you tolerate: the
   connector is repeating verdicts it cannot re-observe (the source is
   down).
 - `pnfs_mds_connector_verdicts_expired_total` counts verdicts that ran
   out without a new one, but only when the next batch is accepted; while
-  the connector is unreachable it stays flat, so use the gauges above.
+  the connector is unreachable it stays flat. Alert on
+  `pnfs_mds_connector_reachable` for that; the placement gauges above
+  show the effect once files are placed.
 - On the connector host, `connector_state_write_errors_total` (the state
   file cannot be written, so a restart would lose the verdicts).
 
