@@ -130,17 +130,30 @@ def test_duplicate_keys_warn():
 
 
 def test_fold_preflight():
+    """A connector that is not ready is a warning: smart places without it."""
     base = rep("placement_mode = smart\n", "smart")
     r = fold_preflight(rep("placement_mode = smart\n", "smart"), None)
-    assert not r.ready and "CONNECTOR:UNAVAILABLE" in r.errors[0]
+    assert r.ready and r.errors == [] and any(w.startswith("CONNECTOR:UNAVAILABLE") for w in r.warnings)
     r = fold_preflight(rep("placement_mode = smart\n", "smart"), {"ready": False, "reasons": ["CONNECTOR_NOT_READY", "UNBOUND_DS:1"]})
-    assert not r.ready and r.errors == ["CONNECTOR:CONNECTOR_NOT_READY", "CONNECTOR:UNBOUND_DS:1"]
+    assert r.ready and r.errors == []
+    assert [w for w in r.warnings if w.startswith("CONNECTOR:")] == ["CONNECTOR:CONNECTOR_NOT_READY", "CONNECTOR:UNBOUND_DS:1"]
+    r = fold_preflight(rep("placement_mode = smart\n", "smart"), {"ready": False})
+    assert r.ready and "CONNECTOR:NOT_READY" in r.warnings
     r = fold_preflight(rep("placement_mode = smart\n", "smart"), {"ready": True, "reasons": []})
     assert r.ready and r.connector == {"ready": True, "reasons": []}
+    assert not [w for w in r.warnings if w.startswith("CONNECTOR:")]
     # not smart: untouched
     r = fold_preflight(rep("placement_mode = fill\n", "fill"), None)
-    assert r.ready and r.connector is None
+    assert r.ready and r.connector is None and r.warnings == []
     assert base.ready
+
+
+def test_fold_preflight_keeps_the_file_errors_that_fail_validation():
+    r = rep("placement_mode = smart\ndefault_mirror_count = 2\n", "smart")
+    assert not r.ready
+    r = fold_preflight(r, {"ready": False, "reasons": ["CONNECTOR_NOT_READY"]})
+    assert not r.ready and any(e.startswith("MIRROR_COUNT_UNSUPPORTED") for e in r.errors)
+    assert "CONNECTOR:CONNECTOR_NOT_READY" in r.warnings and not any(e.startswith("CONNECTOR:") for e in r.errors)
 
 
 def test_legacy_profile_digest_key_is_an_error_in_every_mode():

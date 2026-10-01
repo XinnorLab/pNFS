@@ -6,6 +6,10 @@ It reads ``/healthz`` and ``/v1/assessments`` from the local connector and
 checks what the MDS will check: contract major, every expected DS bound,
 no UNKNOWN or expired record, one digest per profile id, domain consistency
 (records that share a ``capacity_domain_id`` share a ``datastore_id``).
+Each DS row says whether its verdict is ``fresh``, ``retained`` (the source
+gave no new one), ``restored`` (from the state file) or ``none``, with the
+hold left; a retained verdict is not a failure. In a ``FAILED`` snapshot
+only a retained verdict counts as VALID, as on the MDS.
 It never changes anything and knows nothing about the MDS placement mode.
 """
 
@@ -84,8 +88,17 @@ def evaluate(health: Optional[Dict[str, Any]], batch: Optional[Dict[str, Any]],
             profile = a.get("profile") or {}
             resources = a.get("resources") or {}
             quality = a.get("quality")
-            if failed:
+            reasons_here = list(placement.get("reason_codes") or [])
+            if failed and "VERDICT_RETAINED" not in reasons_here:
                 quality = contract.QUALITY_UNKNOWN
+            if quality != contract.QUALITY_VALID:
+                verdict = "none"
+            elif "RESTORED_FROM_STATE" in reasons_here:
+                verdict = "restored"
+            elif "VERDICT_RETAINED" in reasons_here:
+                verdict = "retained"
+            else:
+                verdict = "fresh"
             row = {
                 "ds_id": ds,
                 "instance": iid,
@@ -99,8 +112,10 @@ def evaluate(health: Optional[Dict[str, Any]], batch: Optional[Dict[str, Any]],
                 "target_id": a.get("target_id"),
                 "target_incarnation": a.get("target_incarnation"),
                 "binding_generation": a.get("binding_generation"),
-                "reason_codes": list(placement.get("reason_codes") or []),
+                "reason_codes": reasons_here,
                 "ds_path": (a.get("endpoint") or {}).get("ds_path"),
+                "verdict": verdict,
+                "hold_left_ms": a.get("remaining_ttl_ms"),
             }
             rows.append(row)
             if isinstance(ds, int):
@@ -165,8 +180,9 @@ def render(report: Dict[str, Any]) -> str:
         lines.append("instance %s (%s) epoch=%s seq=%s snapshot=%s" % (i["id"], i["module"], i["epoch"], i["sequence"], i["snapshot_status"]))
     for r in report.get("ds", []):
         lines.append(
-            "  ds %3s %-8s allowed=%-5s ppm=%-7s ttl_ms=%-6s domain=%s datastore=%s target=%s gen=%s ds_path=%s reasons=%s"
+            "  ds %3s %-8s allowed=%-5s ppm=%-7s ttl_ms=%-6s verdict=%s hold_left_ms=%s domain=%s datastore=%s target=%s gen=%s ds_path=%s reasons=%s"
             % (r["ds_id"], r["quality"], r["allowed"], r["multiplier_ppm"], r["remaining_ttl_ms"],
+               r["verdict"], r["hold_left_ms"],
                r["capacity_domain_id"], r["datastore_id"], r["target_id"], r["binding_generation"],
                r["ds_path"] or "-", ",".join(r["reason_codes"]))
         )

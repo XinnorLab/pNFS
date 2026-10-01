@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from . import contract
 from .paths import is_canonical, normalize, path_contains
+from .state import DEFAULT_STATE_PATH
 
 CONFIG_VERSION = "1.0"
 SUPPORTED_MODULES = ("xinas", "fixture")
@@ -70,8 +71,14 @@ class RuntimeConfig:
     max_ds: int = contract.MAX_DS_PER_MDS
     max_instances: int = contract.MAX_INSTANCES
     max_batch_bytes: int = contract.MAX_BATCH_BYTES
-    #: Restarts of a stuck worker per hour before the instance stays UNKNOWN.
+    #: Restarts of a stuck worker per hour before the instance publishes
+    #: WORKER_STUCK (its retained verdicts, then UNKNOWN) until a reload.
     worker_restart_limit: int = 3
+    #: The verdict state file (smart verdict retention design §4.4); None
+    #: disables persistence. The parser defaults an absent key to
+    #: ``state.DEFAULT_STATE_PATH``; the dataclass default is None so a
+    #: hand-built configuration (tests, fixtures) never touches /var/lib.
+    state_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,13 @@ class Profile:
     source_max_age_ms: int = 20000
     recovery_hold_down_ms: int = 10000
     recovery_distinct_cycles: int = 2
+    #: How long the last observed verdict of a data store is repeated without
+    #: a new one, counted from its observation (contract 1.1): the longer
+    #: ``critical_hold_ms`` for a critical verdict -- ``allowed: false``, and
+    #: only that -- and ``verdict_hold_ms`` for any other (an allow at any
+    #: multiplier, a degraded one included). After that the data store is neutral.
+    critical_hold_ms: int = contract.DEFAULT_CRITICAL_HOLD_MS
+    verdict_hold_ms: int = contract.DEFAULT_VERDICT_HOLD_MS
     degraded_multiplier_ppm: int = 250000
     need_restripe_multiplier_ppm: int = 250000
     scan_multiplier_ppm: int = contract.PPM_FULL
@@ -94,6 +108,9 @@ class Profile:
     export_source_required: str = "etab"
     digest: str = ""
 
+    def hold_ms(self, critical: bool) -> int:
+        return self.critical_hold_ms if critical else self.verdict_hold_ms
+
     def placement_fields(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -101,6 +118,8 @@ class Profile:
             "source_max_age_ms": self.source_max_age_ms,
             "recovery_hold_down_ms": self.recovery_hold_down_ms,
             "recovery_distinct_cycles": self.recovery_distinct_cycles,
+            "critical_hold_ms": self.critical_hold_ms,
+            "verdict_hold_ms": self.verdict_hold_ms,
             "degraded_multiplier_ppm": self.degraded_multiplier_ppm,
             "need_restripe_multiplier_ppm": self.need_restripe_multiplier_ppm,
             "scan_multiplier_ppm": self.scan_multiplier_ppm,
@@ -296,6 +315,15 @@ def _parse_runtime(c: _Collector, raw: Dict[str, Any]) -> RuntimeConfig:
     if group is not None and (not isinstance(group, str) or not group):
         c.error("TYPE", f"{path}.socket_group", "must be a group name")
         group = None
+    # Absent: the unit's StateDirectory; null: no state file.
+    state_path = raw.get("state_path", DEFAULT_STATE_PATH)
+    if state_path is not None:
+        if not isinstance(state_path, str):
+            c.error("TYPE", f"{path}.state_path", "must be an absolute path or null")
+            state_path = None
+        elif not state_path.startswith("/") or state_path.endswith("/"):
+            c.error("RANGE", f"{path}.state_path", "must be an absolute file path (or null to disable the state file)")
+            state_path = None
     return RuntimeConfig(
         socket_path=socket_path,
         socket_group=group,
@@ -305,6 +333,7 @@ def _parse_runtime(c: _Collector, raw: Dict[str, Any]) -> RuntimeConfig:
         max_instances=_int(c, raw, "max_instances", path, d.max_instances, 1, contract.MAX_INSTANCES) or d.max_instances,
         max_batch_bytes=_int(c, raw, "max_batch_bytes", path, d.max_batch_bytes, 4096, contract.MAX_BATCH_BYTES) or d.max_batch_bytes,
         worker_restart_limit=_int(c, raw, "worker_restart_limit", path, d.worker_restart_limit, 0, 100) or d.worker_restart_limit,
+        state_path=state_path,
     )
 
 
@@ -317,11 +346,16 @@ def _parse_profile(c: _Collector, raw: Dict[str, Any], idx: int, runtime: Runtim
     if version is not None and version != SUPPORTED_PROFILE_VERSION:
         c.error("UNSUPPORTED_PROFILE", f"{path}.version", f"only version {SUPPORTED_PROFILE_VERSION} is supported")
     d = Profile(id="", version="")
-    max_age = _int(c, raw, "source_max_age_ms", path, d.source_max_age_ms, 1000, contract.MAX_REMAINING_TTL_MS)
+    max_age = _int(c, raw, "source_max_age_ms", path, d.source_max_age_ms, 1000, contract.MAX_SOURCE_MAX_AGE_MS)
     if max_age is not None and max_age < 2 * runtime.collect_interval_ms:
         c.error("TIMEOUT_RELATION", f"{path}.source_max_age_ms", "must be at least twice runtime.collect_interval_ms")
     hold = _int(c, raw, "recovery_hold_down_ms", path, d.recovery_hold_down_ms, 0, 600_000)
     cycles = _int(c, raw, "recovery_distinct_cycles", path, d.recovery_distinct_cycles, 1, 10)
+    crit = _int(c, raw, "critical_hold_ms", path, d.critical_hold_ms, 1000, contract.MAX_REMAINING_TTL_MS)
+    vhold = _int(c, raw, "verdict_hold_ms", path, d.verdict_hold_ms, 1000, contract.MAX_REMAINING_TTL_MS)
+    for name, val in (("critical_hold_ms", crit), ("verdict_hold_ms", vhold)):
+        if val is not None and max_age is not None and val < max_age:
+            c.error("HOLD_RELATION", f"{path}.{name}", "must be at least source_max_age_ms")
     degraded = _int(c, raw, "degraded_multiplier_ppm", path, d.degraded_multiplier_ppm, 0, contract.PPM_FULL)
     restripe = _int(c, raw, "need_restripe_multiplier_ppm", path, d.need_restripe_multiplier_ppm, 0, contract.PPM_FULL)
     scan = _int(c, raw, "scan_multiplier_ppm", path, d.scan_multiplier_ppm, 0, contract.PPM_FULL)
@@ -335,7 +369,7 @@ def _parse_profile(c: _Collector, raw: Dict[str, Any], idx: int, runtime: Runtim
     if export_source not in ("exports", "etab"):
         c.error("ENUM", f"{path}.export_source_required", "must be 'exports' or 'etab'")
         export_source = d.export_source_required
-    if pid is None or version is None or None in (max_age, hold, cycles, degraded, restripe, scan):
+    if pid is None or version is None or None in (max_age, hold, cycles, crit, vhold, degraded, restripe, scan):
         return None
     profile = Profile(
         id=pid,
@@ -343,6 +377,8 @@ def _parse_profile(c: _Collector, raw: Dict[str, Any], idx: int, runtime: Runtim
         source_max_age_ms=int(max_age),
         recovery_hold_down_ms=int(hold),
         recovery_distinct_cycles=int(cycles),
+        critical_hold_ms=int(crit),
+        verdict_hold_ms=int(vhold),
         degraded_multiplier_ppm=int(degraded),
         need_restripe_multiplier_ppm=int(restripe),
         scan_multiplier_ppm=int(scan),

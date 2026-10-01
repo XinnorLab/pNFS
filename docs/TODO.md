@@ -13,9 +13,20 @@ entry when it lands.
   trust only the local `statvfs`; an MDS without back-mounts sees every
   DS as `CAPACITY_UNKNOWN`.  Done = a timestamped observation column in
   the DS registry row and a freshness rule for merged rows.
-- **`config show` buffer.** Per-DS rows are appended to the 8 KiB
-  response; on large clusters use the `placement_ds.<id>` filter.  Done =
-  a paged or larger admin response in upstream.
+- **`config show` buffer.** The whole response is one 8 KiB buffer
+  (`handle_config_show_admin`, `cluster_transport.c`); rows that do not
+  fit are dropped silently.  The sections render in a fixed order
+  (identity, tuning, caches, placement, `render_cfg_ds`, `render_cfg_misc`),
+  so when the buffer fills the later ones vanish first.  Each smart
+  `placement_ds.<id>` row is about 45 bytes longer since verdict
+  retention (`verdict=… hold_left_ms=…`) and the readiness row 26 bytes;
+  with the lab's ~110-byte domain ids an unfiltered `config show` starts
+  losing `placement_ds` rows at roughly 15–20 DS.  The "~32 keys at <256
+  bytes each" comment next to the buffer is stale.  On large clusters use
+  the `placement_ds.<id>` filter; the helper does not yet flag fewer rows
+  than `registered_ds`.  Done = a paged or larger admin response in
+  upstream (and the comment corrected), or a helper finding when
+  `len(ds) < registered_ds`.
 - **Adversarial review 2026-09-23, carried over.** (1) LAT-25 measured
   2026-09-24 (`stand-2026-09-24-stage-c.md`): no throughput loss, +1.7 µs
   per gate call; still open is the same row on a cluster with many DS
@@ -53,16 +64,68 @@ entry when it lands.
   `profile-xinas-mvp.md` (or a shorter domain form) and a connector-side
   check. (2) `pm-run.sh` now prints the tree it tests (`PM_TREE …`);
   `--no-sync` still means "the pushed base commit, no local changes".
-- **Stage C stand 2026-09-24, carried over.** (1) A connector just
-  (re)started reports its DS `VALID allowed=False RECOVERY_HOLD_DOWN`
-  for the hold-down window and `preflight` says READY (the record is
-  VALID and bound); an operator switching inside that window sees
-  `CONNECTOR_DENIED` for a few seconds. Done = `preflight` prints the
-  hold-down remaining as a note (or waits for it with `--wait`). (2)
-  The MDS metrics listener resets a connection now and then (`Connection
-  reset by peer` on `/metrics`); the helper retries once. Done = an
-  upstream look at the metrics HTTP server's accept/close path.
+- **Stage C stand 2026-09-24, carried over.** The MDS metrics listener
+  resets a connection now and then (`Connection reset by peer` on
+  `/metrics`); the helper retries once. Done = an upstream look at the
+  metrics HTTP server's accept/close path.
 - **Profile reload and clock-step rows** (from the wave-2 list above)
   and the LAT-25 row on a many-DS cluster remain the open acceptance
   rows; the `verify`-driven switch, partial coverage and the
   `DESIRED_NE_EFFECTIVE` gate are covered by `stand-2026-09-24-stage-c.md`.
+
+## Smart verdict retention (design `docs/superpowers/specs/2026-09-29-smart-verdict-retention-design.md`)
+
+- **The MDS patch series does not carry verdict retention yet.**
+  `mds/manifest.json` still pins `fork_sha` 639b6c5 and `mds/patches/6b4dcde/`
+  has no retention patches, while the contract manifest (1.3) and the
+  connector's contract 1.1 describe the retention rows, metrics and TTLs
+  up to one hour.  Deferred on purpose: the fork branch
+  `xinnor/smart-verdict-retention` is not merged, and an export now would
+  pin an unmerged SHA.  Done = after the fork PR merges into
+  `xinnor/placement-modes`, run `scripts/export-patches.sh <fork checkout>`
+  for the merged branch in the pNFS PR (or one merged together with it),
+  so `mds/manifest.json` `fork_sha` and `mds/patches/` match; the pNFS PR
+  merges only after that (`scripts/check-manifests.py` ok).
+- **A test-mode fixture instance loses its verdict on a collection error
+  when its document names a non-default profile.** An instance with no
+  configured profile takes its profile id from the batch document; the
+  no-data path resolves the triplet without a batch, so the stored
+  verdict (stored under the document's id) reads as another profile's and
+  is dropped instead of retained. `test_mode` only: xinas instances always
+  carry a configured profile. Left because no deployed instance runs
+  without one. Done = the no-data path uses the profile id the verdict
+  was stored under when the instance has no configured profile, with a
+  test.
+- **The stand trial (R10) has not run.** Verdict retention is proven by
+  unit tests and the fork CI, not on the lab.  Done = the design §9 stand
+  rows on node223/node225 with the shortened holds (`critical_hold_ms =
+  180000`, `verdict_hold_ms = 90000` in the lab profile), in an announced
+  window with the MDS upgraded first and the connector second, one
+  `pm-bench.sh` run per mode, and a stand record under
+  `docs/placement-modes/`.  The window also updates
+  `ds_connector_expected_profiles` on every MDS (the profile digest
+  changed) and installs the new connector unit file.
+- **Recapture the helper's two synthetic fixtures after the stand.**
+  `tools/lattice-placement/tests/fixtures/config-show-smart-retention.json`
+  and `config-show-smart-steering-off.json` are built from the fork's
+  rendered row format (test output of the fork build), not captured from a
+  running MDS.  Done = both replaced by `mds-admin config show --json`
+  captures from the retention build on the lab and the README note about
+  them removed.
+- **Synced `pm-run.sh` results before the 2026-09-29 fixes may have
+  tested a stale tree.**  Two defects, one long-standing and one that
+  made it worse.  (1) `9a37177` (which added the `PM_TREE` line) moved the
+  local → box upload loop into the `--no-sync` `else` branch, so a synced
+  run never uploaded the working tree at all: node225 extracted whatever
+  tarball an earlier run had left on the box, while `PM_TREE` still
+  printed `(synced)`.  `b7ac016` put the loop back.  This is the primary
+  cause for runs between `9a37177` and `b7ac016`.  (2) The box → node225
+  copy of the tarball swallowed a failed `scp` (`|| true`, from `5519e04`),
+  so a failed copy left node225 extracting an older archive as well.
+  Fixed in `60b93f4` (a failed copy prints `PM_RESULT SYNC_FAILED` and
+  exits 3; the archive is deleted after extraction).  What node225
+  reported for synced runs between `9a37177` and `b7ac016` (defect 1), and
+  in principle for any synced run before `60b93f4` (defect 2), may not
+  describe the tree the run claimed.  Done = the results the design or a
+  stand record relies on are re-run synced on the fixed script, or
+  confirmed by a `--no-sync` run of the same commit or the fork CI.

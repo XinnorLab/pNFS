@@ -9,7 +9,8 @@
     "collect_deadline_ms": 2000,
     "max_ds": 256,
     "max_instances": 64,
-    "max_batch_bytes": 4194304
+    "max_batch_bytes": 4194304,
+    "state_path": "/var/lib/lattice-ds-connector/verdicts.json"
   },
   "profiles": [
     {

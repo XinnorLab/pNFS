@@ -39,11 +39,35 @@ def test_parse_ds_row_smart_and_none():
         assert lr.state == "ONLINE"
 
 
+def test_parse_ds_row_neutral_and_retained():
+    show = parse_config_show(fixture("config-show-smart-retention.json"))
+    r0 = parse_ds_row(0, show["placement_ds.0"])
+    assert r0.quality == "VALID" and r0.allowed is True and r0.ppm == 1000000
+    assert r0.ttl_ms == 412000 and r0.assessment_age_ms == 188000
+    assert r0.verdict == "retained" and r0.hold_left_ms == 412000 and r0.eligible
+    r1 = parse_ds_row(1, show["placement_ds.1"])       # no verdict in force: placed neutrally
+    assert r1.quality is None and r1.allowed is None and r1.ppm == 1000000 and r1.ttl_ms == 0
+    assert r1.verdict == "none" and r1.hold_left_ms is None and r1.reason == "NONE" and r1.eligible
+    assert r1.as_dict()["allowed"] is None and r1.as_dict()["verdict"] == "none"
+    fresh = parse_ds_row(2, "domain=x state=ONLINE quality=VALID allowed=0 ppm=0 ttl_ms=5000 weight=0 "
+                            "reason=CONNECTOR_DENIED verdict=fresh hold_left_ms=5000")
+    assert fresh.verdict == "fresh" and fresh.allowed is False and fresh.hold_left_ms == 5000 and not fresh.eligible
+    old = parse_ds_row(0, "domain=x state=ONLINE quality=VALID allowed=1 ppm=1000000 ttl_ms=14866 weight=5 reason=NONE")
+    assert old.verdict is None and old.hold_left_ms is None      # an older MDS renders neither field
+
+
 def test_parse_readiness_build_metrics():
     r = parse_readiness("mode_active=1 connector_config_valid=1 connector_reachable=0 last_batch_valid=0 "
                         "coverage=none registered_ds=2 covered_ds=0 eligible_ds=0")
     assert r.mode_active and r.connector_config_valid and not r.connector_reachable
     assert r.coverage == "none" and r.registered_ds == 2 and r.covered_ds == 0
+    assert r.retained_ds == 0 and r.neutral_ds == 2            # an older MDS: neutral = registered - covered
+    assert r.retention_aware is False                          # ... and it refuses a DS without a verdict
+    r = parse_readiness("mode_active=1 connector_config_valid=1 connector_reachable=1 last_batch_valid=1 "
+                        "coverage=partial registered_ds=2 covered_ds=1 eligible_ds=2 retained_ds=1 neutral_ds=1")
+    assert r.eligible_ds == 2 and r.retained_ds == 1 and r.neutral_ds == 1
+    assert r.retention_aware is True and r.as_dict()["retention_aware"] is True
+    assert r.as_dict()["retained_ds"] == 1 and r.as_dict()["neutral_ds"] == 1
     assert parse_build("wrr=1 connector=1 prealloc=0") == {"wrr": 1, "connector": 1, "prealloc": 0}
     m = parse_metrics(fixture("metrics-smart-mds2.txt"))
     assert m["pnfs_mds_placement_eligible_ds"] == 1.0
@@ -73,6 +97,25 @@ def test_state_from_show_smart_partial_and_none():
     assert all(r.reason == "MODE_NOT_READY" for r in s1.ds)
     legacy = state_from_show("x", parse_config_show(fixture("config-show-legacy-mds2.json")))
     assert legacy.mode_effective == "legacy" and legacy.readiness is None and legacy.build == {}
+
+
+def test_state_from_show_retention_and_steering_off():
+    s = state_from_show("m1", parse_config_show(fixture("config-show-smart-retention.json")), desired="smart")
+    assert s.readiness.coverage == "partial" and s.readiness.retained_ds == 1 and s.readiness.neutral_ds == 1
+    assert [r.verdict for r in s.ds] == ["retained", "none"] and s.profiles_row and s.profiles_error is None
+    off = state_from_show("m1", parse_config_show(fixture("config-show-smart-steering-off.json")), desired="smart")
+    assert off.readiness.coverage == "none" and not off.readiness.connector_reachable
+    assert off.readiness.eligible_ds == 2 and off.readiness.neutral_ds == 2 and off.readiness.retained_ds == 0
+    assert all(r.verdict == "none" and r.allowed is None and r.eligible for r in off.ds)
+    assert off.profiles["xinas-mvp"].startswith("sha256:c9bee5b2") and off.config_digest.startswith("sha256:30259fc1")
+    assert off.last_detail.startswith("socket /run/lattice-ds-connector/connector.sock")
+
+
+def test_new_gauges_reach_the_metrics_map():
+    m = parse_metrics("pnfs_mds_placement_neutral_ds 1\npnfs_mds_placement_retained_ds 2\n"
+                      "pnfs_mds_connector_verdicts_expired_total 3\nunrelated_total 9\n")
+    assert m == {"pnfs_mds_placement_neutral_ds": 1.0, "pnfs_mds_placement_retained_ds": 2.0,
+                 "pnfs_mds_connector_verdicts_expired_total": 3.0}
 
 
 def test_is_local_address():

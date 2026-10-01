@@ -29,19 +29,56 @@ batch defined by [`contracts/connector-batch.schema.json`](contracts/connector-b
 (`VALID`/`UNKNOWN`), `placement.allowed`, `placement.multiplier_ppm`,
 `reason_codes`, the generic identity (`datastore_id`, `target_id`,
 `target_incarnation`), the shared capacity domain, coverage rows,
-`evidence_age_ms` and `remaining_ttl_ms`. A record is a hard veto unless it
-is `VALID`, `allowed: true` and its TTL is above zero — anything the runtime
-cannot prove is `UNKNOWN`/`false`/`0` with a reason.
+`evidence_age_ms` and `remaining_ttl_ms`. Only a record that is `VALID`,
+`allowed: true` and has a TTL above zero allows; a `VALID` deny vetoes;
+anything the runtime cannot prove is `UNKNOWN`/`false`/`0` with a reason. An
+`UNKNOWN` record, or a TTL of zero, is no verdict at all: the MDS (`smart`)
+places that data store neutrally (multiplier 1 000 000 ppm), it does not veto it.
 
 Freshness is the runtime's arithmetic (CON-10/11): the source's own evidence
 age, plus the whole request duration, plus the local monotonic time since the
 fetch. A GET never refreshes anything; `remaining_ttl_ms` only shrinks until
-the next accepted collection. A restarted daemon starts with every DS
-`UNKNOWN` (`NO_ASSESSMENT`).
+the next accepted collection. It is the verdict's hold minus its age
+(`critical_hold_ms` for `allowed: false`, `verdict_hold_ms` otherwise; see
+"Verdict holds" in `docs/profile-xinas-mvp.md`): an `UNKNOWN` record or a
+collection error of any kind re-publishes the verdict in force with
+`VERDICT_RETAINED` until its hold runs out, never revokes it. A restarted
+daemon restores the verdicts still in force from its state file (below)
+before its first publication; a DS without one reads `UNKNOWN`
+(`NO_ASSESSMENT`) until the first collect.
 
-Re-entry hold-down (CON-16): after start or any deny/UNKNOWN, an allow is
+Re-entry hold-down (CON-16): an allow that leaves a deny in force is
 withheld (`RECOVERY_HOLD_DOWN`) until two *distinct* source cycles agreed
-and 10 s passed; a repeated identical source snapshot is one sample.
+and 10 s passed; a repeated identical source snapshot is one sample. The
+deny it keeps publishing counts its hold from the last critical
+observation. After a start, an UNKNOWN period or a neutral period (no deny
+in force) the first verdict is published at once; a deny restored from the
+state file is in force, so leaving it is held down like any other.
+
+State file (`runtime.state_path`, default
+`/var/lib/lattice-ds-connector/verdicts.json`; `null` disables it): the
+verdict store as JSON — per binding its identity, profile id, verdict,
+`observed_at` and, for a deny, `critical_observed_at` (wall-clock UTC); no
+credentials, no endpoints. It is written after the cycles that change a
+verdict, at most once per `collect_interval_ms` and once more on stop,
+atomically (temp file, `fsync`, `rename`, `fsync` of the directory) with
+mode 0600 in the unit's `StateDirectory`. At start it is read once, before
+the first publication: an entry comes back only when its key matches a
+configured binding exactly (instance, `ds_id`, `binding_generation`,
+`target_id`, pinned incarnation), its profile id and data store are the
+binding's and its hold has not run out by the wall clock under the current
+profile's hold; it is published as a retained verdict with `VERDICT_RETAINED`,
+`RESTORED_FROM_STATE`. So a restart keeps what the MDS was told — a deny
+keeps denying for the rest of its hold, an allow keeps its multiplier — and
+a rebind still starts clean. A file that cannot be read or parsed, or that
+has another version, is renamed to `verdicts.json.corrupt-<ts>` with a WARN
+(`state_file_ignored`) and the connector starts with an empty store; a
+failed write is a WARN (`state_write_failed`) and
+`connector_state_write_errors_total`, and the connector carries on with its
+in-memory store. The state file never stops the connector. Leaving the key
+out of an existing configuration keeps both the default path and the
+`config_digest`; writing it in changes the digest an MDS may pin
+(`ds_connector_expected_config_digest`), like any other edit of the file.
 
 ## Layout
 
@@ -52,6 +89,8 @@ and 10 s passed; a repeated identical source snapshot is one sample.
 | `lattice_ds_connector/modules/xinas.py`, `xinas_policy.py` | the production module: bounded HTTPS client (no redirects, capped body, bearer from a 0600 file) and the xinas-mvp v1 decision policy |
 | `lattice_ds_connector/modules/fixture.py` | the test-only module (`test_mode: true` required) |
 | `lattice_ds_connector/runtime.py` | instances, one bounded worker each, freshness/TTL, hold-down, epochs/sequences, batch limits |
+| `lattice_ds_connector/verdicts.py` | the verdict store: the verdict in force per binding and its hold |
+| `lattice_ds_connector/state.py` | the verdict state file: atomic write, forgiving load, entry checks |
 | `lattice_ds_connector/server.py` | the Unix-socket HTTP server: `/v1/assessments`, `/healthz`, `/metrics` |
 | `lattice_ds_connector/cli.py` | `run`, `validate-config`, `show`, `describe` |
 | `contracts/` | Appendix Г (connector batch) and Д (xiNAS observations) schemas |
@@ -101,8 +140,9 @@ installed (`python3-jsonschema`), every response is also validated against
 `contracts/xinas-observations.schema.json` at runtime.
 
 Reload: `SIGHUP`; an invalid file is rejected and the active configuration
-stays (the rejection is logged with every issue). Stop: `SIGTERM`, bounded
-by 5 s.
+stays (the rejection is logged with every issue); the verdicts of bindings
+that stay as they were are kept. Stop: `SIGTERM`, bounded by 5 s; the state
+file is written once more on the way out.
 
 ## Tests
 

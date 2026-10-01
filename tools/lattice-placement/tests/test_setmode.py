@@ -53,7 +53,7 @@ def test_plan_smart_from_legacy_removes_legacy_keys_and_appends_the_block():
     assert doc.managed_pairs(BEGIN, END) == [("placement_mode", "smart"), ("ds_connector_poll_ms", "1000"),
                                              ("ds_connector_request_deadline_ms", "500")]
     assert "-placement_policy = wrr" in p.diff and "+placement_mode = smart" in p.diff
-    assert any("no DS until the first fresh VALID" in n for n in p.notes)
+    assert any("without a connector verdict neutrally" in n for n in p.notes)
     assert not any("health veto" in w for w in p.warnings)
 
 

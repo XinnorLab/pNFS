@@ -7,6 +7,8 @@ import os
 
 import pytest
 
+from conftest import make_profile
+from lattice_ds_connector import contract
 from lattice_ds_connector.config import ConfigError, load_config, validate_config_dict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +53,57 @@ def test_profile_digest_changes_only_with_placement_fields(token_file, tmp_path)
     b, _ = validate_config_dict(doc2)
     assert a.profiles["xinas-mvp"].digest != b.profiles["xinas-mvp"].digest
     assert a.digest != b.digest
+
+
+def test_profile_hold_fields_default_and_digest():
+    p = make_profile()
+    assert p.critical_hold_ms == contract.DEFAULT_CRITICAL_HOLD_MS == 1_200_000
+    assert p.verdict_hold_ms == contract.DEFAULT_VERDICT_HOLD_MS == 600_000
+    assert p.hold_ms(True) == 1_200_000 and p.hold_ms(False) == 600_000
+    assert make_profile(critical_hold_ms=180_000).digest != p.digest  # part of placement_fields
+    assert make_profile(verdict_hold_ms=180_000).digest != p.digest
+
+
+def test_example_profile_carries_the_default_holds(token_file, tmp_path):
+    config, _ = validate_config_dict(example(token_file, tmp_path))
+    prof = config.profiles["xinas-mvp"]
+    assert (prof.critical_hold_ms, prof.verdict_hold_ms) == (1_200_000, 600_000)
+
+
+def test_parsed_holds_land_in_their_own_profile_fields(token_file, tmp_path):
+    # Two distinct explicit values: a swap between the keys and the fields shows.
+    doc = example(token_file, tmp_path)
+    doc["profiles"][0]["critical_hold_ms"] = 900_000
+    doc["profiles"][0]["verdict_hold_ms"] = 300_000
+    config, issues = validate_config_dict(doc)
+    assert config is not None, issues
+    prof = config.profiles["xinas-mvp"]
+    assert (prof.critical_hold_ms, prof.verdict_hold_ms) == (900_000, 300_000)
+    assert prof.hold_ms(True) == 900_000 and prof.hold_ms(False) == 300_000
+
+
+@pytest.mark.parametrize(
+    "field, value, code",
+    [
+        ("critical_hold_ms", 3_600_001, "RANGE"),
+        ("verdict_hold_ms", 999, "RANGE"),
+        ("critical_hold_ms", 15_000, "HOLD_RELATION"),  # below source_max_age_ms (20 000)
+        ("verdict_hold_ms", 19_999, "HOLD_RELATION"),
+        ("source_max_age_ms", 20_001, "RANGE"),  # the source-age cap did not move
+    ],
+)
+def test_profile_hold_ranges(token_file, tmp_path, field, value, code):
+    doc = example(token_file, tmp_path)
+    doc["profiles"][0][field] = value
+    assert (code, f"profiles[0].{field}") in errors_of(doc)
+
+
+@pytest.mark.parametrize("field", ["critical_hold_ms", "verdict_hold_ms"])
+def test_profile_hold_at_the_bounds_is_valid(token_file, tmp_path, field):
+    for value in (20_000, 3_600_000):  # source_max_age_ms .. one hour
+        doc = example(token_file, tmp_path)
+        doc["profiles"][0][field] = value
+        assert errors_of(doc) == set()
 
 
 @pytest.mark.parametrize(
@@ -125,6 +178,40 @@ def test_limits(token_file, tmp_path):
     doc = example(token_file, tmp_path)
     doc["runtime"]["max_instances"] = 1
     assert ("LIMIT", "instances") in errors_of(doc)
+
+
+def test_state_path_defaults_to_the_state_directory(token_file, tmp_path):
+    from lattice_ds_connector.config import RuntimeConfig
+    from lattice_ds_connector.state import DEFAULT_STATE_PATH
+    doc = example(token_file, tmp_path)
+    doc["runtime"].pop("state_path", None)
+    config, issues = validate_config_dict(doc)
+    assert config is not None, issues
+    assert config.runtime.state_path == DEFAULT_STATE_PATH == "/var/lib/lattice-ds-connector/verdicts.json"
+    assert RuntimeConfig().state_path is None          # the dataclass default: no persistence (tests)
+
+
+def test_state_path_null_disables_persistence(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    doc["runtime"]["state_path"] = None
+    config, issues = validate_config_dict(doc)
+    assert config is not None, issues
+    assert config.runtime.state_path is None
+
+
+def test_state_path_explicit(token_file, tmp_path):
+    doc = example(token_file, tmp_path)
+    doc["runtime"]["state_path"] = str(tmp_path / "verdicts.json")
+    config, issues = validate_config_dict(doc)
+    assert config is not None, issues
+    assert config.runtime.state_path == str(tmp_path / "verdicts.json")
+
+
+@pytest.mark.parametrize("value, code", [("verdicts.json", "RANGE"), ("var/lib/x.json", "RANGE"), ("", "RANGE"), (5, "TYPE"), (True, "TYPE")])
+def test_state_path_must_be_absolute(token_file, tmp_path, value, code):
+    doc = example(token_file, tmp_path)
+    doc["runtime"]["state_path"] = value
+    assert (code, "runtime.state_path") in errors_of(doc)
 
 
 def test_load_config_reports_every_error_at_once(tmp_path):

@@ -9,7 +9,7 @@ optional diagnostic reason must not break placement.
 
 from __future__ import annotations
 
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "1.1"
 CONTRACT_MAJOR = 1
 
 # The source schema this connector's xinas module understands (API-21).
@@ -36,8 +36,15 @@ MAX_REASON_CODES = 16
 MAX_DIAGNOSTICS_BYTES = 4096
 MAX_SHARED_RESOURCE_IDS = 128
 MAX_COVERAGE_ROWS = 64
-# The schema caps remaining_ttl_ms at 20 000 (the MVP profile's max source age).
-MAX_REMAINING_TTL_MS = 20_000
+# The schema caps remaining_ttl_ms at one hour: a verdict stays in force at
+# most that long without a new one (contract 1.1; it was 20 000 in 1.0).
+MAX_REMAINING_TTL_MS = 3_600_000
+# The oldest evidence a policy may call fresh (unchanged since 1.0).
+MAX_SOURCE_MAX_AGE_MS = 20_000
+# Verdict holds (contract 1.1): how long a reported verdict is repeated
+# without a new one, counted from its observation.
+DEFAULT_CRITICAL_HOLD_MS = 1_200_000
+DEFAULT_VERDICT_HOLD_MS = 600_000
 
 # CON-12 scheduling bounds.
 MAX_JITTER_MS = 500
@@ -121,8 +128,8 @@ RUNTIME_REASONS = {
     "SOURCE_NOT_READY": "the source answered 503 SOURCE_NOT_READY; UNKNOWN",
     "SOURCE_FAILED": "the source snapshot is FAILED; UNKNOWN",
     "CAPABILITY_MISSING": "a required check is not in the source's capabilities; UNKNOWN",
-    "EVIDENCE_EXPIRED": "the assessment's remaining TTL reached 0; UNKNOWN",
-    "RECOVERY_HOLD_DOWN": "allow is withheld until the hold-down completes; VALID deny",
+    "EVIDENCE_EXPIRED": "the verdict's hold ran out (remaining TTL 0) without a new one; UNKNOWN",
+    "RECOVERY_HOLD_DOWN": "applies when leaving a deny: the allow is withheld until the hold-down completes; VALID deny",
     "NO_ASSESSMENT": "no assessment has been produced yet; UNKNOWN",
     "BINDING_INVALID": "the binding failed validation; UNKNOWN",
     "INVALID_MULTIPLIER": "a module returned a multiplier outside [0, 1000000] or not an integer; UNKNOWN",
@@ -132,15 +139,17 @@ RUNTIME_REASONS = {
     "DENIED": "deny without a module-supplied reason (should not happen)",
     "SOURCE_TLS_FAILED": "TLS verification against the configured CA failed; UNKNOWN",
     "SOURCE_REPLAY": "the source answered with a generation not newer than the last accepted one; ignored",
-    "COLLECT_IN_FLIGHT": "the previous collect is still running; this tick was skipped (UNKNOWN once the lease expires)",
+    "COLLECT_IN_FLIGHT": "the previous collect is still running; this tick was skipped (the verdict in force is retained)",
     "GRAPH_INCONSISTENT": "a reference resolves to a record that contradicts the share (kind, path, mountpoint, device); UNKNOWN",
     "EVIDENCE_AGE_MISSING": "a mandatory SUCCESS record carries no evidence time or age; UNKNOWN",
     "FILESYSTEM_IDENTITY_MISSING": "the filesystem has no uuid or incarnation; UNKNOWN",
     "INCARNATION_UNPINNED": "the binding pins no expected_target_incarnation; UNKNOWN (see `discover`)",
     "XIRAID_VERSION_UNSUPPORTED": "the array's edition/version is outside the profile's compatibility (Classic 4.4); UNKNOWN",
     "RAID_LEVEL_UNSUPPORTED": "the array's level is not one the policy knows; UNKNOWN",
+    "VERDICT_RETAINED": "the source gave no new verdict; the last observed one is repeated until its hold runs out",
+    "RESTORED_FROM_STATE": "the retained verdict was restored from the state file after a connector restart",
     "MODULE_ERROR": "an uncaught module error; UNKNOWN",
-    "WORKER_STUCK": "the collect worker exceeded its restart budget; UNKNOWN until reload",
+    "WORKER_STUCK": "the collect worker exceeded its restart budget; the verdicts in force are retained until their hold runs out, then UNKNOWN, until reload",
     "FIXTURE_HEALTHY": "fixture module: healthy (test only)",
 }
 

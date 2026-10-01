@@ -1,7 +1,7 @@
 {
   "connector": "lattice-ds-connector",
   "connector_version": "0.1.0",
-  "contract_version": "1.0",
+  "contract_version": "1.1",
   "modules": {
     "xinas": {
       "version": "1",
@@ -27,7 +27,17 @@
       "profiles": [
         {
           "id": "xinas-mvp",
-          "version": "1"
+          "version": "1",
+          "verdict_holds": {
+            "critical_hold_ms": {
+              "default": 1200000,
+              "range": "source_max_age_ms .. 3600000"
+            },
+            "verdict_hold_ms": {
+              "default": 600000,
+              "range": "source_max_age_ms .. 3600000"
+            }
+          }
         }
       ],
       "known_source_gaps": [
@@ -52,6 +62,13 @@
         }
       ]
     }
+  },
+  "contract": {
+    "remaining_ttl_max_ms": 3600000,
+    "reason_codes_added_in_1_1": [
+      "VERDICT_RETAINED",
+      "RESTORED_FROM_STATE"
+    ]
   },
   "lattice": {
     "upstream_baseline": "PEAK-AIO/pnfs-lattice main @ 6b4dcde (2026-09-04)",

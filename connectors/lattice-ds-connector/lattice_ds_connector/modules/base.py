@@ -20,9 +20,10 @@ from ..config import Binding, ConfigIssue, Instance, Profile
 class CollectionError(Exception):
     """A typed collection failure.
 
-    ``retryable`` marks transport-style failures whose last VALID decision may
-    be retained until its original expiry (CON-12); everything else revokes
-    allow immediately.
+    ``retryable`` marks transport-style failures (logged as a warning); the
+    rest (auth, schema, an explicit source verdict) are logged as an alert.
+    Neither kind revokes anything: the runtime keeps publishing each binding's
+    verdict in force until its hold runs out (smart verdict retention, rule 3).
     """
 
     def __init__(self, code: str, message: str, retryable: bool = True, details: Optional[Dict[str, Any]] = None):

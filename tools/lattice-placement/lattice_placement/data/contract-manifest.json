@@ -1,6 +1,6 @@
 {
   "name": "lattice-placement-modes",
-  "version": "1.2",
+  "version": "1.3",
   "design": "docs/superpowers/specs/2026-09-23-placement-modes-design.md",
   "mds": {
     "fork": "XinnorLab/pnfs-lattice",
@@ -263,6 +263,12 @@
     "WEIGHT_OVERFLOW",
     "DOMAIN_MAP_MISMATCH"
   ],
+  "reasons_retired_for_smart": [
+    "NO_BINDING",
+    "ASSESSMENT_UNKNOWN",
+    "ASSESSMENT_STALE",
+    "MODE_NOT_READY"
+  ],
   "kernel": {
     "id": "0x58494e01",
     "stub_id": 0
@@ -284,9 +290,55 @@
     "placement_connector_last_detail",
     "placement_build"
   ],
+  "config_show_fields": {
+    "placement_readiness": [
+      "mode_active",
+      "connector_config_valid",
+      "connector_reachable",
+      "last_batch_valid",
+      "coverage",
+      "registered_ds",
+      "covered_ds",
+      "eligible_ds",
+      "retained_ds",
+      "neutral_ds"
+    ],
+    "placement_ds.<id>": [
+      "domain",
+      "state",
+      "capacity_age_ms",
+      "avail",
+      "total",
+      "assessment_age_ms",
+      "quality",
+      "allowed",
+      "ppm",
+      "ttl_ms",
+      "weight",
+      "reason",
+      "verdict",
+      "hold_left_ms"
+    ],
+    "verdict_values": [
+      "fresh",
+      "retained",
+      "none"
+    ],
+    "neutral_row_fields": {
+      "assessment_age_ms": "none",
+      "quality": "NONE",
+      "allowed": "-",
+      "ppm": 1000000,
+      "ttl_ms": 0,
+      "verdict": "none",
+      "hold_left_ms": "none"
+    }
+  },
   "metrics": [
     "pnfs_mds_placement_mode",
     "pnfs_mds_placement_eligible_ds",
+    "pnfs_mds_placement_neutral_ds",
+    "pnfs_mds_placement_retained_ds",
     "pnfs_mds_placement_rejections_total",
     "pnfs_mds_placement_alias_suspected_total",
     "pnfs_mds_connector_batches_accepted_total",
@@ -295,10 +347,12 @@
     "pnfs_mds_connector_covered_ds",
     "pnfs_mds_connector_reachable",
     "pnfs_mds_connector_last_success_mono_ms",
+    "pnfs_mds_connector_verdicts_expired_total",
     "pnfs_mds_placement_admit_seconds"
   ],
   "connector_client": {
     "contract_version_major": 1,
+    "contract_version": "1.1",
     "scope": "NEW_ALLOCATION",
     "endpoint_rule": "endpoint.server == registry.host; endpoint.port == registry.tcp_port when both set; trailing '/' is ignored on every path; without endpoint.ds_path: endpoint.export_path == registry.export_path; with endpoint.ds_path: ds_path == registry.export_path and export_path == ds_path or a component-wise ancestor of it; '/' is never a parent; every path is canonical: no empty, '.' or '..' component",
     "binding_pin": [
@@ -309,7 +363,7 @@
       "target_incarnation",
       "access_scope_id"
     ],
-    "rebind_rule": "a strictly higher binding_generation re-pins and leaves the DS UNKNOWN for that batch; any other change is BINDING_MISMATCH",
+    "rebind_rule": "a strictly higher binding_generation re-pins and clears the verdict of the old binding: the DS is neutral until the first VALID record of the new binding; any other change is BINDING_MISMATCH",
     "batch_drops": [
       "JSON",
       "SCHEMA",
@@ -336,19 +390,30 @@
       "coverage(full|partial|none)",
       "registered_ds",
       "covered_ds",
-      "eligible_ds"
+      "eligible_ds",
+      "retained_ds",
+      "neutral_ds"
     ],
     "reachable_rule": "an accepted batch within 3 x ds_connector_poll_ms; recomputed on every failure kind (CONNECT, TIMEOUT, HTTP, UNAVAILABLE, DROP) and mirrored by pnfs_mds_connector_reachable",
     "ttl_max_ms": 3600000,
     "batch_max_bytes": 4194304,
     "contract_version_rule": "<major>.<rest>: digits, no leading zero, a '.' must follow the major; the major equals ds_connector_expected_contract_major",
-    "sequence_rule": "per (instance, epoch): equal = the same snapshot re-served (accepted, rows re-timed); lower = REPLAY (batch dropped); a new runtime_epoch resets every line and pin; at most 64 instance lines, a batch needing more is refused",
+    "sequence_rule": "per (instance, epoch): equal = the same snapshot re-served (accepted, rows re-timed); lower = REPLAY (batch dropped); a new runtime_epoch resets every line and pin but keeps the verdicts; at most 64 instance lines, a batch needing more is refused",
     "profile_rule": "per record: with pins set, profile.id must be pinned and its digest equal the pin; one id with two digests, or more than 8 ids, drops the batch; checked on every batch, not part of the per-DS pin (a connector profile reload is not a rebind)",
     "duplicate_rule": "a ds_id present more than once in a batch has no trusted record and pins nothing",
     "string_rule": "standard JSON escapes decoded, \\uXXXX with surrogate pairs; lone surrogates and \\u0000 are shape errors",
     "json_depth_max": 64,
     "http_client": "Unix socket, Content-Length framing only (Transfer-Encoding is refused), body <= 4 MiB, EOF before Content-Length = TIMEOUT-class failure, MSG_NOSIGNAL",
-    "unobserved_incarnation_rule": "target_incarnation null is legal only with quality UNKNOWN: the tuple is compared without the incarnation, the record is accepted as UNKNOWN, the pin is neither created nor changed (a higher generation clears it); VALID with null incarnation is a shape error"
+    "unobserved_incarnation_rule": "target_incarnation null is legal on a quality UNKNOWN record and on a VALID deny (the connector's evidence-less denies, SHARE_ABSENT and IDENTITY_MISMATCH): the tuple is compared without the incarnation, the pin is neither created nor changed (a higher generation clears it); an UNKNOWN record is no new data; a VALID allow with a null incarnation is a shape error",
+    "retention_rule": "a VALID verdict stays in force for remaining_ttl_ms without a new one (the connector sets it: critical_hold_ms for a critical verdict, allowed=false, verdict_hold_ms for any other, counted from the observation, or from the fetch for a deny that carries no evidence time such as SHARE_ABSENT or IDENTITY_MISMATCH); a newer VALID record replaces it at once; UNKNOWN, rejected and dropped records never replace it; a FAILED snapshot carries only VERDICT_RETAINED records; a rebind clears it and a runtime_epoch change keeps it; no verdict in force = neutral (1 000 000 ppm on the base weight of the operator's capacity domain: its placement_domain_weight.<domain> under placement_allow_manual_base_weights, else the fill level; the DS state, capacity and alias gates still apply)",
+    "hold_defaults_ms": {
+      "critical": 1200000,
+      "other": 600000
+    },
+    "new_reason_codes": [
+      "VERDICT_RETAINED",
+      "RESTORED_FROM_STATE"
+    ]
   },
   "cmake_flags": [
     "-DENABLE_WRR=ON",
@@ -374,8 +439,8 @@
     "mds_admin_port_default": 50051,
     "metrics_port_default": 9090,
     "verify_exit": {
-      "0": "same effective mode, generation and build on every MDS; smart: connector valid and reachable on every MDS, coverage full or partial",
-      "1": "any difference, a desired mode not yet effective, connector invalid/unreachable, coverage none, or partial with --require-full-coverage",
+      "0": "same effective mode, generation and build on every MDS and no error reported; smart on an MDS with verdict retention: an unreachable connector and coverage partial or none are warnings (the cluster places neutrally, it does not steer)",
+      "1": "any difference, a desired mode not yet effective, connector_config_valid=0, a connector config digest or profile map that differs between MDS, an unreadable (CONNECTOR_PROFILES_INVALID) or, in smart, absent (CONNECTOR_PROFILES_MISSING) profile pin row; in smart an MDS that admits no DS (NO_ELIGIBLE_DS: registered_ds > 0, eligible_ds = 0) and, against an MDS that predates verdict retention (no retained_ds/neutral_ds in its readiness row), an unreachable connector or coverage none (COVERAGE_NONE); with --require-full-coverage also partial, none or retained coverage",
       "2": "an MDS could not be read"
     }
   }

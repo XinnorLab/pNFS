@@ -60,7 +60,7 @@ def test_socket_permissions_and_routes(served, schemas):
     status, health = get_json(sock, "/healthz")
     assert status == 503 and health["ready"] is False
     status, batch = get_json(sock, "/v1/assessments")
-    assert status == 200 and batch["contract_version"] == "1.0"
+    assert status == 200 and batch["contract_version"] == "1.1"
     validate(schemas["batch"], batch)
     rec = batch["instances"][0]["assessments"][0]
     assert rec["quality"] == "UNKNOWN" and rec["placement"]["reason_codes"] == ["NO_ASSESSMENT"]
@@ -75,8 +75,8 @@ def test_fixture_module_gives_generic_results(served, schemas):
     status, batch = get_json(sock, "/v1/assessments")
     rec = batch["instances"][0]["assessments"][0]
     assert rec["datastore_id"] == "fixture-zfs-01" and rec["target_incarnation"] == "dataset-a-inc-1"
-    assert rec["quality"] == "VALID" and rec["placement"]["allowed"] is False  # hold-down
-    assert rec["placement"]["reason_codes"] == ["RECOVERY_HOLD_DOWN", "FIXTURE_HEALTHY"]
+    assert rec["quality"] == "VALID" and rec["placement"]["allowed"] is True  # no deny in force: no hold-down
+    assert rec["placement"]["reason_codes"] == ["FIXTURE_HEALTHY"]
     assert rec["resources"]["capacity_domain_id"] == "fixture-zfs-01/pool-01"
     assert rec["profile"]["id"] == "fixture-zfs-shaped" and rec["profile"]["digest"].startswith("sha256:")
     assert rec["diagnostics"]["test_only"] is True
@@ -104,7 +104,10 @@ def test_fixture_failure_injection(served):
     ir.run_cycle()
     status, batch = get_json(sock, "/v1/assessments")
     rec = batch["instances"][0]["assessments"][0]
-    assert rec["quality"] == "UNKNOWN" and rec["placement"]["reason_codes"] == ["SOURCE_AUTH_FAILED"]
+    # An auth failure no longer revokes: the verdict of the first cycle is
+    # retained, the error code second.
+    assert rec["quality"] == "VALID" and rec["placement"]["allowed"] is True
+    assert rec["placement"]["reason_codes"][:2] == ["VERDICT_RETAINED", "SOURCE_AUTH_FAILED"]
     assert batch["instances"][0]["snapshot_status"] == "FAILED"
 
 
@@ -133,3 +136,31 @@ def test_get_p99_is_fast(served):
         durations.append(time.perf_counter() - t0)
     durations.sort()
     assert durations[int(len(durations) * 0.99) - 1] < 0.05
+
+
+def test_contract_1_1_and_long_ttl_validate(served, schemas):
+    from lattice_ds_connector import contract
+
+    assert contract.CONTRACT_VERSION == "1.1"
+    assert contract.MAX_REMAINING_TTL_MS == 3_600_000
+    assert contract.MAX_SOURCE_MAX_AGE_MS == 20_000
+    rt, server, sock, fx = served
+    status, batch = get_json(sock, "/v1/assessments")
+    assert status == 200 and batch["contract_version"] == "1.1"
+    rec = batch["instances"][0]["assessments"][0]
+    rec["remaining_ttl_ms"] = 3_600_000
+    validate(schemas["batch"], batch)
+    rec["remaining_ttl_ms"] = 3_600_001
+    with pytest.raises(AssertionError):
+        validate(schemas["batch"], batch)
+    batch["contract_version"] = "1.0"
+    rec["remaining_ttl_ms"] = 0
+    with pytest.raises(AssertionError):
+        validate(schemas["batch"], batch)
+
+
+def test_retention_reason_codes_are_catalogued():
+    from lattice_ds_connector import contract
+
+    for code in ("VERDICT_RETAINED", "RESTORED_FROM_STATE"):
+        assert code in contract.RUNTIME_REASONS and code in contract.ALL_REASON_CODES

@@ -12,7 +12,7 @@ def test_set_is_a_dry_run_by_default(tmp_path, capsys):
     assert main(["mode", "set", "smart", "--config", str(cfg), "--set", "ds_connector_poll_ms=1000"]) == 0
     out = capsys.readouterr().out
     assert out.startswith("DRY RUN") and "+placement_mode = smart" in out and "-ds_weight.0 = 55" in out
-    assert "NOTE: smart admits no DS" in out
+    assert "NOTE: smart places a DS without a connector verdict neutrally" in out
     assert cfg.read_text() == LEGACY                      # untouched
 
 

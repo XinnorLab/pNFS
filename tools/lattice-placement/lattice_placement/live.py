@@ -35,6 +35,10 @@ class DsRow:
     ttl_ms: Optional[int] = None
     weight: Optional[int] = None
     reason: str = ""
+    # smart only, and only on an MDS that renders them: "fresh" | "retained" | "none"
+    # (no verdict in force: the DS is placed neutrally, allowed/ppm carry no verdict)
+    verdict: Optional[str] = None
+    hold_left_ms: Optional[int] = None      # how long the verdict in force stays in force
 
     @property
     def eligible(self) -> bool:
@@ -52,8 +56,14 @@ class Readiness:
     last_batch_valid: bool = False
     coverage: str = "none"
     registered_ds: int = 0
-    covered_ds: int = 0
-    eligible_ds: int = 0
+    covered_ds: int = 0                     # a verdict in force, fresh or retained
+    eligible_ds: int = 0                    # neutral DS plus live allows with ppm > 0
+    retained_ds: int = 0                    # live retained verdicts, allow or deny
+    neutral_ds: int = 0                     # registered - covered
+    #: The row carries retained_ds/neutral_ds: the MDS places a DS without a
+    #: verdict neutrally. An older MDS refuses such a DS (MODE_NOT_READY /
+    #: ASSESSMENT_* -> ENOSPC), so no steering there means no placement.
+    retention_aware: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -129,6 +139,7 @@ def parse_ds_row(ds_id: int, value: str) -> DsRow:
     kv = _kv(value)
     quality = kv.get("quality")
     allowed = kv.get("allowed")
+    verdict = kv.get("verdict")
     return DsRow(
         ds_id=ds_id,
         domain=kv.get("domain", ""),
@@ -138,25 +149,34 @@ def parse_ds_row(ds_id: int, value: str) -> DsRow:
         total=_int(kv.get("total")),
         assessment_age_ms=_int(kv.get("assessment_age_ms")),
         quality=None if quality in (None, "NONE") else quality,
-        allowed=None if allowed is None else allowed == "1",
+        allowed=None if allowed in (None, "-") else allowed == "1",   # "-": no verdict in force
         ppm=_int(kv.get("ppm")),
         ttl_ms=_int(kv.get("ttl_ms")),
         weight=_int(kv.get("weight")),
         reason=kv.get("reason", ""),
+        verdict=verdict if verdict else None,
+        hold_left_ms=_int(kv.get("hold_left_ms")),
     )
 
 
 def parse_readiness(value: str) -> Readiness:
     kv = _kv(value)
+    registered = _int(kv.get("registered_ds")) or 0
+    covered = _int(kv.get("covered_ds")) or 0
+    neutral = _int(kv.get("neutral_ds"))
     return Readiness(
         mode_active=kv.get("mode_active") == "1",
         connector_config_valid=kv.get("connector_config_valid") == "1",
         connector_reachable=kv.get("connector_reachable") == "1",
         last_batch_valid=kv.get("last_batch_valid") == "1",
         coverage=kv.get("coverage", "none"),
-        registered_ds=_int(kv.get("registered_ds")) or 0,
-        covered_ds=_int(kv.get("covered_ds")) or 0,
+        registered_ds=registered,
+        covered_ds=covered,
         eligible_ds=_int(kv.get("eligible_ds")) or 0,
+        retained_ds=_int(kv.get("retained_ds")) or 0,
+        # an MDS that predates the retention keys: neutral is registered - covered by definition
+        neutral_ds=max(registered - covered, 0) if neutral is None else neutral,
+        retention_aware="retained_ds" in kv and "neutral_ds" in kv,
     )
 
 

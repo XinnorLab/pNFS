@@ -46,6 +46,20 @@ def _differences(states: List[MdsState]) -> List[str]:
     return errs
 
 
+def _has_verdict(row: DsRow) -> bool:
+    """A verdict in force for this DS.  An MDS that predates the retention
+    rows renders no `verdict=`; there an assessment (quality) is the verdict."""
+    if row.verdict is not None:
+        return row.verdict in ("fresh", "retained")
+    return row.quality is not None
+
+
+def _neutral_reason(row: DsRow) -> str:
+    """What to tell the operator about a DS placed neutrally: the gate's
+    reason when it also excludes the DS, else that it simply has no verdict."""
+    return row.reason if row.reason not in ("", "NONE") else "no verdict"
+
+
 def verdict(states: List[MdsState], require_full_coverage: bool = False) -> Verdict:
     v = Verdict(exit_code=EXIT_OK)
     for s in states:
@@ -71,17 +85,33 @@ def verdict(states: List[MdsState], require_full_coverage: bool = False) -> Verd
                 v.errors.append("CONNECTOR_PROFILES_MISSING:%s" % s.host)
             if not r.connector_config_valid:
                 v.errors.append("CONNECTOR_CONFIG_INVALID:%s" % s.host)
+            # A retention-aware MDS without steering still places (a DS without a verdict
+            # in force is neutral), so an unreachable connector or no coverage is a
+            # warning there; --require-full-coverage is the gate for operators who need
+            # steering. An MDS that predates retention refuses such a DS (ENOSPC): there
+            # both stay errors, as before retention.
             if not r.connector_reachable:
-                v.errors.append("CONNECTOR_UNREACHABLE:%s: %s" % (s.host, s.last_detail or ""))
+                msg = "CONNECTOR_UNREACHABLE:%s: %s" % (s.host, s.last_detail or "")
+                (v.warnings if r.retention_aware else v.errors).append(msg)
             if r.coverage == "none":
-                v.errors.append("COVERAGE_NONE:%s: no DS has a fresh VALID assessment (%s)" % (s.host, s.last_detail or ""))
-            elif r.coverage == "partial":
-                bad = ["ds %d %s" % (row.ds_id, row.reason) for row in s.ds if not row.eligible]
-                msg = "COVERAGE_PARTIAL:%s: %d of %d DS eligible (%s)" % (s.host, r.eligible_ds, r.registered_ds, ", ".join(bad))
-                if require_full_coverage:
-                    v.errors.append(msg)
+                if r.retention_aware:
+                    msg = "STEERING_OFF:%s: no data store has a verdict in force; placing neutrally" % s.host
+                    (v.errors if require_full_coverage else v.warnings).append(msg)
                 else:
-                    v.warnings.append(msg)
+                    v.errors.append("COVERAGE_NONE:%s: no DS has a verdict and this MDS predates verdict "
+                                    "retention: it refuses every new file (%s)" % (s.host, s.last_detail or ""))
+            elif r.coverage == "partial":
+                neutral = ", ".join("ds %d %s" % (row.ds_id, _neutral_reason(row)) for row in s.ds if not _has_verdict(row))
+                msg = "COVERAGE_PARTIAL:%s: %d of %d DS have a verdict in force (neutral: %s)" % (
+                    s.host, r.covered_ds, r.registered_ds, neutral)
+                (v.errors if require_full_coverage else v.warnings).append(msg)
+            # On any build: every registered DS denied, zeroed or refused -> ENOSPC for every file.
+            if r.registered_ds > 0 and r.eligible_ds == 0:
+                v.errors.append("NO_ELIGIBLE_DS:%s: the MDS admits no DS (%d registered, 0 eligible)"
+                                % (s.host, r.registered_ds))
+            if require_full_coverage and r.retained_ds > 0:
+                v.errors.append("COVERAGE_RETAINED:%s: %d DS held by retained verdicts "
+                                "(the connector is not observing them)" % (s.host, r.retained_ds))
     if v.errors:
         v.exit_code = EXIT_DIFFER
     return v
@@ -112,6 +142,8 @@ def render_row(row: DsRow) -> str:
             row.quality or "NONE", "-" if row.allowed is None else int(row.allowed),
             row.ppm if row.ppm is not None else "-", _fmt_age(row.ttl_ms), _fmt_age(row.assessment_age_ms)))
     parts.append("weight=%s reason=%s" % (row.weight if row.weight is not None else "-", row.reason or "-"))
+    if row.verdict is not None:
+        parts.append("verdict=%s hold_left=%s" % (row.verdict, _fmt_age(row.hold_left_ms)))
     return "  " + " ".join(parts)
 
 
@@ -133,9 +165,10 @@ def render_show(states: List[MdsState]) -> str:
         if s.readiness is not None:
             r = s.readiness
             lines.append("  readiness: mode_active=%d connector_config_valid=%d connector_reachable=%d "
-                         "last_batch_valid=%d coverage=%s registered=%d covered=%d eligible=%d" % (
+                         "last_batch_valid=%d coverage=%s registered=%d covered=%d eligible=%d "
+                         "retained=%d neutral=%d" % (
                              r.mode_active, r.connector_config_valid, r.connector_reachable, r.last_batch_valid,
-                             r.coverage, r.registered_ds, r.covered_ds, r.eligible_ds))
+                             r.coverage, r.registered_ds, r.covered_ds, r.eligible_ds, r.retained_ds, r.neutral_ds))
             lines.append("  connector: config_digest=%s profiles=%s last=%s" % (
                 s.config_digest or "-", _fmt_profiles(s), s.last_detail or "-"))
         for row in s.ds:

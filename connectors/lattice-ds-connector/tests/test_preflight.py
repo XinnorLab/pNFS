@@ -146,12 +146,12 @@ def test_preflight_cli_over_the_socket(tmp_path, capsys):
         server.start()
         try:
             rt.instances["fixture-01"].run_cycle()
-            for _ in range(3):   # hold-down: two distinct cycles
+            for _ in range(3):   # a few more cycles
                 rt.instances["fixture-01"].run_cycle()
             rc = main(["preflight", "--socket", cfg.runtime.socket_path, "--expect-ds", "2"])
             out = capsys.readouterr().out
             assert "ds   2" in out
-            assert rc in (0, 1)   # the fixture may still be in its hold-down; the report itself is what we check
+            assert rc in (0, 1)   # the report itself is what we check
             rc = main(["preflight", "--socket", cfg.runtime.socket_path, "--expect-ds", "2,9", "--json"])
             doc = json.loads(capsys.readouterr().out)
             assert rc == 1 and "UNBOUND:ds9" in doc["reasons"]
@@ -171,3 +171,36 @@ def test_rows_show_ds_path():
     assert rows[0]["ds_path"] == "/mnt/data/pnfs-ds" and rows[1]["ds_path"] is None
     text = render(r)
     assert "ds_path=/mnt/data/pnfs-ds" in text and "ds_path=-" in text
+
+
+def retained(ds_id, *more, **kw):
+    r = record(ds_id, **kw)
+    r["placement"]["reason_codes"] = ["VERDICT_RETAINED"] + list(more) + ["NORMAL"]
+    return r
+
+
+def test_rows_report_fresh_retained_restored_and_none():
+    b = batch(record(0), retained(1, "SOURCE_TIMEOUT", ttl=300000),
+              retained(2, "RESTORED_FROM_STATE", "NO_ASSESSMENT"),
+              record(3, quality="UNKNOWN", allowed=False, ppm=0, ttl=0, domain="d3"))
+    r = evaluate(HEALTH_OK, b)
+    rows = {d["ds_id"]: d for d in r["ds"]}
+    assert {k: v["verdict"] for k, v in rows.items()} == {0: "fresh", 1: "retained", 2: "restored", 3: "none"}
+    assert rows[1]["hold_left_ms"] == 300000 and rows[0]["hold_left_ms"] == 15000
+    assert r["reasons"] == ["UNKNOWN:ds3", "EXPIRED:ds3"]          # a retained verdict is not a failure
+    text = render(r)
+    assert "verdict=retained hold_left_ms=300000" in text and "verdict=none hold_left_ms=0" in text
+
+
+def test_retained_verdict_in_a_failed_snapshot_is_ready():
+    b = batch(retained(0, "SOURCE_AUTH_FAILED"))
+    b["instances"][0]["snapshot_status"] = "FAILED"
+    r = evaluate(HEALTH_OK, b, expect_ds=[0])
+    assert r["ready"], r["reasons"]
+    assert r["ds"][0]["quality"] == "VALID" and r["ds"][0]["verdict"] == "retained"
+    # A VALID record without VERDICT_RETAINED in a FAILED snapshot is not
+    # trusted (the MDS reads it as UNKNOWN too).
+    b = batch(record(0))
+    b["instances"][0]["snapshot_status"] = "FAILED"
+    r = evaluate(HEALTH_OK, b, expect_ds=[0])
+    assert "UNKNOWN:ds0" in r["reasons"] and r["ds"][0]["verdict"] == "none"

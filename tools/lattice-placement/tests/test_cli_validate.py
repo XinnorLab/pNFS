@@ -59,13 +59,25 @@ def test_validate_smart_uses_the_connector(tmp_path, capsys):
                  "--connector-socket", "/tmp/x.sock", "--expect-ds", "0,1"]) == 0
     assert "connector: ready=True" in capsys.readouterr().out
     bad = fake_connector(tmp_path, False, ["CONNECTOR_NOT_READY"])
-    assert main(["mode", "validate", "smart", "--config", cfg, "--connector-cli", bad, "--json"]) == 1
+    assert main(["mode", "validate", "smart", "--config", cfg, "--connector-cli", bad, "--json"]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert "CONNECTOR:CONNECTOR_NOT_READY" in data["errors"]
+    assert data["ready"] is True and data["errors"] == []
+    assert "CONNECTOR:CONNECTOR_NOT_READY" in data["warnings"]
     assert data["connector"]["ready"] is False
-    # no connector CLI at all: NOT_READY, never a crash
-    assert main(["mode", "validate", "smart", "--config", cfg, "--connector-cli", str(tmp_path / "nope")]) == 1
-    assert "CONNECTOR:UNAVAILABLE" in capsys.readouterr().out
+    # no connector CLI at all: still READY, with a warning, never a crash
+    assert main(["mode", "validate", "smart", "--config", cfg, "--connector-cli", str(tmp_path / "nope")]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("READY\n") and "warning: CONNECTOR:UNAVAILABLE" in out and "error:" not in out
+
+
+def test_validate_smart_with_a_broken_file_is_still_not_ready(tmp_path, capsys):
+    cfg = write(tmp_path, "mds.conf", "placement_mode = smart\ndefault_mirror_count = 2\n")
+    bad = fake_connector(tmp_path, False, ["CONNECTOR_NOT_READY"])
+    assert main(["mode", "validate", "smart", "--config", cfg, "--connector-cli", bad,
+                 "--connector-socket", "/tmp/x.sock"]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith("NOT_READY\n") and "error:   MIRROR_COUNT_UNSUPPORTED" in out
+    assert "warning: CONNECTOR:CONNECTOR_NOT_READY" in out
 
 
 def test_validate_does_not_forward_a_malformed_expect_profiles_to_the_connector(tmp_path, capsys):
